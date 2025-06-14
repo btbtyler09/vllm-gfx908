@@ -202,3 +202,10 @@ shellcheck*/
 
 # Ignore moe/marlin_moe gen code
 csrc/moe/marlin_moe_wna16/kernel_*
+
+# Ignore our plan folder
+docs/plans
+CLAUDE.md
+
+# Ignore nlzy
+nlzy-vllm-gfx906
