@@ -22,11 +22,11 @@ https://github.com/qwopqwop200/GPTQ-for-LLaMa
 namespace vllm {
 namespace gptq {
 
-#define BLOCK_KN_SIZE 128
+#define BLOCK_KN_SIZE 256
 #define BLOCK_M_SIZE_MAX 8
 #define MAX_GROUPS_IN_BLOCK (BLOCK_KN_SIZE / 32)
-#define MAX_Q_GEMM_ROWS 50
-#define MAX_Q_GEMM_ROWS_8BIT 24
+#define MAX_Q_GEMM_ROWS 64
+#define MAX_Q_GEMM_ROWS_8BIT 32
 #define MAX_ALT_GEMM_ROWS 8
 #define THREADS_X 32
 #define THREADS_Y 32
@@ -103,6 +103,14 @@ __forceinline__ __device__ half2 dot22_32(half2 (&dq)[16], const half* a_ptr,
 __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr,
                                            const float g_result,
                                            const float qs_f) {
+#if defined(USE_ROCM)
+  // Use AMD-specific intrinsic for better performance on MI50/MI100
+  float result = {};
+  const half2* a2_ptr = (const half2*)a_ptr;
+  #pragma unroll
+  for (int i = 0; i < 4; i++) result = __ockl_fdot2(dq[i], *a2_ptr++, result, true);
+  return fma(result, qs_f, g_result);
+#else
   half2 result = {};
   const half2* a2_ptr = (const half2*)a_ptr;
 #pragma unroll
@@ -110,6 +118,7 @@ __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr,
   float result_f =
       __half2float(__low2half(result)) + __half2float(__high2half(result));
   return fma(result_f, qs_f, g_result);
+#endif
 }
 
 __forceinline__ __device__ float dot22_16_f(half2 (&dq)[8], const half* a_ptr,
