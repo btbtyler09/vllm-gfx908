@@ -43,8 +43,8 @@ def test_gptq_4bit_kernel():
             torch.cuda.synchronize()
             start_time = time.time()
             
-            # Run GPTQ GEMM (4-bit)
-            output = gptq_gemm(a, b_q_weight, b_qzeros, b_scales, b_perm, bit=4, use_exllama=False)
+            # Run GPTQ GEMM (4-bit) - Use exllama=True to match real models
+            output = gptq_gemm(a, b_q_weight, b_qzeros, b_scales, b_perm, bit=4, use_exllama=True)
             
             torch.cuda.synchronize()
             end_time = time.time()
@@ -105,8 +105,8 @@ def test_gptq_8bit_kernel():
             torch.cuda.synchronize()
             start_time = time.time()
             
-            # Run GPTQ GEMM (8-bit)
-            output = gptq_gemm(a, b_q_weight, b_qzeros, b_scales, b_perm, bit=8, use_exllama=False)
+            # Run GPTQ GEMM (8-bit) - Use exllama=True to match real models
+            output = gptq_gemm(a, b_q_weight, b_qzeros, b_scales, b_perm, bit=8, use_exllama=True)
             
             torch.cuda.synchronize()
             end_time = time.time()
@@ -184,7 +184,7 @@ def compare_kernel_outputs(baseline_output, current_output, test_name: str, tole
     
     return outputs_match
 
-def run_kernel_tests(baseline_file: str = None):
+def run_kernel_tests(save_baseline_file: str = None, compare_baseline_file: str = None):
     """Run all kernel tests and optionally compare against baseline"""
     print("🔧 GPTQ Kernel Direct Testing")
     print("=" * 50)
@@ -220,15 +220,30 @@ def run_kernel_tests(baseline_file: str = None):
     overall_success = success_4bit and success_8bit
     
     # Save results if requested
-    if baseline_file:
-        torch.save(test_results, baseline_file)
-        print(f"\n💾 Results saved to: {baseline_file}")
+    if save_baseline_file:
+        torch.save(test_results, save_baseline_file)
+        print(f"\n💾 Results saved to: {save_baseline_file}")
     
-    # Load and compare with baseline if it exists
-    baseline_comparison_file = "gptq_kernel_baseline.pt"
-    try:
-        baseline_results = torch.load(baseline_comparison_file)
-        print(f"\n🔍 Comparing against baseline: {baseline_comparison_file}")
+    # Load and compare with baseline if specified
+    if compare_baseline_file:
+        try:
+            baseline_results = torch.load(compare_baseline_file)
+            print(f"\n🔍 Comparing against baseline: {compare_baseline_file}")
+        except FileNotFoundError:
+            print(f"\n📝 Baseline file not found: {compare_baseline_file}")
+            baseline_results = None
+    else:
+        # Try default baseline file for backward compatibility
+        default_baseline = "gptq_kernel_baseline.pt"
+        try:
+            baseline_results = torch.load(default_baseline)
+            print(f"\n🔍 Comparing against baseline: {default_baseline}")
+        except FileNotFoundError:
+            print(f"\n📝 No baseline found at {default_baseline}")
+            print("   Run with --save-baseline to create one")
+            baseline_results = None
+    
+    if baseline_results:
         
         # Compare 4-bit
         if "4bit" in baseline_results:
@@ -253,10 +268,6 @@ def run_kernel_tests(baseline_file: str = None):
             print("   ⚠️  No 8-bit baseline found")
         
         overall_success = overall_success and match_4bit and match_8bit
-        
-    except FileNotFoundError:
-        print(f"\n📝 No baseline found at {baseline_comparison_file}")
-        print("   Run with --save-baseline to create one")
     
     # Summary
     print(f"\n📊 Kernel Test Summary:")
@@ -270,10 +281,12 @@ def main():
     parser = argparse.ArgumentParser(description="Direct GPTQ Kernel Testing")
     parser.add_argument("--save-baseline", type=str,
                        help="Save results as baseline to specified file")
+    parser.add_argument("--baseline", type=str,
+                       help="Compare results against specified baseline file")
     
     args = parser.parse_args()
     
-    success = run_kernel_tests(args.save_baseline)
+    success = run_kernel_tests(args.save_baseline, args.baseline)
     exit(0 if success else 1)
 
 if __name__ == "__main__":
