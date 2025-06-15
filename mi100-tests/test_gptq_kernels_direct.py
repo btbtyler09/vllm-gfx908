@@ -12,14 +12,19 @@ def test_gptq_4bit_kernel():
     """Test 4-bit GPTQ kernel directly"""
     print("🧪 Testing 4-bit GPTQ kernel...")
     
-    # Test parameters
-    m, n, k = 128, 256, 512
+    # Test parameters - larger, more realistic sizes
+    # Simulate tensor parallel: each GPU handles n/4 columns in real models
+    m, n, k = 256, 2048, 4096  # More realistic model layer size
     groupsize = 128
     device = "cuda"
     
+    # Set deterministic seed for reproducible results
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    
     try:
-        # Create test tensors
-        a = torch.randn(m, k, dtype=torch.half, device=device)
+        # Create test tensors with more realistic ranges
+        a = torch.randn(m, k, dtype=torch.half, device=device) * 0.1
         
         # Create quantized weight tensor (4-bit packed)
         b_q_weight = torch.randint(0, 15, (k // 8, n), dtype=torch.int32, device=device)
@@ -74,14 +79,19 @@ def test_gptq_8bit_kernel():
     """Test 8-bit GPTQ kernel directly"""
     print("🧪 Testing 8-bit GPTQ kernel...")
     
-    # Test parameters  
-    m, n, k = 128, 256, 512
+    # Test parameters - larger, more realistic sizes
+    # Simulate tensor parallel: each GPU handles n/4 columns in real models
+    m, n, k = 256, 2048, 4096  # More realistic model layer size
     groupsize = 128
     device = "cuda"
     
+    # Set deterministic seed for reproducible results
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    
     try:
-        # Create test tensors
-        a = torch.randn(m, k, dtype=torch.half, device=device)
+        # Create test tensors with more realistic ranges
+        a = torch.randn(m, k, dtype=torch.half, device=device) * 0.1
         
         # Create quantized weight tensor (8-bit packed)
         b_q_weight = torch.randint(0, 255, (k // 4, n), dtype=torch.int32, device=device)
