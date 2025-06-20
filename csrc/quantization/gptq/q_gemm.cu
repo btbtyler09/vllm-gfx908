@@ -215,8 +215,6 @@ __global__ void gemm_half_q_half_gptq_4bit_kernel(
   auto offset_m = blockIdx.y * m_count;
   auto offset_k = blockIdx.z * BLOCK_KN_SIZE;
 
-  [[maybe_unused]] int end_n = min(offset_n + BLOCK_KN_SIZE * 4, size_n);
-  [[maybe_unused]] int end_m = min(offset_m + m_count, size_m);
   int end_k = min(offset_k + BLOCK_KN_SIZE, size_k);
 
   int n = offset_n + t * 4;
@@ -353,8 +351,6 @@ __global__ void gemm_half_q_half_gptq_2bit_kernel(
   auto offset_m = blockIdx.y * m_count;
   auto offset_k = blockIdx.z * BLOCK_KN_SIZE;
 
-  [[maybe_unused]] int end_n = min(offset_n + BLOCK_KN_SIZE * 4, size_n);
-  [[maybe_unused]] int end_m = min(offset_m + m_count, size_m);
   int end_k = min(offset_k + BLOCK_KN_SIZE, size_k);
 
   int n = offset_n + t * 4;
@@ -474,8 +470,6 @@ __global__ void gemm_half_q_half_gptq_3bit_kernel(
   auto offset_m = blockIdx.y * m_count;
   auto offset_k = blockIdx.z * BLOCK_KN_SIZE;
 
-  [[maybe_unused]] int end_n = min(offset_n + BLOCK_KN_SIZE * 4, size_n);
-  [[maybe_unused]] int end_m = min(offset_m + m_count, size_m);
   int end_k = min(offset_k + BLOCK_KN_SIZE, size_k);
 
   int n = offset_n + t * 4;
@@ -602,8 +596,6 @@ __global__ void gemm_half_q_half_gptq_8bit_kernel(
   auto offset_m = blockIdx.y * m_count;
   auto offset_k = blockIdx.z * BLOCK_KN_SIZE;
 
-  [[maybe_unused]] int end_n = min(offset_n + BLOCK_KN_SIZE * 4, size_n);
-  [[maybe_unused]] int end_m = min(offset_m + m_count, size_m);
   int end_k = min(offset_k + BLOCK_KN_SIZE, size_k);
 
   int n = offset_n + t * 4;
