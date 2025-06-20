@@ -542,6 +542,7 @@ def save_configs(
     filename = get_config_file_name(
         num_experts, shard_intermediate_size // 2, dtype_str, block_quant_shape
     )
+    filename = filename.replace("/", "_")  # Fix for device names with forward slashes
 
     print(f"Writing best config to {filename}...")
     with open(filename, "w") as f:
