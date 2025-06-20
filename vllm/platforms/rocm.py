@@ -112,6 +112,12 @@ def on_mi3xx() -> bool:
 
 
 @cache
+def on_mi100() -> bool:
+    GPU_ARCH = torch.cuda.get_device_properties("cuda").gcnArchName
+    return any(arch in GPU_ARCH for arch in ["gfx900", "gfx902", "gfx906", "gfx908"])
+
+
+@cache
 def on_gfx9() -> bool:
     GPU_ARCH = torch.cuda.get_device_properties("cuda").gcnArchName
     return any(arch in GPU_ARCH for arch in ["gfx90a", "gfx942", "gfx950"])
@@ -328,6 +334,10 @@ class RocmPlatform(Platform):
 
         if model_arch in _ROCM_PARTIALLY_SUPPORTED_MODELS:
             msg = _ROCM_PARTIALLY_SUPPORTED_MODELS[model_arch]
+            # Only show Triton-related warnings if Triton is actually being used
+            if "Triton flash attention" in msg and not envs.VLLM_USE_TRITON_FLASH_ATTN:
+                # Skip warning since Triton is not being used
+                return
             logger.warning(
                 "Model architecture '%s' is partially "
                 "supported by ROCm: %s", model_arch, msg)
