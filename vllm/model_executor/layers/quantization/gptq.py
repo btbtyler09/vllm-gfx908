@@ -4,12 +4,17 @@
 import enum
 from enum import Enum
 from fractions import Fraction
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 
 import torch
 from torch.nn.parameter import Parameter
 
 from vllm import _custom_ops as ops
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
@@ -21,6 +26,8 @@ from vllm.model_executor.parameter import (ChannelQuantScaleParameter,
                                            PackedColumnParameter,
                                            PackedvLLMParameter,
                                            RowvLLMParameter)
+
+logger = init_logger(__name__)
 
 
 class GPTQConfig(QuantizationConfig):
@@ -111,7 +118,22 @@ class GPTQConfig(QuantizationConfig):
                    dynamic)
 
     def get_quant_method(self, layer: torch.nn.Module,
-                         prefix: str) -> Optional["GPTQLinearMethod"]:
+                         prefix: str) -> Optional[Union["GPTQLinearMethod", "QuantizeMethodBase"]]:
+        if isinstance(layer, FusedMoE):
+            # GPTQ MoE support: fall back to MoeWNA16 for broad compatibility
+            from .moe_wna16 import MoeWNA16Config
+            
+            logger.info(f"Using MoeWNA16 method for GPTQ MoE layer '{prefix}'")
+            config = {
+                "quant_method": "gptq",
+                "bits": self.weight_bits,
+                "group_size": self.group_size,
+                "sym": True,  # GPTQ typically uses symmetric quantization
+                "lm_head": False,
+            }
+            return MoeWNA16Config.from_config(config).get_quant_method(
+                layer, prefix)
+        
         return get_linear_quant_method(self, layer, prefix, GPTQLinearMethod)
 
 
