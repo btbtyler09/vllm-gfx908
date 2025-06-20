@@ -564,8 +564,9 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                                "`VLLM_USE_TRITON_FLASH_ATTN=0`")
         else:
             # if not using triton, navi3x/navi21/navi10 do not use flash-attn
-            # either
-            if not current_platform.has_device_capability(90):
+            # either. However, MI100 series (gfx908) should support CK FlashAttention
+            from vllm.platforms.rocm import on_mi100
+            if not (current_platform.has_device_capability(90) or on_mi100()):
                 self.use_naive_attn = True
             else:
                 try:
