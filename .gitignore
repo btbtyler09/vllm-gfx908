@@ -209,3 +209,7 @@ CLAUDE.md
 
 # Ignore nlzy
 nlzy-vllm-gfx906
+
+# Local planning documents
+docs/plans/
+
