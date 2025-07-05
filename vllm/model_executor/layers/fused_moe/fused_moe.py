@@ -750,6 +750,10 @@ def get_moe_wna16_block_config(config: dict[str,
 
 def should_moe_wna16_use_cuda(num_valid_tokens: int, group_size: int,
                               num_experts: int, bit: int):
+    # Don't use CUDA kernel on ROCm platforms
+    if not current_platform.is_cuda():
+        return False
+    
     return bit == 4 and group_size in [32, 64, 128] and \
         num_valid_tokens / num_experts <= 6
 

@@ -389,7 +389,8 @@ class Qwen3MoeModel(nn.Module):
         # Skip loading extra parameters for GPTQ/modelopt models.
         ignore_suffixes = (".bias", "_bias", ".k_scale", "_k_scale",
                            ".v_scale", "_v_scale", ".weight_scale",
-                           "_weight_scale", ".input_scale", "_input_scale")
+                           "_weight_scale", ".input_scale", "_input_scale",
+                           ".gate.weight", "_gate.weight")
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
