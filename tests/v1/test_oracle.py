@@ -13,7 +13,6 @@ UNSUPPORTED_MODELS_V1 = [
     "openai/whisper-large-v3",  # transcription
     "facebook/bart-large-cnn",  # encoder decoder
     "state-spaces/mamba-130m-hf",  # mamba1
-    "hmellor/tiny-random-BambaForCausalLM",  # hybrid
     "BAAI/bge-m3",  # embedding
 ]
 
@@ -40,12 +39,6 @@ def test_unsupported_configs(monkeypatch):
 
     with monkeypatch.context() as m:
         m.setenv("VLLM_USE_V1", "1")
-
-        with pytest.raises(NotImplementedError):
-            AsyncEngineArgs(
-                model=MODEL,
-                kv_cache_dtype="fp8",
-            ).create_engine_config()
 
         with pytest.raises(NotImplementedError):
             AsyncEngineArgs(
