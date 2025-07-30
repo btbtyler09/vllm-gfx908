@@ -19,6 +19,7 @@ from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
+from vllm.platforms import current_platform
 from vllm.model_executor.layers.quantization.utils.gptq_utils import (
     get_linear_quant_method)
 from vllm.model_executor.parameter import (ChannelQuantScaleParameter,
@@ -265,6 +266,17 @@ class GPTQLinearMethod(LinearMethodBase):
         layer.exllama_state = exllama_state
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Check for known ROCm issue with asymmetric quantization + group_size 128
+        if current_platform.is_rocm() and self.quant_config.group_size == 128:
+            # Check if using asymmetric quantization by looking at zero values
+            # In symmetric quantization, zeros are typically 8 (for 4-bit)
+            if hasattr(layer, 'qzeros') and layer.qzeros is not None:
+                logger.warning(
+                    "ROCm may have issues with GPTQ models using group_size 128. "
+                    "If you experience incorrect outputs, try using models with "
+                    "group_size 32 or symmetric quantization."
+                )
+        
         # for torch.compile
         layer.qzeros = Parameter(layer.qzeros.data, requires_grad=False)
         layer.qweight = Parameter(layer.qweight.data, requires_grad=False)
