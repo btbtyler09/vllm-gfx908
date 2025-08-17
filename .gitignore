@@ -4,6 +4,9 @@
 # vllm-flash-attn built from source
 vllm/vllm_flash_attn/*
 
+# triton jit 
+.triton
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -147,7 +150,8 @@ venv.bak/
 # mkdocs documentation
 /site
 docs/argparse
-docs/examples
+docs/examples/*
+!docs/examples/README.md
 
 # mypy
 .mypy_cache/
@@ -215,3 +219,6 @@ nlzy-vllm-gfx906
 docs/plans/
 
 mi100-tests/
+
+# Ignore ep_kernels_workspace folder
+ep_kernels_workspace/

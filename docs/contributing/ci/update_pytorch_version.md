@@ -106,6 +106,7 @@ releases (which would take too much time), they can be built from
 source to unblock the update process.
 
 ### FlashInfer
+
 Here is how to build and install it from source with `torch2.7.0+cu128` in vLLM [Dockerfile](https://github.com/vllm-project/vllm/blob/27bebcd89792d5c4b08af7a65095759526f2f9e1/docker/Dockerfile#L259-L271):
 
 ```bash
@@ -121,25 +122,13 @@ public location for immediate installation, such as [this FlashInfer wheel link]
 team if you want to get the package published there.
 
 ### xFormers
+
 Similar to FlashInfer, here is how to build and install xFormers from source:
 
 ```bash
 export TORCH_CUDA_ARCH_LIST='7.0 7.5 8.0 8.9 9.0 10.0+PTX'
 MAX_JOBS=16 uv pip install --system \
     --no-build-isolation "git+https://github.com/facebookresearch/xformers@v0.0.30"
-```
-
-### Mamba
-
-```bash
-uv pip install --system \
-    --no-build-isolation "git+https://github.com/state-spaces/mamba@v2.2.5"
-```
-
-### causal-conv1d
-
-```
-uv pip install 'git+https://github.com/Dao-AILab/causal-conv1d@v1.5.0.post8'
 ```
 
 ## Update all the different vLLM platforms
