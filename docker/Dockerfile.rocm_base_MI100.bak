@@ -10,8 +10,6 @@ ARG PYTORCH_BRANCH="295f2ed4"
 ARG PYTORCH_VISION_BRANCH="v0.21.0"
 ARG PYTORCH_REPO="https://github.com/pytorch/pytorch.git"
 ARG PYTORCH_VISION_REPO="https://github.com/pytorch/vision.git"
-ARG FA_BRANCH="main"
-ARG FA_REPO="https://github.com/btbtyler09/flash-attention-gfx908.git"
 
 FROM ${BASE_IMAGE} AS base
 
@@ -105,8 +103,6 @@ ARG PYTORCH_BRANCH
 ARG PYTORCH_VISION_BRANCH
 ARG PYTORCH_REPO
 ARG PYTORCH_VISION_REPO
-ARG FA_BRANCH
-ARG FA_REPO
 RUN git clone ${PYTORCH_REPO} pytorch
 RUN cd pytorch && git checkout ${PYTORCH_BRANCH} && \
     pip install -r requirements.txt && git submodule update --init --recursive \
@@ -117,14 +113,8 @@ RUN git clone ${PYTORCH_VISION_REPO} vision
 RUN cd vision && git checkout ${PYTORCH_VISION_BRANCH} \
     && python3 setup.py bdist_wheel --dist-dir=dist \
     && pip install dist/*.whl
-RUN git clone ${FA_REPO}
-RUN cd flash-attention-gfx908 \
-    && git checkout ${FA_BRANCH} \
-    && git submodule update --init \
-    && FLASH_ATTENTION_FORCE_BUILD=TRUE GPU_ARCHS=gfx908 python3 setup.py bdist_wheel --dist-dir=dist
 RUN mkdir -p /app/install && cp /app/pytorch/dist/*.whl /app/install \
-    && cp /app/vision/dist/*.whl /app/install \
-    && cp /app/flash-attention-gfx908/dist/*.whl /app/install
+    && cp /app/vision/dist/*.whl /app/install
 
 FROM base AS final
 RUN --mount=type=bind,from=build_hipblaslt,src=/app/install/,target=/install \
@@ -158,8 +148,6 @@ ARG PYTORCH_BRANCH
 ARG PYTORCH_VISION_BRANCH
 ARG PYTORCH_REPO
 ARG PYTORCH_VISION_REPO
-ARG FA_BRANCH
-ARG FA_REPO
 RUN echo "BASE_IMAGE: ${BASE_IMAGE}" > /app/versions.txt \
     && echo "HIPBLAS_COMMON_BRANCH: ${HIPBLAS_COMMON_BRANCH}" >> /app/versions.txt \
     && echo "HIPBLASLT_BRANCH: ${HIPBLASLT_BRANCH}" >> /app/versions.txt \
@@ -171,6 +159,4 @@ RUN echo "BASE_IMAGE: ${BASE_IMAGE}" > /app/versions.txt \
     && echo "PYTORCH_BRANCH: ${PYTORCH_BRANCH}" >> /app/versions.txt \
     && echo "PYTORCH_VISION_BRANCH: ${PYTORCH_VISION_BRANCH}" >> /app/versions.txt \
     && echo "PYTORCH_REPO: ${PYTORCH_REPO}" >> /app/versions.txt \
-    && echo "PYTORCH_VISION_REPO: ${PYTORCH_VISION_REPO}" >> /app/versions.txt \
-    && echo "FA_BRANCH: ${FA_BRANCH}" >> /app/versions.txt \
-    && echo "FA_REPO: ${FA_REPO}" >> /app/versions.txt
+    && echo "PYTORCH_VISION_REPO: ${PYTORCH_VISION_REPO}" >> /app/versions.txt
