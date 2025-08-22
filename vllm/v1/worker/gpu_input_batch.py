@@ -10,8 +10,8 @@ import torch
 from typing_extensions import deprecated
 
 from vllm.lora.request import LoRARequest
-from vllm.multimodal.inputs import (MultiModalKwargs, MultiModalKwargsItem,
-                                    PlaceholderRange)
+from vllm.multimodal.inputs import (MultiModalKwargsItem,
+                                    MultiModalKwargsItems, PlaceholderRange)
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.utils import swap_dict_values
@@ -57,8 +57,10 @@ class CachedRequestState:
     @property
     @deprecated("`mm_inputs` is superseded by `mm_kwargs` and will be "
                 "removed in v0.13. Please use `mm_kwargs` instead.")
-    def mm_inputs(self) -> list[MultiModalKwargs]:
-        return [MultiModalKwargs([item]) for item in self.mm_kwargs]
+    def mm_inputs(self) -> list[MultiModalKwargsItems]:
+        return [
+            MultiModalKwargsItems.from_seq([item]) for item in self.mm_kwargs
+        ]
 
     def get_token_id(self, idx: int) -> int:
         if idx < self.num_prompt_tokens:
@@ -440,10 +442,11 @@ class InputBatch:
         # LoRA
         lora_id = self.request_lora_mapping[req_index]
         if lora_id != 0:
-            self.lora_id_to_request_ids[lora_id].discard(req_id)
-            if len(self.lora_id_to_request_ids[lora_id]) == 0:
-                self.lora_id_to_request_ids.pop(lora_id)
-                self.lora_id_to_lora_request.pop(lora_id)
+            lora_req_ids = self.lora_id_to_request_ids[lora_id]
+            lora_req_ids.discard(req_id)
+            if not lora_req_ids:
+                del self.lora_id_to_request_ids[lora_id]
+                del self.lora_id_to_lora_request[lora_id]
             self.request_lora_mapping[req_index] = 0
 
         self.has_allowed_token_ids.discard(req_id)
@@ -711,7 +714,7 @@ class InputBatch:
 
         return PoolingMetadata(
             prompt_lens=torch.from_numpy(
-                self.num_prompt_tokens[:self.num_reqs]).to(self.device),
+                self.num_prompt_tokens[:self.num_reqs]),
             prompt_token_ids=self.sampling_metadata.prompt_token_ids,
             pooling_params=pooling_params,
         )
