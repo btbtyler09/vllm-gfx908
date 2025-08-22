@@ -170,7 +170,7 @@ class ExpertsInt8MoEMethod(FusedMoEMethodBase):
         def quantize_and_call_weight_loader(param: torch.nn.Parameter,
                                             loaded_weight: torch.Tensor,
                                             weight_name: str, shard_id: int,
-                                            expert_id: int):
+                                            expert_id: int, return_success: bool = False):
             tp_rank = get_tensor_model_parallel_rank()
             shard_size = layer.intermediate_size_per_partition
             shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
@@ -198,6 +198,9 @@ class ExpertsInt8MoEMethod(FusedMoEMethodBase):
                     f"Shard id must be in [0,1,2] but got {shard_id}")
             weight_loader(param, loaded_weight, weight_name, shard_id,
                           expert_id)
+            
+            # Return success status if requested (for Expert Parallelism support)
+            return True if return_success else None
 
         return quantize_and_call_weight_loader
 

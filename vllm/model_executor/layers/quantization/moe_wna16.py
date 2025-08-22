@@ -405,11 +405,11 @@ class MoeWNA16Method(FusedMoEMethodBase):
         def moe_wna16_weight_loader(param: torch.nn.Parameter,
                                     loaded_weight: torch.Tensor,
                                     weight_name: str, shard_id: str,
-                                    expert_id: int):
+                                    expert_id: int, return_success: bool = False):
             if "g_idx" in weight_name:
-                return
+                return True if return_success else None
             if not layer.quant_config.has_zp and "qzeros" in weight_name:
-                return
+                return True if return_success else None
 
             device = get_tp_group().device
             tp_rank = get_tensor_model_parallel_rank()
@@ -461,5 +461,8 @@ class MoeWNA16Method(FusedMoEMethodBase):
             else:
                 weight_loader(param, loaded_weight, weight_name, shard_id,
                               expert_id)
+            
+            # Return success status if requested (for Expert Parallelism support)
+            return True if return_success else None
 
         return moe_wna16_weight_loader
