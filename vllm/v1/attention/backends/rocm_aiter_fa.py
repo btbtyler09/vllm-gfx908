@@ -11,6 +11,7 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import is_aiter_supported
 from vllm.v1.attention.backends.utils import (AttentionCGSupport,
                                               AttentionMetadataBuilder,
                                               CommonAttentionMetadata)
@@ -18,9 +19,27 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 _PARTITION_SIZE_ROCM = 256
 
+# Only import AITER on supported hardware
+# MI100 (gfx908) does NOT support AITER, only CDNA3+ (MI300 series)
 if current_platform.is_rocm():
-    import aiter
+    if is_aiter_supported():
+        try:
+            import aiter
+        except ImportError:
+            raise ImportError(
+                "AITER module is not installed but hardware supports it. "
+                "Please install AITER for optimal performance on MI300 series GPUs."
+            )
+    else:
+        # Hardware doesn't support AITER, don't try to import it
+        # This prevents errors on MI100 and other unsupported GPUs
+        raise ImportError(
+            "AITER is not supported on this hardware. "
+            "AITER requires CDNA3+ architecture (MI300 series). "
+            "Detected hardware does not meet this requirement."
+        )
 
+if current_platform.is_rocm():
     from vllm.triton_utils import tl, triton
     from vllm.utils import direct_register_custom_op
 

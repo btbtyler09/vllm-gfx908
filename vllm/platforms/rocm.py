@@ -125,6 +125,27 @@ def on_gfx9() -> bool:
 
 
 @cache
+def is_aiter_supported() -> bool:
+    """Check if AITER is supported on the current hardware.
+    
+    AITER (AMD's optimization library) is only supported on CDNA3+ architectures
+    (MI300 series with gfx942/gfx950). MI100 (gfx908) and other older GPUs are
+    not supported.
+    
+    Returns True if:
+    - Running on MI300 series (gfx942/gfx950) OR
+    - User explicitly enabled it via VLLM_ROCM_USE_AITER (for testing)
+    """
+    # Check if user explicitly wants to use AITER (might be for testing)
+    if envs.VLLM_ROCM_USE_AITER:
+        return True
+    
+    # Otherwise, only enable on supported hardware (CDNA3+)
+    # MI100 (gfx908) is NOT supported
+    return on_mi3xx()
+
+
+@cache
 def use_rocm_custom_paged_attention(
         qtype: torch.dtype,
         head_size: int,

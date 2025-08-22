@@ -112,10 +112,17 @@ class EagleProposer:
         if current_platform.is_rocm():
             rocm_types = [TritonAttentionMetadata, FlashAttentionMetadata]
             # vllm.v1.attention.backends.rocm_aiter_fa is an optional backend
+            # Only try to import it if the hardware supports AITER
+            # MI100 (gfx908) does NOT support AITER
             if find_spec("vllm.v1.attention.backends.rocm_aiter_fa"):
-                from vllm.v1.attention.backends.rocm_aiter_fa import (
-                    AiterFlashAttentionMetadata)
-                rocm_types.append(AiterFlashAttentionMetadata)
+                try:
+                    from vllm.v1.attention.backends.rocm_aiter_fa import (
+                        AiterFlashAttentionMetadata)
+                    rocm_types.append(AiterFlashAttentionMetadata)
+                    logger.info("AITER Flash Attention backend is available and loaded")
+                except ImportError as e:
+                    # This is expected on MI100 and other unsupported hardware
+                    logger.info(f"AITER Flash Attention backend not available: {e}")
             self.allowed_attn_types = tuple(rocm_types)
         else:
             self.allowed_attn_types = (FlashAttentionMetadata,
