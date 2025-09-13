@@ -13,6 +13,12 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
+# Import platform detection functions
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_mi100
+else:
+    on_mi100 = lambda *args, **kwargs: False
+
 logger = init_logger(__name__)
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
@@ -48,6 +54,13 @@ def find_seq_idx(query_start_len_ptr, target_idx, num_seqs,
     return left - 1
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_stages=1, num_warps=4) if on_mi100() else
+        triton.Config({}, num_stages=1, num_warps=8)
+    ],
+    key=[]
+)
 @triton.jit
 def kernel_unified_attention_2d(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
@@ -302,6 +315,13 @@ def kernel_unified_attention_2d(
     )
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_stages=1, num_warps=4) if on_mi100() else
+        triton.Config({}, num_stages=1, num_warps=8)
+    ],
+    key=[]
+)
 @triton.jit
 def kernel_unified_attention_3d(
         segm_output_ptr,

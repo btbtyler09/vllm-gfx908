@@ -29,9 +29,10 @@ from vllm.triton_utils import tl, triton
 
 # Avoid misleading ROCm warning.
 if current_platform.is_rocm():
-    from vllm.platforms.rocm import on_gfx1x
+    from vllm.platforms.rocm import on_gfx1x, on_mi100
 else:
     on_gfx1x = lambda *args, **kwargs: False
+    on_mi100 = lambda *args, **kwargs: False
 
 torch_dtype: tl.constexpr = torch.float16
 
@@ -388,8 +389,69 @@ def get_rdna_autotune_configs():
     ], ['IS_CAUSAL', 'dropout_p', 'BLOCK_DMODEL', 'USE_FP8']
 
 
+def get_mi100_autotune_configs():
+    return [
+        triton.Config(
+            {
+                'BLOCK_M': 128,
+                'BLOCK_N': 64,
+                'waves_per_eu': 2,
+                'PRE_LOAD_V': False
+            },
+            num_stages=1,
+            num_warps=4),
+        triton.Config(
+            {
+                'BLOCK_M': 64,
+                'BLOCK_N': 64,
+                'waves_per_eu': 2,
+                'PRE_LOAD_V': False
+            },
+            num_stages=1,
+            num_warps=4),
+        triton.Config(
+            {
+                'BLOCK_M': 128,
+                'BLOCK_N': 128,
+                'waves_per_eu': 1,
+                'PRE_LOAD_V': False
+            },
+            num_stages=1,
+            num_warps=4),
+        triton.Config(
+            {
+                'BLOCK_M': 64,
+                'BLOCK_N': 32,
+                'waves_per_eu': 3,
+                'PRE_LOAD_V': False
+            },
+            num_stages=1,
+            num_warps=2),
+        triton.Config(
+            {
+                'BLOCK_M': 32,
+                'BLOCK_N': 32,
+                'waves_per_eu': 4,
+                'PRE_LOAD_V': False
+            },
+            num_stages=1,
+            num_warps=2),
+        triton.Config(
+            {
+                'BLOCK_M': 32,
+                'BLOCK_N': 64,
+                'waves_per_eu': 2,
+                'PRE_LOAD_V': False
+            },
+            num_stages=1,
+            num_warps=2),
+    ], ['IS_CAUSAL', 'dropout_p', 'BLOCK_DMODEL', 'USE_FP8']
+
+
 def get_autotune_configs():
-    if on_gfx1x():
+    if on_mi100():
+        return get_mi100_autotune_configs()
+    elif on_gfx1x():
         return get_rdna_autotune_configs()
     else:
         return get_cdna_autotune_configs()
