@@ -1,13 +1,8 @@
-ARG BASE_IMAGE=rocm/dev-ubuntu-22.04:6.3.4-complete
-ARG HIPBLASLT_BRANCH="3bca5da"
-ARG HIPBLAS_COMMON_BRANCH="f159ae0"
-ARG LEGACY_HIPBLASLT_OPTION=
-ARG RCCL_BRANCH="4486d09"
-ARG RCCL_REPO="https://github.com/ROCm/rccl"
-ARG TRITON_BRANCH="d654e0f"
+ARG BASE_IMAGE=rocm/dev-ubuntu-22.04:6.4-complete
+ARG TRITON_BRANCH="dc5b0c6"
 ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
-ARG PYTORCH_BRANCH="295f2ed4"
-ARG PYTORCH_VISION_BRANCH="v0.21.0"
+ARG PYTORCH_BRANCH="ba56102"
+ARG PYTORCH_VISION_BRANCH="v0.23.0"
 ARG PYTORCH_REPO="https://github.com/pytorch/pytorch.git"
 ARG PYTORCH_VISION_REPO="https://github.com/pytorch/vision.git"
 ARG FA_BRANCH="main"
@@ -52,38 +47,8 @@ RUN apt-get update -y \
 
 RUN pip install -U packaging 'cmake<4' ninja wheel setuptools pybind11 Cython
 
-FROM base AS build_hipblaslt
-ARG HIPBLASLT_BRANCH
-ARG HIPBLAS_COMMON_BRANCH
-# Set to "--legacy_hipblas_direct" for ROCm<=6.2
-ARG LEGACY_HIPBLASLT_OPTION
-
-RUN git clone https://github.com/ROCm/hipBLAS-common.git
-RUN cd hipBLAS-common \
-    && git checkout ${HIPBLAS_COMMON_BRANCH} \
-    && mkdir build \
-    && cd build \
-    && cmake .. \
-    && make package \
-    && dpkg -i ./*.deb
-RUN apt-get update && apt --fix-broken install -y
-RUN git clone https://github.com/ROCm/hipBLASLt
-RUN cd hipBLASLt \
-    && git checkout ${HIPBLASLT_BRANCH} \
-    && apt-get install -y llvm-dev \
-    && ./install.sh -dc --architecture ${PYTORCH_ROCM_ARCH} ${LEGACY_HIPBLASLT_OPTION} \
-    && cd build/release \
-    && make package
-RUN mkdir -p /app/install && cp /app/hipBLASLt/build/release/*.deb /app/hipBLAS-common/build/*.deb /app/install
-
-FROM base AS build_rccl
-ARG RCCL_BRANCH
-ARG RCCL_REPO
-RUN git clone ${RCCL_REPO}
-RUN cd rccl \
-    && git checkout ${RCCL_BRANCH} \
-    && ./install.sh -p --amdgpu_targets ${PYTORCH_ROCM_ARCH}
-RUN mkdir -p /app/install && cp /app/rccl/build/release/*.deb /app/install
+# hipBLAS, hipBLASLt, and RCCL are already included in ROCm 6.4-complete base image
+# No need to build from source
 
 FROM base AS build_triton
 ARG TRITON_BRANCH
@@ -91,9 +56,12 @@ ARG TRITON_REPO
 RUN git clone ${TRITON_REPO}
 RUN cd triton \
     && git checkout ${TRITON_BRANCH} \
-    && cd python \
-    && python3 setup.py bdist_wheel --dist-dir=dist
-RUN mkdir -p /app/install && cp /app/triton/python/dist/*.whl /app/install
+    && python3 setup.py bdist_wheel --dist-dir=dist \
+    && if [ -d "python/triton_kernels" ]; then \
+        cd python/triton_kernels && \
+        pip wheel . --no-deps -w ../../dist || echo "triton_kernels build failed"; \
+    fi
+RUN mkdir -p /app/install && cp /app/triton/dist/*.whl /app/install
 
 FROM base AS build_amdsmi
 RUN cd /opt/rocm/share/amd_smi \
@@ -127,14 +95,7 @@ RUN mkdir -p /app/install && cp /app/pytorch/dist/*.whl /app/install \
     && cp /app/flash-attention-gfx908/dist/*.whl /app/install
 
 FROM base AS final
-RUN --mount=type=bind,from=build_hipblaslt,src=/app/install/,target=/install \
-    dpkg -i /install/*deb \
-    && sed -i 's/, hipblaslt-dev \(.*\), hipcub-dev/, hipcub-dev/g' /var/lib/dpkg/status \
-    && sed -i 's/, hipblaslt \(.*\), hipfft/, hipfft/g' /var/lib/dpkg/status
-RUN --mount=type=bind,from=build_rccl,src=/app/install/,target=/install \
-    dpkg -i /install/*deb \
-    && sed -i 's/, rccl-dev \(.*\), rocalution/, rocalution/g' /var/lib/dpkg/status \
-    && sed -i 's/, rccl \(.*\), rocalution/, rocalution/g' /var/lib/dpkg/status
+# hipBLAS, hipBLASLt, and RCCL libraries are already in the base image
 RUN --mount=type=bind,from=build_triton,src=/app/install/,target=/install \
     pip install /install/*.whl
 RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
@@ -142,16 +103,7 @@ RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
 RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
     pip install /install/*.whl
 
-# Fix hipBLASLt version mismatch - PyTorch expects libhipblaslt.so.0 but we have libhipblaslt.so.1
-RUN ln -sf /opt/rocm/lib/libhipblaslt.so.1 /opt/rocm/lib/libhipblaslt.so.0 \
-    && ldconfig
-
 ARG BASE_IMAGE
-ARG HIPBLAS_COMMON_BRANCH
-ARG HIPBLASLT_BRANCH
-ARG LEGACY_HIPBLASLT_OPTION
-ARG RCCL_BRANCH
-ARG RCCL_REPO
 ARG TRITON_BRANCH
 ARG TRITON_REPO
 ARG PYTORCH_BRANCH
@@ -161,11 +113,6 @@ ARG PYTORCH_VISION_REPO
 ARG FA_BRANCH
 ARG FA_REPO
 RUN echo "BASE_IMAGE: ${BASE_IMAGE}" > /app/versions.txt \
-    && echo "HIPBLAS_COMMON_BRANCH: ${HIPBLAS_COMMON_BRANCH}" >> /app/versions.txt \
-    && echo "HIPBLASLT_BRANCH: ${HIPBLASLT_BRANCH}" >> /app/versions.txt \
-    && echo "LEGACY_HIPBLASLT_OPTION: ${LEGACY_HIPBLASLT_OPTION}" >> /app/versions.txt \
-    && echo "RCCL_BRANCH: ${RCCL_BRANCH}" >> /app/versions.txt \
-    && echo "RCCL_REPO: ${RCCL_REPO}" >> /app/versions.txt \
     && echo "TRITON_BRANCH: ${TRITON_BRANCH}" >> /app/versions.txt \
     && echo "TRITON_REPO: ${TRITON_REPO}" >> /app/versions.txt \
     && echo "PYTORCH_BRANCH: ${PYTORCH_BRANCH}" >> /app/versions.txt \
