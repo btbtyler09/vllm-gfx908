@@ -631,23 +631,22 @@ class Florence2LanguageModel(nn.Module):
     ) -> torch.Tensor:
         r"""
         Args:
-            input_ids
-                Indices of *decoder* input sequence tokens in the vocabulary.
+            input_ids: Indices of *decoder* input sequence tokens 
+                in the vocabulary.
                 Padding will be ignored by default should you
                 provide it.
-            positions
-                Positions of *decoder* input sequence tokens.
-            encoder_input_ids
-                Indices of *encoder* input sequence tokens in the vocabulary.
-            encoder_positions:
-                Positions of *encoder* input sequence tokens.
+            positions: Positions of *decoder* input sequence tokens.
+            encoder_input_ids: Indices of *encoder* input sequence tokens 
+                in the vocabulary.
+            encoder_positions: Positions of *encoder* input sequence tokens.
         Returns:
             Model output torch.Tensor
         """
 
         encoder_hidden_states = None
 
-        if inputs_embeds is not None or encoder_input_ids.numel() > 0:
+        if ((inputs_embeds is not None and inputs_embeds.numel() > 0)
+                or encoder_input_ids.numel() > 0):
             # Run encoder attention if a non-zero number of encoder tokens
             # are provided as input
             encoder_hidden_states = self.encoder(input_ids=encoder_input_ids,
@@ -681,6 +680,8 @@ class Florence2LanguageForConditionalGeneration(nn.Module, SupportsV0Only):
         self.lm_head = BartParallelLMHead(self.vocab_size,
                                           config.d_model,
                                           embed_scale=embed_scale)
+        if self.config.tie_word_embeddings:
+            self.lm_head.tie_weights(self.model.shared)
 
         self.logits_processor = LogitsProcessor(self.vocab_size,
                                                 config.vocab_size)
@@ -696,14 +697,10 @@ class Florence2LanguageForConditionalGeneration(nn.Module, SupportsV0Only):
     ) -> torch.Tensor:
         r"""
         Args:
-            input_ids
-                torch.Tensor of *decoder* input token ids.
-            positions
-                torch.Tensor of *decoder* position indices.
-            encoder_input_ids
-                torch.Tensor of *encoder* input token ids.
-            encoder_positions
-                torch.Tensor of *encoder* position indices
+            input_ids: torch.Tensor of *decoder* input token ids.
+            positions: torch.Tensor of *decoder* position indices.
+            encoder_input_ids: torch.Tensor of *encoder* input token ids.
+            encoder_positions: torch.Tensor of *encoder* position indices
         Returns:
             Output torch.Tensor
         """
@@ -749,7 +746,8 @@ class Florence2LanguageForConditionalGeneration(nn.Module, SupportsV0Only):
             else:
                 if "final_logits_bias" in name:
                     continue
-                if self.config.tie_word_embeddings and "embed_tokens" in name:
+                if self.config.tie_word_embeddings and ("embed_tokens" in name
+                                                        or "lm_head" in name):
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
@@ -1064,14 +1062,10 @@ class Florence2ForConditionalGeneration(nn.Module, SupportsMultiModal,
     ) -> torch.Tensor:
         r"""
         Args:
-            input_ids
-                torch.Tensor of *decoder* input token ids.
-            positions
-                torch.Tensor of *decoder* position indices.
-            encoder_input_ids
-                torch.Tensor of *encoder* input token ids.
-            encoder_positions
-                torch.Tensor of *encoder* position indices
+            input_ids: torch.Tensor of *decoder* input token ids.
+            positions: torch.Tensor of *decoder* position indices.
+            encoder_input_ids: torch.Tensor of *encoder* input token ids.
+            encoder_positions: torch.Tensor of *encoder* position indices
         Returns:
             Output torch.Tensor
         """
