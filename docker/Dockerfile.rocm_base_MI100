@@ -1,9 +1,9 @@
 ARG BASE_IMAGE=rocm/dev-ubuntu-22.04:6.4-complete
 ARG TRITON_BRANCH="81d413e"
 ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
-ARG PYTORCH_BRANCH="ba56102"
-ARG PYTORCH_VISION_BRANCH="v0.23.0"
-ARG PYTORCH_REPO="https://github.com/pytorch/pytorch.git"
+ARG PYTORCH_BRANCH="f717b2af"
+ARG PYTORCH_VISION_BRANCH="v0.21.0"
+ARG PYTORCH_REPO="https://github.com/ROCm/pytorch.git"
 ARG PYTORCH_VISION_REPO="https://github.com/pytorch/vision.git"
 ARG FA_BRANCH="main"
 ARG FA_REPO="https://github.com/btbtyler09/flash-attention-gfx908.git"

@@ -160,13 +160,31 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def _maybe_ignore_quant_config(self, quant_config: QuantizationConfig):
         # GPTQ configs do not have a list of ignored modules, however AutoGPTQ
         # seems to avoid gate quantization while AutoRound does.
+        # gptqmodel also quantizes gates, so we need to check for it too.
         # See: https://huggingface.co/Qwen/Qwen3-30B-A3B-GPTQ-Int4,
         # and https://huggingface.co/jart25/Qwen3-Coder-30B-A3B-Instruct-Int4-gptq
-        if isinstance(
-                quant_config,
-            (GPTQConfig,
-             GPTQMarlinConfig)) and not quant_config.autoround_version:
-            return None
+        if isinstance(quant_config, (GPTQConfig, GPTQMarlinConfig)):
+            # Check if this is gptqmodel (which quantizes gates)
+            is_gptqmodel = False
+            
+            # For GPTQConfig, check the meta field
+            if isinstance(quant_config, GPTQConfig) and hasattr(quant_config, 'meta') and quant_config.meta:
+                quantizer = quant_config.meta.get('quantizer', [])
+                if quantizer and 'gptqmodel' in str(quantizer):
+                    is_gptqmodel = True
+            
+            # For GPTQMarlinConfig, check the full_config
+            elif isinstance(quant_config, GPTQMarlinConfig) and hasattr(quant_config, 'full_config') and quant_config.full_config:
+                meta = quant_config.full_config.get('meta', {})
+                if meta:
+                    quantizer = meta.get('quantizer', [])
+                    if quantizer and 'gptqmodel' in str(quantizer):
+                        is_gptqmodel = True
+            
+            # Return None only for standard AutoGPTQ (not AutoRound, not gptqmodel)
+            if not quant_config.autoround_version and not is_gptqmodel:
+                return None
+        
         return quant_config
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

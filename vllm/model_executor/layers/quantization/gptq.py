@@ -44,6 +44,7 @@ class GPTQConfig(QuantizationConfig):
         lm_head_quantized: bool,
         dynamic: dict[str, dict[str, Union[int, bool]]],
         autoround_version: str = "",
+        meta: dict[str, Any] = None,
     ) -> None:
         # GPTQModel use `dynamic` config property to allow per module
         # quantization config so each module can be individually optimized.
@@ -83,6 +84,9 @@ class GPTQConfig(QuantizationConfig):
 
         # used to identify GPTQ model quantized by autoround
         self.autoround_version = autoround_version
+        
+        # metadata about the quantization tool used (e.g., gptqmodel, AutoGPTQ)
+        self.meta = meta or {}
 
     def __repr__(self) -> str:
         return (f"GPTQConfig(weight_bits={self.weight_bits}, "
@@ -120,8 +124,9 @@ class GPTQConfig(QuantizationConfig):
                                                  default=False)
         autoround_version = cls.get_from_keys_or(config, ["autoround_version"],
                                                  default="")
+        meta = cls.get_from_keys_or(config, ["meta"], default={})
         return cls(weight_bits, group_size, desc_act, lm_head_quantized,
-                   dynamic, autoround_version)
+                   dynamic, autoround_version, meta)
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str

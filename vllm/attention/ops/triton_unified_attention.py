@@ -56,7 +56,6 @@ def find_seq_idx(query_start_len_ptr, target_idx, num_seqs,
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_stages=1, num_warps=4) if on_mi100() else
         triton.Config({}, num_stages=1, num_warps=8)
     ],
     key=[]
@@ -317,7 +316,6 @@ def kernel_unified_attention_2d(
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_stages=1, num_warps=4) if on_mi100() else
         triton.Config({}, num_stages=1, num_warps=8)
     ],
     key=[]
