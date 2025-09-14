@@ -23,6 +23,25 @@ logger = init_logger(__name__)
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
 
+def get_mi100_unified_attention_autotune_configs():
+    """Get MI100-specific autotune configs for unified attention kernels.
+    
+    Uses 2 warps for better compilation time and small workloads,
+    with 8 warps as fallback for larger workloads.
+    """
+    if on_mi100():
+        # MI100 optimized configs: prefer 2 warps for faster compilation
+        return [
+            triton.Config({}, num_stages=1, num_warps=2),
+            triton.Config({}, num_stages=1, num_warps=8),
+        ]
+    else:
+        # Default config for other platforms
+        return [
+            triton.Config({}, num_stages=1, num_warps=8)
+        ]
+
+
 @triton.jit
 def cdiv_fn(x, y):
     return (x + y - 1) // y
@@ -55,9 +74,7 @@ def find_seq_idx(query_start_len_ptr, target_idx, num_seqs,
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_stages=1, num_warps=8)
-    ],
+    configs=get_mi100_unified_attention_autotune_configs(),
     key=[]
 )
 @triton.jit
@@ -315,9 +332,7 @@ def kernel_unified_attention_2d(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_stages=1, num_warps=8)
-    ],
+    configs=get_mi100_unified_attention_autotune_configs(),
     key=[]
 )
 @triton.jit
