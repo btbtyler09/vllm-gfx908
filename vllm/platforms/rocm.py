@@ -112,6 +112,13 @@ def on_gfx950() -> bool:
 
 
 @cache
+def on_mi100() -> bool:
+    """Detect MI100 (gfx908) which lacks native FP8 hardware."""
+    GPU_ARCH = torch.cuda.get_device_properties("cuda").gcnArchName
+    return "gfx908" in GPU_ARCH
+
+
+@cache
 def use_rocm_custom_paged_attention(
     qtype: torch.dtype,
     head_size: int,

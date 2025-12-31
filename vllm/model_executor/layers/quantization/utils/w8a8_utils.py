@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable
 
 import torch
@@ -181,6 +182,130 @@ def flashinfer_w8a8_scaled_mm(
     )
 
 
+# Use PyTorch dequant by default on MI100 (HIP kernel has unresolved issues)
+# Set MI100_USE_HIP_KERNEL=1 to use the custom HIP kernel instead
+_MI100_USE_PYTORCH = os.environ.get("MI100_USE_HIP_KERNEL", "0") != "1"
+_mi100_debug_logged = False
+
+# Timing instrumentation for performance debugging
+import time
+_mi100_timing_enabled = os.environ.get("MI100_FP8_TIMING", "0") == "1"
+_mi100_dequant_times: list[float] = []
+_mi100_gemm_times: list[float] = []
+_mi100_call_count = 0
+
+
+def mi100_fp8_scaled_mm_impl(
+    qinput: torch.Tensor,
+    weight: torch.Tensor,
+    out_dtype: torch.dtype,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    """
+    MI100 FP8 scaled matmul: dequant FP8 -> FP16, then rocBLAS GEMM.
+
+    MI100 (gfx908) lacks native FP8 hardware. By default, uses PyTorch's
+    native FP8->FP16 conversion. Set MI100_USE_HIP_KERNEL=1 to use custom
+    HIP kernel instead (faster but has unresolved issues).
+    """
+    global _mi100_debug_logged, _mi100_call_count, _mi100_dequant_times, _mi100_gemm_times
+
+    if _MI100_USE_PYTORCH:
+        # PyTorch path: Use native FP8->FP16 conversion (known-correct)
+        if not _mi100_debug_logged:
+            print(f"[MI100_FP8] Using PyTorch dequant (default for MI100)")
+            print(f"[MI100_FP8] Set MI100_USE_HIP_KERNEL=1 to use HIP kernel instead")
+            if _mi100_timing_enabled:
+                print(f"[MI100_FP8] Timing enabled (MI100_FP8_TIMING=1)")
+            _mi100_debug_logged = True
+
+        if _mi100_timing_enabled:
+            # Timing path: measure dequant and GEMM separately
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+            # Dequant: cast FP8 -> FP16, then multiply by scale
+            input_fp16 = qinput.to(torch.float16) * scale_a.to(torch.float16)
+            weight_fp16 = weight.to(torch.float16) * scale_b.to(torch.float16)
+
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+
+            # GEMM via rocBLAS
+            output = torch.mm(input_fp16, weight_fp16)
+
+            torch.cuda.synchronize()
+            t2 = time.perf_counter()
+
+            dequant_ms = (t1 - t0) * 1000
+            gemm_ms = (t2 - t1) * 1000
+            _mi100_dequant_times.append(dequant_ms)
+            _mi100_gemm_times.append(gemm_ms)
+            _mi100_call_count += 1
+
+            # Print summary every 100 calls
+            if _mi100_call_count % 100 == 0:
+                avg_dequant = sum(_mi100_dequant_times[-100:]) / 100
+                avg_gemm = sum(_mi100_gemm_times[-100:]) / 100
+                m, k = qinput.shape
+                n = weight_fp16.shape[1]
+                tflops = (2 * m * n * k) / (avg_gemm / 1000) / 1e12
+                print(f"[MI100_TIMING] calls={_mi100_call_count}, "
+                      f"shape=[{m},{k}]x[{k},{n}], "
+                      f"dequant={avg_dequant:.2f}ms, gemm={avg_gemm:.2f}ms, "
+                      f"gemm_tflops={tflops:.1f}", flush=True)
+        else:
+            # Fast path: no timing overhead
+            # Dequant: cast FP8 -> FP16, then multiply by scale
+            input_fp16 = qinput.to(torch.float16) * scale_a.to(torch.float16)
+            weight_fp16 = weight.to(torch.float16) * scale_b.to(torch.float16)
+
+            # GEMM via rocBLAS
+            output = torch.mm(input_fp16, weight_fp16)
+
+        if bias is not None:
+            output = output + bias
+
+        return output.to(out_dtype)
+
+    # Production path: Use HIP kernel
+    from mi100_ops.hip.fp8_gemm import fp8_to_fp16_scaled
+
+    # Dequant FP8 -> FP16 for both input and weight
+    # Note: scale_a and scale_b are per-tensor scales (passed directly to kernel)
+    # Ensure tensors are contiguous before passing to HIP kernel
+    input_u8 = qinput.view(torch.uint8).contiguous()
+    weight_u8 = weight.view(torch.uint8).contiguous()
+    input_fp16 = fp8_to_fp16_scaled(input_u8, scale_a)
+    weight_fp16 = fp8_to_fp16_scaled(weight_u8, scale_b)
+
+    # DEBUG: Compare HIP kernel output with PyTorch native on first call
+    if not _mi100_debug_logged:
+        # PyTorch reference
+        input_ref = qinput.to(torch.float16) * scale_a.to(torch.float16)
+        weight_ref = weight.to(torch.float16) * scale_b.to(torch.float16)
+
+        input_diff = (input_ref - input_fp16).abs().max().item()
+        weight_diff = (weight_ref - weight_fp16).abs().max().item()
+
+        print(f"[HIP_DEBUG] input_fp16: std={input_fp16.std().item():.6f}, ref_std={input_ref.std().item():.6f}, diff={input_diff:.6f}", flush=True)
+        print(f"[HIP_DEBUG] weight_fp16: std={weight_fp16.std().item():.6f}, ref_std={weight_ref.std().item():.6f}, diff={weight_diff:.6f}", flush=True)
+        _mi100_debug_logged = True
+
+    # GEMM via rocBLAS
+    output = torch.mm(input_fp16, weight_fp16)
+
+    if bias is not None:
+        output = output + bias
+
+    return output.to(out_dtype)
+
+
+_rocm_dispatch_logged = False
+
+
 def rocm_per_tensor_w8a8_scaled_mm_impl(
     qinput: torch.Tensor,
     weight: torch.Tensor,
@@ -189,8 +314,24 @@ def rocm_per_tensor_w8a8_scaled_mm_impl(
     scale_b: torch.Tensor,
     bias: torch.Tensor,
 ) -> torch.Tensor:
-    from vllm.platforms.rocm import on_mi3xx
+    global _rocm_dispatch_logged
+    from vllm.platforms.rocm import on_mi100, on_mi3xx
 
+    # Log dispatch on first call
+    if not _rocm_dispatch_logged:
+        import sys
+        is_mi100 = on_mi100()
+        using_pytorch = _MI100_USE_PYTORCH if is_mi100 else False
+        print(f"[FP8_DISPATCH] on_mi100()={is_mi100}, using_pytorch={using_pytorch}", file=sys.stderr, flush=True)
+        _rocm_dispatch_logged = True
+
+    # MI100: Use custom dequant + rocBLAS (no native FP8 hardware)
+    if on_mi100():
+        return mi100_fp8_scaled_mm_impl(
+            qinput, weight, out_dtype, scale_a, scale_b, bias
+        )
+
+    # MI300+: Use native FP8 ops
     if (
         envs.VLLM_ROCM_USE_SKINNY_GEMM
         and on_mi3xx()
