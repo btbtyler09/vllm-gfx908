@@ -410,7 +410,7 @@ class HfRunner:
 
         # don't put this import at the top level
         # it will call torch.cuda.device_count()
-        from transformers import AutoProcessor  # noqa: F401
+        from transformers import AutoProcessor
 
         self.processor = AutoProcessor.from_pretrained(
             model_name,
@@ -702,10 +702,16 @@ class HfRunner:
                 **kwargs,
             )
 
+            # Encoder-decoder models return decoder_hidden_states instead of
+            # hidden_states
+            hidden_states = (
+                getattr(output, "hidden_states", None) or output.decoder_hidden_states
+            )
+
             (
                 seq_logprobs_lst,
                 output_len,
-            ) = self._hidden_states_to_logprobs(output.hidden_states, num_logprobs)
+            ) = self._hidden_states_to_logprobs(hidden_states, num_logprobs)
 
             all_logprobs.append(seq_logprobs_lst)
             seq_ids = output.sequences[0]
