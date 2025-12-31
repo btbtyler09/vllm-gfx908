@@ -681,11 +681,39 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.hidden_size, args.hidden_size, bias=False)
         self.wo = nn.Linear(args.hidden_size, args.hidden_size, bias=False)
 
+    def _chunked_sdpa(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Memory-efficient chunked SDPA - processes each image separately."""
+        batch, patches, heads, dim = q.shape
+        outputs = []
+        lens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+
+        q_chunks = torch.split(q.squeeze(0), lens, dim=0)
+        k_chunks = torch.split(k.squeeze(0), lens, dim=0)
+        v_chunks = torch.split(v.squeeze(0), lens, dim=0)
+
+        for q_i, k_i, v_i in zip(q_chunks, k_chunks, v_chunks):
+            # [seq, heads, dim] -> [1, heads, seq, dim]
+            q_i = q_i.unsqueeze(0).transpose(1, 2)
+            k_i = k_i.unsqueeze(0).transpose(1, 2)
+            v_i = v_i.unsqueeze(0).transpose(1, 2)
+            out_i = nn.functional.scaled_dot_product_attention(q_i, k_i, v_i)
+            out_i = out_i.transpose(1, 2).squeeze(0)  # back to [seq, heads, dim]
+            outputs.append(out_i)
+
+        return torch.cat(outputs, dim=0).unsqueeze(0)  # [1, patches, heads, dim]
+
     def forward(
         self,
         x: torch.Tensor,
-        mask: torch.Tensor,
+        mask: torch.Tensor | None,
         freqs_cis: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, patches, _ = x.shape
 
@@ -698,6 +726,9 @@ class Attention(nn.Module):
 
         if USE_XFORMERS_OPS:
             out = xops.memory_efficient_attention(q, k, v, attn_bias=mask)
+        elif cu_seqlens is not None:
+            # Memory-efficient chunked attention (no dense mask needed)
+            out = self._chunked_sdpa(q, k, v, cu_seqlens)
         else:
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
@@ -720,11 +751,13 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        mask: torch.Tensor,
+        mask: torch.Tensor | None,
         freqs_cis: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         r = self.attention.forward(
-            self.attention_norm(x), mask=mask, freqs_cis=freqs_cis
+            self.attention_norm(x), mask=mask, freqs_cis=freqs_cis,
+            cu_seqlens=cu_seqlens
         )
         h = x + r
         r = self.feed_forward.forward(self.ffn_norm(h))
@@ -742,11 +775,12 @@ class Transformer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        mask: torch.Tensor,
+        mask: torch.Tensor | None,
         freqs_cis: torch.Tensor | None,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         for layer in self.layers:
-            x = layer(x, mask=mask, freqs_cis=freqs_cis)
+            x = layer(x, mask=mask, freqs_cis=freqs_cis, cu_seqlens=cu_seqlens)
         return x
 
 
@@ -847,15 +881,20 @@ class VisionTransformer(nn.Module):
             mask = xops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(
                 [p.shape[-2] * p.shape[-1] for p in patch_embeds_list],
             )
+            out = self.transformer(patch_embeds, mask=mask, freqs_cis=freqs_cis)
         else:
-            from transformers.models.pixtral.modeling_pixtral import (
-                generate_block_attention_mask,
+            # Use cu_seqlens for memory-efficient chunked attention
+            # This avoids creating a huge dense attention mask (e.g., 96k x 96k)
+            seqlens = [p.shape[-2] * p.shape[-1] for p in patch_embeds_list]
+            cu_seqlens = torch.zeros(
+                len(seqlens) + 1, dtype=torch.int32, device=patch_embeds.device
             )
-
-            mask = generate_block_attention_mask(
-                [p.shape[-2] * p.shape[-1] for p in patch_embeds_list], patch_embeds
+            cu_seqlens[1:] = torch.cumsum(
+                torch.tensor(seqlens, device=patch_embeds.device), dim=0
             )
-        out = self.transformer(patch_embeds, mask=mask, freqs_cis=freqs_cis)
+            out = self.transformer(
+                patch_embeds, mask=None, freqs_cis=freqs_cis, cu_seqlens=cu_seqlens
+            )
 
         # squeeze dim 0 and split into separate tensors for each image
         return torch.split(out.squeeze(0), embed_sizes)
