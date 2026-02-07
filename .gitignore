@@ -7,6 +7,9 @@ vllm/vllm_flash_attn/*
 # OpenAI triton kernels copied from source
 vllm/third_party/triton_kernels/*
 
+# FlashMLA interface copied from source
+vllm/third_party/flashmla/flash_mla_interface.py
+
 # triton jit
 .triton
 
@@ -198,6 +201,9 @@ nlzy-vllm-gfx906/
 AGENTS.md
 .codex/
 
+# Cursor
+.cursor/
+
 # DS Store
 .DS_Store
 
@@ -237,3 +243,8 @@ ep_kernels_workspace/
 
 # Separate project - has its own git repo
 mi100-ops/
+
+# Generated gRPC protobuf files (compiled at build time from vllm_engine.proto)
+vllm/grpc/vllm_engine_pb2.py
+vllm/grpc/vllm_engine_pb2_grpc.py
+vllm/grpc/vllm_engine_pb2.pyi
