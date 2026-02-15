@@ -195,6 +195,8 @@ def rocm_unquantized_gemm_impl(
     )
 
     if use_skinny is not True:
+        if x.dtype != weight.dtype:
+            x = x.to(weight.dtype)
         return torch.nn.functional.linear(x, weight, bias)
 
     x_view = x.reshape(-1, x.size(-1))
@@ -205,13 +207,15 @@ def rocm_unquantized_gemm_impl(
     elif m % 4 == 0 and n == 1 and k <= 8192 and bias is None:
         out = ops.LLMM1(weight, x_view, 4)
         return out.reshape(*x.shape[:-1], weight.shape[0])
+    if x.dtype != weight.dtype:
+        x = x.to(weight.dtype)
     return torch.nn.functional.linear(x, weight, bias)
 
 
 def rocm_unquantized_gemm_fake(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
-    return x.new_empty((*x.shape[:-1], weight.shape[0]))
+    return weight.new_empty((*x.shape[:-1], weight.shape[0]))
 
 
 def rocm_unquantized_gemm(
