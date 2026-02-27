@@ -27,6 +27,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe import *
 from vllm.model_executor.layers.fused_moe.triton_deep_gemm_moe import (
     TritonOrDeepGemmExperts,
 )
+from vllm.model_executor.layers.fused_moe.utils import disable_inplace
 from vllm.transformers_utils.config import get_config
 from vllm.triton_utils import triton
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -226,9 +227,10 @@ def benchmark_config(
                 x, input_gating, topk, renormalize=not use_deep_gemm
             )
 
+            use_inplace = not disable_inplace()
             if use_deep_gemm:
                 return deep_gemm_experts(
-                    x, w1, w2, topk_weights, topk_ids, inplace=True
+                    x, w1, w2, topk_weights, topk_ids, inplace=use_inplace
                 )
             return fused_experts(
                 x,
@@ -236,7 +238,7 @@ def benchmark_config(
                 w2,
                 topk_weights,
                 topk_ids,
-                inplace=True,
+                inplace=use_inplace,
                 quant_config=quant_config,
             )
 
