@@ -988,6 +988,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
             suffix_lse=lse,
         )
 
+    @torch.compiler.disable
     def forward(
         self,
         layer: torch.nn.Module,
@@ -1125,9 +1126,11 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 assert attn_metadata.decode_metadata is not None
                 decode_max_query_len = attn_metadata.decode_metadata.max_query_len
 
-                # Use unified_attention for speculative decoding (multi-token)
-                # or when sliding window is enabled
-                if self.sliding_window[0] != -1 or decode_max_query_len > 1:
+                # Use unified_attention for speculative decoding (multi-token),
+                # sliding window, or gfx908 (ll4mi gated to gfx90a+, Triton
+                # PA decode exceeds MI100 64KB LDS with block_size=528)
+                from vllm.platforms.rocm import on_gfx908 as _on_gfx908
+                if self.sliding_window[0] != -1 or decode_max_query_len > 1 or _on_gfx908():
                     assert not rocm_aiter_ops.is_shuffle_kv_cache_enabled(), (
                         "Shuffle KV cache layout is not supported with sliding "
                         "window or speculative decoding (multi-token decode)."
@@ -1233,47 +1236,101 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         out_=output[:num_decode_tokens],
                     )
                 else:
-                    _, num_heads, head_size = query.shape
-                    nbytes_per_qo_elem = torch.finfo(query.dtype).bits // 8
-                    num_seqs = attn_metadata.seq_lens.shape[0]
-                    max_num_partitions = (
-                        attn_metadata.max_seq_len + _PARTITION_SIZE_ROCM - 1
-                    ) // _PARTITION_SIZE_ROCM
+                    from vllm.platforms.rocm import on_gfx908
 
-                    workspace_buffer = torch.empty(
-                        (num_seqs * num_heads * max_num_partitions * head_size)
-                        * nbytes_per_qo_elem
-                        + 2 * (num_seqs * num_heads * max_num_partitions) * 4,
-                        dtype=torch.uint8,
-                        device=output.device,
-                    )
+                    if on_gfx908():
+                        # ll4mi paged_attention_v1 is gated to gfx90a+.
+                        # Use Triton PA decode instead (3168/3168 tests pass
+                        # on gfx908).
+                        from aiter.ops.triton.attention.pa_decode import (
+                            paged_attention_decode,
+                        )
 
-                    # import so that aiter register the op to the namespace of
-                    # torch.ops.aiter
-                    import aiter  # noqa: F401
+                        # Triton PA decode expects HND layout:
+                        # [num_blocks, num_kv_heads, block_size, head_size]
+                        # AITER FA uses NHD layout:
+                        # [num_blocks, block_size, num_kv_heads, head_size]
+                        # permute is zero-copy (just changes strides)
+                        key_cache_hnd = key_cache.permute(0, 2, 1, 3)
+                        value_cache_hnd = value_cache.permute(0, 2, 1, 3)
 
-                    torch.ops.aiter.paged_attention_v1(
-                        output[:num_decode_tokens],
-                        workspace_buffer,
-                        query[:num_decode_tokens],
-                        key_cache,
-                        value_cache,
-                        self.scale,
-                        attn_metadata.block_table[:num_decodes],
-                        attn_metadata.query_start_loc[:num_decodes],
-                        attn_metadata.seq_lens[:num_decodes],
-                        attn_metadata.max_seq_len,
-                        self.alibi_slopes,
-                        self.kv_cache_dtype,
-                        "NHD",
-                        self.logits_soft_cap,
-                        layer._k_scale,
-                        layer._v_scale,
-                        None,
-                        _PARTITION_SIZE_ROCM,
-                        1,
-                        self.sliding_window[0] + 1,
-                    )
+                        # PA decode expects triton dtype, not torch dtype
+                        _TORCH_TO_TL = {
+                            torch.float16: tl.float16,
+                            torch.bfloat16: tl.bfloat16,
+                            torch.float32: tl.float32,
+                        }
+                        tl_compute_type = _TORCH_TO_TL[query.dtype]
+
+                        paged_attention_decode(
+                            output=output[:num_decode_tokens],
+                            query=query[:num_decode_tokens],
+                            key_cache=key_cache_hnd,
+                            value_cache=value_cache_hnd,
+                            seq_lens=attn_metadata.seq_lens[:num_decodes],
+                            block_tables=attn_metadata.block_table[
+                                :num_decodes
+                            ],
+                            attn_scale=self.scale,
+                            max_seq_len=attn_metadata.max_seq_len,
+                            compute_type=tl_compute_type,
+                            k_scale=layer._k_scale,
+                            v_scale=layer._v_scale,
+                            alibi_slopes=self.alibi_slopes,
+                        )
+                    else:
+                        _, num_heads, head_size = query.shape
+                        nbytes_per_qo_elem = (
+                            torch.finfo(query.dtype).bits // 8
+                        )
+                        num_seqs = attn_metadata.seq_lens.shape[0]
+                        max_num_partitions = (
+                            attn_metadata.max_seq_len
+                            + _PARTITION_SIZE_ROCM
+                            - 1
+                        ) // _PARTITION_SIZE_ROCM
+
+                        workspace_buffer = torch.empty(
+                            (
+                                num_seqs
+                                * num_heads
+                                * max_num_partitions
+                                * head_size
+                            )
+                            * nbytes_per_qo_elem
+                            + 2
+                            * (num_seqs * num_heads * max_num_partitions)
+                            * 4,
+                            dtype=torch.uint8,
+                            device=output.device,
+                        )
+
+                        # import so that aiter register the op to the
+                        # namespace of torch.ops.aiter
+                        import aiter  # noqa: F401
+
+                        torch.ops.aiter.paged_attention_v1(
+                            output[:num_decode_tokens],
+                            workspace_buffer,
+                            query[:num_decode_tokens],
+                            key_cache,
+                            value_cache,
+                            self.scale,
+                            attn_metadata.block_table[:num_decodes],
+                            attn_metadata.query_start_loc[:num_decodes],
+                            attn_metadata.seq_lens[:num_decodes],
+                            attn_metadata.max_seq_len,
+                            self.alibi_slopes,
+                            self.kv_cache_dtype,
+                            "NHD",
+                            self.logits_soft_cap,
+                            layer._k_scale,
+                            layer._v_scale,
+                            None,
+                            _PARTITION_SIZE_ROCM,
+                            1,
+                            self.sliding_window[0] + 1,
+                        )
         else:
             raise NotImplementedError(
                 "Cascade attention is not implemented for ROCM AITER"
@@ -1334,3 +1391,44 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 layer._k_scale,
                 layer._v_scale,
             )
+
+    def fused_rope_kvcache_supported(self):
+        return rocm_aiter_ops.is_enabled()
+
+    def do_rope_and_kv_cache_update(
+        self,
+        layer,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        is_neox: bool,
+        kv_cache: torch.Tensor,
+        layer_slot_mapping: torch.Tensor,
+    ):
+        if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
+            return
+        key_cache, value_cache = kv_cache.unbind(0)
+        flash_layout = True
+
+        is_fp8_kv_cache = self.kv_cache_dtype.startswith("fp8")
+        if is_fp8_kv_cache:
+            key_cache = key_cache.view(current_platform.fp8_dtype())
+            value_cache = value_cache.view(current_platform.fp8_dtype())
+
+        rocm_aiter_ops.triton_rope_and_cache(
+            query,
+            key,
+            value,
+            positions,
+            cos_sin_cache,
+            is_neox,
+            key_cache,
+            value_cache,
+            layer_slot_mapping,
+            layer._k_scale,
+            layer._v_scale,
+            flash_layout,
+            is_fp8_kv_cache,
+        )

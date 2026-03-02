@@ -50,9 +50,9 @@ def is_aiter_found_and_supported() -> bool:
     VLLM_ROCM_USE_AITER=0, while preventing unwanted JIT warnings for auto-discovery.
     """
     if current_platform.is_rocm() and IS_AITER_FOUND:
-        from vllm.platforms.rocm import on_gfx9
+        from vllm.platforms.rocm import on_gfx9, on_gfx908
 
-        return on_gfx9()
+        return on_gfx9() or on_gfx908()
     return False
 
 
@@ -509,7 +509,11 @@ def _rocm_aiter_gemm_a8w8_blockscale_fake(
 def _rocm_aiter_rms_norm_impl(
     x: torch.Tensor, weight: torch.Tensor, variance_epsilon: float
 ) -> torch.Tensor:
-    from aiter import rms_norm
+    from vllm.platforms.rocm import on_gfx908
+    if on_gfx908():
+        from aiter.ops.triton.normalization.rmsnorm import rms_norm
+    else:
+        from aiter import rms_norm
 
     if x.dim() > 2:
         x_original_shape = x.shape
@@ -532,7 +536,12 @@ def _rocm_aiter_rmsnorm2d_fwd_with_add_impl(
     weight: torch.Tensor,
     variance_epsilon: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from aiter import rmsnorm2d_fwd_with_add
+    from vllm.platforms.rocm import on_gfx908
+    if on_gfx908():
+        from aiter.ops.triton.normalization.rmsnorm import \
+            rmsnorm2d_fwd_with_add
+    else:
+        from aiter import rmsnorm2d_fwd_with_add
 
     residual_out = torch.empty_like(residual)
     out = torch.empty_like(x)
@@ -1909,8 +1918,32 @@ class rocm_aiter_ops:
         to allow explicit backend selection via attention_config to work
         even when VLLM_ROCM_USE_AITER=0.
 
-        Note: This performs lazy import of aiter.flash_attn_varlen_func
+        Note: On gfx908, redirects to Triton flash_attn_varlen_func since
+        CK uses gfx90a+ ISA (v_pk_mul_f32). Otherwise uses CK version.
         """
+        from vllm.platforms.rocm import on_gfx908
+
+        if on_gfx908():
+            from aiter.ops.triton.attention.mha import flash_attn_varlen_func
+
+            # Triton version doesn't accept min_seqlen_q
+            return flash_attn_varlen_func(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size if window_size is not None else (-1, -1),
+                alibi_slopes=alibi_slopes,
+                return_lse=return_lse,
+                out=out,
+            )
+
         from aiter import flash_attn_varlen_func
 
         return flash_attn_varlen_func(
