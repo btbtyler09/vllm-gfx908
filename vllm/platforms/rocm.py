@@ -173,8 +173,11 @@ if _ON_GFX908:
         "VLLM_ROCM_USE_AITER_TRITON_GEMM": "0",
         # Disable skinny GEMM (wvSplitK assertion crash on gfx908)
         "VLLM_ROCM_USE_SKINNY_GEMM": "0",
-        # Enable working Triton paths
-        "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": "1",
+        # Disable unified attention — UA kernel corrupts model state after
+        # extended use on gfx908, causing degenerate repetition (e.g. "!!!!!").
+        # Reproduces after ~200+ requests through UA decode path.
+        # Triton Attention is perf-equivalent at c=1 and stable long-term.
+        "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": "0",
         "VLLM_ROCM_USE_AITER_TRITON_ROPE": "1",
     }
     for _var, _val in _GFX908_DEFAULTS.items():
