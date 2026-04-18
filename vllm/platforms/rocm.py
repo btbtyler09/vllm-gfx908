@@ -808,6 +808,14 @@ class RocmPlatform(Platform):
         compilation_config = vllm_config.compilation_config
         parallel_config = vllm_config.parallel_config
 
+        # MI100 (gfx908): block_size=32 reduces TTFT and improves prefix
+        # cache efficiency vs the default block_size=16. Only applied when
+        # the user hasn't explicitly set --block-size.
+        if _ON_MI100:
+            cache_config = vllm_config.cache_config
+            if not cache_config.user_specified_block_size:
+                cache_config.block_size = 32
+
         if compilation_config.cudagraph_mode.has_full_cudagraphs():
             # decode context parallel does not support full cudagraphs
             if parallel_config.decode_context_parallel_size > 1:
