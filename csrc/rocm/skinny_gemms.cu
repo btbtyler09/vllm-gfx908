@@ -21,8 +21,9 @@
 //
 // However, it may be possible to fix these kernels to handle both issues.
 
-#if defined(__HIPCC__) && \
-    (defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__))
+#if defined(__HIPCC__) &&                                           \
+    (defined(__gfx908__) || defined(__gfx90a__) || \
+     defined(__gfx942__) || defined(__gfx950__))
   #define __HIP__GFX9__
 #endif
 
