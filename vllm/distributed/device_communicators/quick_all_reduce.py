@@ -226,7 +226,9 @@ class QuickAllReduce:
         try:
             props = torch.cuda.get_device_properties(0)
             gcn_arch = getattr(props, "gcnArchName", "")
-            supported_archs = ["gfx94", "gfx95"]
+            # gfx908 supported via architecture-specific memory ordering
+            # (CDNA1); gfx942/gfx950 are CDNA3/4.
+            supported_archs = ["gfx908", "gfx94", "gfx95"]
             return any(gfx in gcn_arch for gfx in supported_archs)
         except Exception as e:
             logger.warning("Failed to determine ROCm for quick allreduce: %s", e)
