@@ -1006,6 +1006,17 @@ def _get_tile_size(
         # Gemma3: use 32 for decode (default is 16)
         return 32
 
+    # MI100 (gfx908): larger decode tile amortizes per-tile overhead given
+    # the 1.2 TB/s bandwidth (vs 5.3 TB/s on MI300X).
+    if not is_prefill:
+        from vllm.platforms import current_platform
+
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_mi100
+
+            if on_mi100():
+                return 32
+
     # Default behavior
     if is_prefill:
         return 32
