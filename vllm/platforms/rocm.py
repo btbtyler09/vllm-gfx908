@@ -332,8 +332,7 @@ def on_gfx950() -> bool:
 @cache
 def on_mi100() -> bool:
     """Detect MI100 (gfx908) which lacks native FP8 hardware."""
-    GPU_ARCH = _get_gcn_arch_via_amdsmi()
-    return "gfx908" in GPU_ARCH
+    return _ON_GFX908
 
 
 @cache
@@ -811,7 +810,7 @@ class RocmPlatform(Platform):
         # MI100 (gfx908): block_size=32 reduces TTFT and improves prefix
         # cache efficiency vs the default block_size=16. Only applied when
         # the user hasn't explicitly set --block-size.
-        if _ON_MI100:
+        if _ON_GFX908:
             cache_config = vllm_config.cache_config
             if not cache_config.user_specified_block_size:
                 cache_config.block_size = 32
@@ -820,7 +819,7 @@ class RocmPlatform(Platform):
         # TP>1), and disable torch.compile / Inductor (fusions unavailable
         # on ROCm, produces garbage or slowdown). Both gated by
         # VLLM_MI100_TORCH_COMPILE=1 as an escape hatch.
-        if _ON_MI100:
+        if _ON_GFX908:
             from vllm.config.compilation import CompilationMode
 
             mi100_override_compile = (
