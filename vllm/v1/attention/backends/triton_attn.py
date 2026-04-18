@@ -59,6 +59,42 @@ def _get_mi100_tuned_constants() -> tuple[int, int]:
 
 MIN_LAUNCH_GRID_SIZE_2D, NUM_PAR_SOFTMAX_SEGMENTS = _get_mi100_tuned_constants()
 
+# Adaptive Flash-Decoding split-K (MI100 only). The 3D decode kernel splits
+# KV across blocks; picking splits to fill CUs improves occupancy at c=1.
+MAX_FLASH_DECODING_SPLITS = 64
+FLASH_DECODING_SPLIT_COUNTS = [8, 16, 32, 64]
+MIN_TILES_PER_SPLIT = 4
+
+
+def _compute_flash_decoding_splits(
+    max_seq_len: int,
+    num_seqs: int,
+    num_kv_heads: int,
+    tile_size: int,
+    target_cus: int = 120,
+) -> int:
+    """Pick the smallest power-of-2 split count from FLASH_DECODING_SPLIT_COUNTS
+    that saturates ``target_cus`` compute units for the 3D decode grid
+    (num_q_blocks x num_kv_heads x num_splits), bounded by the available
+    number of KV tiles.
+    """
+    num_tiles = (max_seq_len + tile_size - 1) // tile_size
+    max_possible_splits = max(1, num_tiles // MIN_TILES_PER_SPLIT)
+    base_grid = num_seqs * num_kv_heads
+    if base_grid >= target_cus:
+        ideal_splits = FLASH_DECODING_SPLIT_COUNTS[0]
+    else:
+        ideal_splits = max(
+            FLASH_DECODING_SPLIT_COUNTS[0],
+            (target_cus + base_grid - 1) // base_grid,
+        )
+    ideal_splits = min(ideal_splits, max_possible_splits)
+    ideal_splits = min(ideal_splits, MAX_FLASH_DECODING_SPLITS)
+    for split_count in FLASH_DECODING_SPLIT_COUNTS:
+        if split_count >= ideal_splits:
+            return split_count
+    return FLASH_DECODING_SPLIT_COUNTS[-1]
+
 
 @dataclass
 class TritonAttentionMetadata:
@@ -96,6 +132,9 @@ class TritonAttentionMetadata:
     prefix_scheduler_metadata: torch.Tensor | None = None
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
     mm_prefix_range_tensor: torch.Tensor | None = None
+    # None when adaptive Flash-Decoding split-K is disabled (default on
+    # non-MI100 arches); otherwise the upper bound for adaptive splits.
+    max_flash_decoding_splits: int | None = None
 
     @staticmethod
     def compute_mm_prefix_range_tensor(
@@ -186,24 +225,40 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             )
 
         self.num_par_softmax_segments = NUM_PAR_SOFTMAX_SEGMENTS
+
+        # MI100 gets adaptive Flash-Decoding split-K: allocate segment
+        # buffers sized for the adaptive upper bound so split counts can
+        # scale up at low concurrency.
+        self.max_flash_decoding_splits: int | None = None
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_mi100
+
+            if on_mi100():
+                self.max_flash_decoding_splits = MAX_FLASH_DECODING_SPLITS
+
+        buffer_splits = (
+            self.max_flash_decoding_splits
+            if self.max_flash_decoding_splits is not None
+            else self.num_par_softmax_segments
+        )
         headdim_padded = next_power_of_2(self.headdim)
         self.softmax_segm_output = torch.empty(
             (
                 self.seq_threshold_3D,
                 self.num_heads_q,
-                self.num_par_softmax_segments,
+                buffer_splits,
                 headdim_padded,
             ),
             dtype=torch.float32,
             device=device,
         )
         self.softmax_segm_max = torch.empty(
-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
+            (self.seq_threshold_3D, self.num_heads_q, buffer_splits),
             dtype=torch.float32,
             device=device,
         )
         self.softmax_segm_expsum = torch.empty(
-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
+            (self.seq_threshold_3D, self.num_heads_q, buffer_splits),
             dtype=torch.float32,
             device=device,
         )
@@ -269,6 +324,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_output=self.softmax_segm_output,
             softmax_segm_max=self.softmax_segm_max,
             softmax_segm_expsum=self.softmax_segm_expsum,
+            max_flash_decoding_splits=self.max_flash_decoding_splits,
         )
         return attn_metadata
 
@@ -608,6 +664,7 @@ class TritonAttentionImpl(AttentionImpl):
         softmax_segm_output = attn_metadata.softmax_segm_output
         softmax_segm_max = attn_metadata.softmax_segm_max
         softmax_segm_expsum = attn_metadata.softmax_segm_expsum
+        max_flash_decoding_splits = attn_metadata.max_flash_decoding_splits
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
@@ -635,6 +692,7 @@ class TritonAttentionImpl(AttentionImpl):
             softmax_segm_output=softmax_segm_output,
             softmax_segm_max=softmax_segm_max,
             softmax_segm_expsum=softmax_segm_expsum,
+            max_flash_decoding_splits=max_flash_decoding_splits,
             sinks=self.sinks,
             output_scale=output_scale,
             mm_prefix_range=mm_prefix_range_tensor,

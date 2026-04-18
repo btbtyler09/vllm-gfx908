@@ -1045,6 +1045,7 @@ def unified_attention(
     softmax_segm_output=None,
     softmax_segm_max=None,
     softmax_segm_expsum=None,
+    max_flash_decoding_splits=None,
     alibi_slopes=None,
     output_scale=None,
     qq_bias=None,
@@ -1197,8 +1198,29 @@ def unified_attention(
             stride_vs_head=v_scale_cache.stride(2) if v_scale_cache is not None else 0,
         )
     else:
+        # Adaptive Flash-Decoding split-K: when the caller supplies
+        # max_flash_decoding_splits (MI100 only today), pick a split count
+        # that fills target CUs at runtime instead of using a fixed value.
+        # The buffer caps us via softmax_segm_output.shape[2].
+        if max_flash_decoding_splits is not None and max_seqlen_k > 0:
+            from vllm.v1.attention.backends.triton_attn import (
+                _compute_flash_decoding_splits,
+            )
+
+            actual_num_splits = _compute_flash_decoding_splits(
+                max_seq_len=max_seqlen_k,
+                num_seqs=num_seqs,
+                num_kv_heads=num_kv_heads,
+                tile_size=TILE_SIZE_DECODE,
+            )
+            actual_num_splits = min(
+                actual_num_splits, softmax_segm_output.shape[2]
+            )
+        else:
+            actual_num_splits = num_par_softmax_segments
+
         kernel_unified_attention_3d[
-            (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
+            (total_num_q_blocks, num_kv_heads, actual_num_splits)
         ](
             segm_output_ptr=softmax_segm_output,
             segm_max_ptr=softmax_segm_max,
@@ -1246,7 +1268,7 @@ def unified_attention(
             BLOCK_Q=BLOCK_Q,
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
-            NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
+            NUM_SEGMENTS_PER_SEQ=actual_num_splits,
             KV_QUANT_MODE=kv_quant_mode,
             k_scale_cache_ptr=k_scale_cache,
             v_scale_cache_ptr=v_scale_cache,
@@ -1274,6 +1296,6 @@ def unified_attention(
             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
-            NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
+            NUM_SEGMENTS_PER_SEQ=actual_num_splits,
             USE_FP8=output_scale is not None,
         )
