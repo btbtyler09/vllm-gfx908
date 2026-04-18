@@ -816,6 +816,36 @@ class RocmPlatform(Platform):
             if not cache_config.user_specified_block_size:
                 cache_config.block_size = 32
 
+        # MI100 (gfx908): force FULL_DECODE_ONLY graphs (PIECEWISE hangs at
+        # TP>1), and disable torch.compile / Inductor (fusions unavailable
+        # on ROCm, produces garbage or slowdown). Both gated by
+        # VLLM_MI100_TORCH_COMPILE=1 as an escape hatch.
+        if _ON_MI100:
+            from vllm.config.compilation import CompilationMode
+
+            mi100_override_compile = (
+                os.environ.get("VLLM_MI100_TORCH_COMPILE", "0") != "1"
+            )
+            if mi100_override_compile:
+                if compilation_config.cudagraph_mode in (
+                    CUDAGraphMode.PIECEWISE,
+                    CUDAGraphMode.FULL_AND_PIECEWISE,
+                ):
+                    logger.info_once(
+                        "gfx908 (MI100): forcing FULL_DECODE_ONLY CUDA "
+                        "graphs (PIECEWISE hangs at TP>1)."
+                    )
+                    compilation_config.cudagraph_mode = (
+                        CUDAGraphMode.FULL_DECODE_ONLY
+                    )
+                if compilation_config.mode != CompilationMode.NONE:
+                    logger.info_once(
+                        "gfx908 (MI100): disabling torch.compile "
+                        "(Inductor fusions not available on ROCm). "
+                        "Set VLLM_MI100_TORCH_COMPILE=1 to override."
+                    )
+                    compilation_config.mode = CompilationMode.NONE
+
         if compilation_config.cudagraph_mode.has_full_cudagraphs():
             # decode context parallel does not support full cudagraphs
             if parallel_config.decode_context_parallel_size > 1:
