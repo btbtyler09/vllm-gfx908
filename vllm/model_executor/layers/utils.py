@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Utility methods for model layers."""
 
+import os
 from collections.abc import Callable
 
 import torch
@@ -116,7 +117,29 @@ def use_aiter_triton_gemm(n, m, k, dtype):
         or (m == 128 and k == 2880)
         or (m == 640 and k == 2880)
         or (m == 2880 and k == 512)
+        # Qwen3.6-35B-A3B lm_head: M=1, N=62080 — AITER 1.74x vs rocBLAS w/ BEST_CFG
+        # (lm_head replicated across TP ranks, not column-split). Other unquantized
+        # shapes in this model lose to rocBLAS at AITER's ~50μs floor — keep them off.
+        or (m == 62080 and k == 2048)
     )
+
+
+# gfx908 small-M tuning: AITER's default _get_config picks M_LEQ_64 for our shapes,
+# which wastes blocks at M=1. This M=1 N≥1024 K=2048 config wins ~1.74x for lm_head.
+_AITER_GEMM_M1_BEST_CFG = {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 1,
+    "num_warps": 4,
+    "num_stages": 2,
+    "waves_per_eu": 2,
+    "matrix_instr_nonkdim": 16,
+    "cache_modifier": ".cg",
+    "NUM_KSPLIT": 1,
+    "SPLITK_BLOCK_SIZE": 2048,
+    "kpack": 1,
+}
 
 
 def rocm_unquantized_gemm_impl(
@@ -167,6 +190,10 @@ def rocm_unquantized_gemm_impl(
 
         if x.dtype != weight.dtype:
             x = x.to(weight.dtype)
+        # gfx908: pass M=1 small-M config for lm_head shape (1.74x vs default config)
+        cfg = _AITER_GEMM_M1_BEST_CFG if n == 1 and m == 62080 and k == 2048 else None
+        if cfg is not None:
+            return gemm_a16w16(x, weight, bias, config=cfg)
         return gemm_a16w16(x, weight, bias)
 
     use_skinny = (
@@ -303,8 +330,43 @@ def cpu_unquantized_gemm(
     return layer.cpu_linear(x, weight, bias)
 
 
+def rocm_unquantized_gemm_gfx908(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """gfx908-only inline dispatch.
+
+    Bypasses the torch.ops.vllm.rocm_unquantized_gemm custom op (opaque to
+    inductor → blocks fusion of GEMM with adjacent norm/activation/residual ops).
+    For non-AITER paths we fall through to torch.nn.functional.linear so inductor
+    can lower it to aten ops it knows how to fuse around.
+    """
+    n = x.numel() // x.size(-1)
+    m = weight.shape[0]
+    k = weight.shape[1]
+    if use_aiter_triton_gemm(n, m, k, x.dtype):
+        from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+        if os.environ.get("VLLM_GFX908_DEBUG_DISPATCH") == "1":
+            import sys as _sys
+            print(f"[AITER_DISPATCH] n={n} m={m} k={k} dtype={x.dtype}",
+                  file=_sys.stderr, flush=True)
+        if x.dtype != weight.dtype:
+            x = x.to(weight.dtype)
+        cfg = _AITER_GEMM_M1_BEST_CFG if n == 1 and m == 62080 and k == 2048 else None
+        if cfg is not None:
+            return gemm_a16w16(x, weight, bias, config=cfg)
+        return gemm_a16w16(x, weight, bias)
+    # Direct F.linear — no custom op, inductor-fusable
+    return torch.nn.functional.linear(x, weight, bias)
+
+
 def dispatch_unquantized_gemm() -> Callable[..., torch.Tensor]:
     if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx908
+        if on_gfx908():
+            return rocm_unquantized_gemm_gfx908
         return rocm_unquantized_gemm
     elif current_platform.is_cpu():
         return cpu_unquantized_gemm

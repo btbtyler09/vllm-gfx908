@@ -210,8 +210,10 @@ if _ON_GFX908:
         "VLLM_ROCM_USE_AITER_FP8BMM": "0",
         "VLLM_ROCM_USE_AITER_FP4BMM": "0",
         "VLLM_ROCM_USE_AITER_FP4_ASM_GEMM": "0",
-        # Disable Triton GEMM (tested: -25% regression from dtype cast)
-        "VLLM_ROCM_USE_AITER_TRITON_GEMM": "0",
+        # Triton GEMM: enabled, but utils.use_aiter_triton_gemm() shape whitelist
+        # restricts dispatch to specific (m,k) pairs that microbench wins over rocBLAS.
+        # Broad-application historically -25% (dtype cast); shape-gated is safe.
+        "VLLM_ROCM_USE_AITER_TRITON_GEMM": "1",
         # Disable skinny GEMM (wvSplitK assertion crash on gfx908)
         "VLLM_ROCM_USE_SKINNY_GEMM": "0",
         # Disable unified attention — UA kernel corrupts model state after
