@@ -8,19 +8,27 @@ IMG="${1:-vllm-rocm-gfx908:latest}"
 SERVED="qwen3.6-35b-8bit"
 PROBE_TARGET="${2:-3000}"
 
+# Optional debug verification: set VERIFY_DISPATCH=1 to enable dispatch
+# stderr prints + shape probe (noisy; only useful when actively verifying
+# that LLMM1/wvSplitK fire for the expected shapes). Off by default.
+VERIFY_DISPATCH_ENV=""
+if [[ "${VERIFY_DISPATCH:-0}" == "1" ]]; then
+  VERIFY_DISPATCH_ENV="--env VLLM_GFX908_DEBUG_DISPATCH=1 --env VLLM_GFX908_PROBE_SHAPES=$PROBE_TARGET"
+fi
+
 # Optional TunableOp env vars: set TUNABLEOP=tune (TUNING=1) or TUNABLEOP=replay
-# (TUNING=0). Mounts /tmp/decode_opt/tunableop_results as the host-persistent CSV
+# (TUNING=0). Mounts /home/tyler/vllm-gfx908/docs/mi100_decode_opt/tunableop_results as the host-persistent CSV
 # directory so tuned solutions survive container restarts.
 TUNABLEOP_ENV=""
 TUNABLEOP_VOL=""
 case "${TUNABLEOP:-off}" in
   tune)
     TUNABLEOP_ENV="--env PYTORCH_TUNABLEOP_ENABLED=1 --env PYTORCH_TUNABLEOP_TUNING=1 --env PYTORCH_TUNABLEOP_FILENAME=/host_tunableop/tunableop_results.csv"
-    TUNABLEOP_VOL="-v /tmp/decode_opt/tunableop_results:/host_tunableop:rw"
+    TUNABLEOP_VOL="-v /home/tyler/vllm-gfx908/docs/mi100_decode_opt/tunableop_results:/host_tunableop:rw"
     ;;
   replay)
     TUNABLEOP_ENV="--env PYTORCH_TUNABLEOP_ENABLED=1 --env PYTORCH_TUNABLEOP_TUNING=0 --env PYTORCH_TUNABLEOP_FILENAME=/host_tunableop/tunableop_results.csv"
-    TUNABLEOP_VOL="-v /tmp/decode_opt/tunableop_results:/host_tunableop:ro"
+    TUNABLEOP_VOL="-v /home/tyler/vllm-gfx908/docs/mi100_decode_opt/tunableop_results:/host_tunableop:ro"
     ;;
   off|"") ;;
   *) echo "TUNABLEOP must be one of: tune, replay, off" >&2; exit 1 ;;
@@ -42,8 +50,8 @@ docker run -d --name decode_opt \
   --env VLLM_ROCM_USE_AITER=1 \
   --env VLLM_MI100_TORCH_COMPILE=1 \
   --env VLLM_ROCM_USE_AITER_TRITON_GEMM=1 \
-  --env VLLM_GFX908_DEBUG_DISPATCH=1 \
-  --env VLLM_GFX908_PROBE_SHAPES="$PROBE_TARGET" \
+  --env NCCL_ALGO=Tree --env NCCL_PROTO=LL \
+  $VERIFY_DISPATCH_ENV \
   $TUNABLEOP_ENV \
   $TUNABLEOP_VOL \
   -v /home/tyler/.cache/huggingface:/huggingface \
@@ -128,13 +136,16 @@ if ! /home/tyler/vllm-gfx908/docs/mi100_decode_opt/scripts/coherence.sh "$SERVED
   exit 3
 fi
 
-echo ""
-echo "=== shape probe summary (PROBE_SHAPES=$PROBE_TARGET) ==="
-grep -E '\[PROBE_SHAPES\]' /tmp/decode_opt/serve_baseline.log | tail -50
+if [[ "${VERIFY_DISPATCH:-0}" == "1" ]]; then
+  echo ""
+  echo "=== shape probe summary (PROBE_SHAPES=$PROBE_TARGET) ==="
+  grep -E '\[PROBE_SHAPES\]' /tmp/decode_opt/serve_baseline.log | tail -50
 
-echo ""
-echo "=== unique AITER_DISPATCH shapes (this run) ==="
-grep -E '\[AITER_DISPATCH\]' /tmp/decode_opt/serve_baseline.log | sed 's/^.*\[AITER_DISPATCH\]/[AITER_DISPATCH]/' | sort -u | head -20
+  echo ""
+  echo "=== unique dispatch shapes (this run) ==="
+  grep -E '\[(LLMM1|wvSplitK|AITER_DISPATCH)\]' /tmp/decode_opt/serve_baseline.log \
+    | sed -E 's/^.*\[(LLMM1|wvSplitK|AITER_DISPATCH)\]/[\1]/' | sort -u | head -40
+fi
 
 echo ""
 echo "=== DONE — leaving container running for follow-up probes ==="

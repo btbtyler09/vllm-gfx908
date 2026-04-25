@@ -330,21 +330,25 @@ def cpu_unquantized_gemm(
     return layer.cpu_linear(x, weight, bias)
 
 
-def rocm_unquantized_gemm_gfx908(
-    layer: torch.nn.Module,
+def rocm_unquantized_gemm_gfx908_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """gfx908-only inline dispatch.
+    """gfx908 dispatch implementation (registered as torch custom op below).
 
-    Bypasses the torch.ops.vllm.rocm_unquantized_gemm custom op (opaque to
-    inductor → blocks fusion of GEMM with adjacent norm/activation/residual ops).
+    Routes through a `direct_register_custom_op` wrapper so torch.compile /
+    inductor sees one opaque graph node and does NOT inline this Python down
+    to `aten::mm` (rocBLAS). That ensures QKV/QKVZ/o_proj inside compiled model
+    forwards still hit our LLMM1/wvSplitK dispatch, not just the eager-path
+    MoE block / lm_head.
+
     Dispatch priority on gfx908 for fp16/bf16 weight (k % 8 == 0):
       1. LLMM1   for n==1, m % 4 == 0, k <= 8192, bias is None (fastest at M=1)
       2. wvSplitK for m > 8 and 0 < n <= 4 (skinny-M decode)
       3. AITER gemm_a16w16 for whitelisted lm_head shape (Stage 2)
-      4. F.linear fallback (inductor-fusable)
+      4. F.linear fallback (rocBLAS for M >= 8)
+
     Microbench (gfx908 single-GPU, 2026-04-24):
       - LLMM1   2.1-2.7x faster than rocBLAS for our M=1 hot shapes
       - wvSplitK 2.1-6.7x faster than rocBLAS (wins on (1, 1, 2048))
@@ -398,8 +402,34 @@ def rocm_unquantized_gemm_gfx908(
         if cfg is not None:
             return gemm_a16w16(x, weight, bias, config=cfg)
         return gemm_a16w16(x, weight, bias)
-    # Direct F.linear — no custom op, inductor-fusable
+    # rocBLAS fallback for M >= 8 (no skinny-GEMM applies). Now reachable
+    # from inside compiled forwards too (Stage 5h custom-op wrapper below).
     return torch.nn.functional.linear(x, weight, bias)
+
+
+def rocm_unquantized_gemm_gfx908(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """gfx908 dispatch — torch custom op wrapper.
+
+    Routes through `torch.ops.vllm.rocm_unquantized_gemm_gfx908` so inductor
+    treats it as a single opaque graph node. This is what makes the LLMM1 /
+    wvSplitK dispatch fire for QKV/QKVZ/o_proj inside compiled model forwards
+    (round-3 Stage 5h). Without this wrapping, inductor inlines our Python and
+    lowers the trailing `F.linear` straight to `aten::mm` → rocBLAS, bypassing
+    the dispatch.
+    """
+    return torch.ops.vllm.rocm_unquantized_gemm_gfx908(x, weight, bias)
+
+
+direct_register_custom_op(
+    op_name="rocm_unquantized_gemm_gfx908",
+    op_func=rocm_unquantized_gemm_gfx908_impl,
+    fake_impl=rocm_unquantized_gemm_fake,  # output shape == weight.new_empty((*x.shape[:-1], weight.shape[0]))
+)
 
 
 def dispatch_unquantized_gemm() -> Callable[..., torch.Tensor]:

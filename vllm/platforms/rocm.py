@@ -226,6 +226,14 @@ if _ON_GFX908:
         # Triton Attention is perf-equivalent at c=1 and stable long-term.
         "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": "0",
         "VLLM_ROCM_USE_AITER_TRITON_ROPE": "1",
+        # NCCL/RCCL tuning for 4×MI100 XGMI fabric (Stage 5j 2026-04-25):
+        # CAR is broken on gfx908 cudagraphs (CDNA1 IPC pointer staleness on
+        # graph replay), so all-reduces fall back to RCCL. Tree algo + LL
+        # protocol shave ~0.5 ms / step (~4.6% TPOT) vs the Ring/default-proto
+        # combination by reducing per-message latency for the small (~few KB)
+        # per-step all-reduces decode produces.
+        "NCCL_ALGO": "Tree",
+        "NCCL_PROTO": "LL",
     }
     for _var, _val in _GFX908_DEFAULTS.items():
         if _var not in os.environ:
