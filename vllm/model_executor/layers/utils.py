@@ -340,15 +340,55 @@ def rocm_unquantized_gemm_gfx908(
 
     Bypasses the torch.ops.vllm.rocm_unquantized_gemm custom op (opaque to
     inductor → blocks fusion of GEMM with adjacent norm/activation/residual ops).
-    For non-AITER paths we fall through to torch.nn.functional.linear so inductor
-    can lower it to aten ops it knows how to fuse around.
+    Dispatch priority on gfx908 for fp16/bf16 weight (k % 8 == 0):
+      1. LLMM1   for n==1, m % 4 == 0, k <= 8192, bias is None (fastest at M=1)
+      2. wvSplitK for m > 8 and 0 < n <= 4 (skinny-M decode)
+      3. AITER gemm_a16w16 for whitelisted lm_head shape (Stage 2)
+      4. F.linear fallback (inductor-fusable)
+    Microbench (gfx908 single-GPU, 2026-04-24):
+      - LLMM1   2.1-2.7x faster than rocBLAS for our M=1 hot shapes
+      - wvSplitK 2.1-6.7x faster than rocBLAS (wins on (1, 1, 2048))
+      - LLMM1 also beats AITER for (1, 62080, 2048) lm_head: 244us vs 267us
     """
     n = x.numel() // x.size(-1)
     m = weight.shape[0]
     k = weight.shape[1]
+    debug = os.environ.get("VLLM_GFX908_DEBUG_DISPATCH") == "1"
+
+    # Skinny GEMM dispatch (PR adapted from larkinwc/vllm-gfx908#4 microbench).
+    # Required conditions for both: weight.is_contiguous() (LLMM1/wvSplitK
+    # assume contiguous), fp16/bf16 dtype, k % 8 == 0 (vectorized loads).
+    skinny_ok = (
+        x.dtype in (torch.float16, torch.bfloat16)
+        and weight.dtype in (torch.float16, torch.bfloat16)
+        and k % 8 == 0
+        and weight.is_contiguous()
+    )
+    if skinny_ok:
+        x_view = x.reshape(-1, x.size(-1))
+        if n == 1 and m % 4 == 0 and k <= 8192 and bias is None:
+            if debug:
+                import sys as _sys
+                print(f"[LLMM1] n={n} m={m} k={k}",
+                      file=_sys.stderr, flush=True)
+            if x.dtype != weight.dtype:
+                x_view = x_view.to(weight.dtype)
+            out = ops.LLMM1(weight, x_view, 4)
+            return out.reshape(*x.shape[:-1], weight.shape[0])
+        if m > 8 and 0 < n <= 4:
+            if debug:
+                import sys as _sys
+                print(f"[wvSplitK] n={n} m={m} k={k}",
+                      file=_sys.stderr, flush=True)
+            cu_count = num_compute_units()
+            if x.dtype != weight.dtype:
+                x_view = x_view.to(weight.dtype)
+            out = ops.wvSplitK(weight, x_view, cu_count, bias)
+            return out.reshape(*x.shape[:-1], weight.shape[0])
+
     if use_aiter_triton_gemm(n, m, k, x.dtype):
         from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
-        if os.environ.get("VLLM_GFX908_DEBUG_DISPATCH") == "1":
+        if debug:
             import sys as _sys
             print(f"[AITER_DISPATCH] n={n} m={m} k={k} dtype={x.dtype}",
                   file=_sys.stderr, flush=True)

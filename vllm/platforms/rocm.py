@@ -214,8 +214,12 @@ if _ON_GFX908:
         # restricts dispatch to specific (m,k) pairs that microbench wins over rocBLAS.
         # Broad-application historically -25% (dtype cast); shape-gated is safe.
         "VLLM_ROCM_USE_AITER_TRITON_GEMM": "1",
-        # Disable skinny GEMM (wvSplitK assertion crash on gfx908)
-        "VLLM_ROCM_USE_SKINNY_GEMM": "0",
+        # Skinny GEMM (wvSplitK): flipped to "1" 2026-04-24 after verifying
+        # the gfx908 compile guard at csrc/rocm/skinny_gemms.cu:25 already
+        # includes __gfx908__ in the host repo. Larkinwc/vllm-gfx908#4 reports
+        # +28% throughput / -27% TPOT for c=1 decode on Qwen3.5-9B with this
+        # enabled. Test before shipping (revert to "0" if it crashes).
+        "VLLM_ROCM_USE_SKINNY_GEMM": "1",
         # Disable unified attention — UA kernel corrupts model state after
         # extended use on gfx908, causing degenerate repetition (e.g. "!!!!!").
         # Reproduces after ~200+ requests through UA decode path.
