@@ -232,18 +232,6 @@ class CustomAllreduce:
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
             return False
-        # gfx908 (MI100): HIP IPC atomics on hipDeviceMallocUncached memory
-        # produce NaN during HIP graph replay. Skip CAR during stream capture
-        # so captured graphs fall through to pynccl/RCCL; eager paths still
-        # benefit from CAR.
-        if torch.cuda.is_current_stream_capturing():
-            from vllm.platforms import current_platform
-
-            if current_platform.is_rocm():
-                from vllm.platforms.rocm import on_gfx908
-
-                if on_gfx908():
-                    return False
         inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
@@ -282,6 +270,17 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
+                # gfx908: route captured all-reduce through the pre-registered
+                # uncached buffer_ptrs (registered=False) instead of binding
+                # `input` directly (registered=True). HIP IPC views of cached
+                # cudaMalloc'd memory don't see peer writes consistently under
+                # graph replay → drift → NaN. The uncached buffer_ptrs path is
+                # coherent. See docs/mi100_decode_opt/scripts/test_e_persistent_car
+                # for the soak that proved this.
+                if current_platform.is_rocm():
+                    from vllm.platforms.rocm import on_gfx908
+                    if on_gfx908():
+                        return self.all_reduce(input, registered=False)
                 return self.all_reduce(input, registered=True)
             else:
                 # If warm up, mimic the allocation pattern since custom
