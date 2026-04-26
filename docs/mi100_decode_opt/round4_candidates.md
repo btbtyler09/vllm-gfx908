@@ -22,11 +22,16 @@ After round-3 (Stages 5g/5h/5f, ~+70% throughput vs round-1) the cheap single-pa
 - **Expected:** if not fused, pulling in surrounding norms saves 100–500 µs / step (~0.5–2.5%).
 - **Effort:** 1–2 hr audit, 1–4 hr fix if needed.
 
-### C — Cudagraph capture range pruning
-- **Where:** vllm captures M ∈ {1, 2, 4, 8, 16, 32, 64, 128, 256, 512} cudagraph shapes by default. Many of these are never hit in our workload (we mostly run c=1–32). Pruning trims warmup (already ~11 min) and reduces dispatcher branch count per step.
-- **Method:** look at `_get_default_cudagraph_capture_sizes()` in `vllm/v1/worker/`; reduce to {1, 2, 4, 8, 16, 32, 64} via `--compilation-config '{...,"capture_sizes":[...]}`.
-- **Expected:** small per-step win (~0.05 ms), bigger startup savings.
-- **Effort:** 1 hr.
+### C — Cudagraph capture range pruning — **ATTEMPTED 2026-04-26, REVERTED (marginal regressions, startup not a priority)**
+- **Where:** Default capture ladder is `[1,2,4] + range(8,256,8) + range(256,max,16)` = ~50 sizes. We pruned to `[1,2,4,8,16,32,64,128]` in `apply_config_platform_defaults` at `vllm/platforms/rocm.py:778`.
+- **Result (round-4 Phase 1 C-only bench, 2026-04-26 on Qwen3.6-35B-A3B-GPTQ-8bit, 4×MI100 TP=4):** marginal regressions on two tiers:
+  - Short Context Throughput (c=16): tps **-3.42%** (455.66 → 440.08), TPOT +0.43%
+  - Concurrency Scaling c=2: TPOT **+1.15%** (13.96 → 14.12 ms), tps -0.85%
+  - All other 10 tiers within ±0.5% (decode c=1 even slightly better at 91.63 vs 91.17 tok/s)
+- **Root cause hypothesis:** padding-up at non-captured intermediate sizes. Default has [16,24,32,40,...] — actual decode batches of 17-23 pad to 24 (waste 1-7 slots). With our prune [16,32,...], 17-31 pads to 32 (waste 1-15 slots). Short Context Throughput at c=16 likely sees more variance in actual batch size because of prefill mixing with decode, which makes padding waste matter more.
+- **Verdict:** the regressions could be single-run variance (1-3% on one bench run), but per "no regression across the test map" we reverted. Startup time savings (~10 min) and ~0.5% c=1 TPOT improvement weren't worth even the variance risk.
+- **If retried later:** safer prune is `[1,2,4] + range(8, 128+1, 8) = [1,2,4,8,16,24,32,...,128]` = 19 sizes. Drops only the 256-512 range. ~60% fewer captures than default, no padding-up cost on intermediate sizes. Worth a try only if startup time becomes a stated objective.
+- **Bench artifact:** `~/mi100-llm-testing/Model_Reports/benchmark_Qwen3.6-35B-A3B-GPTQ-8bit_v0.20_round4_phase1_Conly.md`
 
 ### D — MoE block torch.compile wrap
 - **Where:** the MoE block (router + shared_expert + gate_up_proj/down_proj) currently runs in **eager Python** (Stage 5g notes "the MoE block is NOT in graph"). Cudagraph captures around it but Python launch overhead survives.
@@ -76,9 +81,32 @@ If round-4 happens, suggested order: **A (cheap probe) → B (audit) → E (the 
 
 ## Added 2026-04-25 (post-round-3 ship)
 
-### K — Custom-op fast path for high-n GEMMs (c=64+ regression fix)
+### K — Custom-op fast path for high-n GEMMs (c=64+ regression fix) — **ATTEMPTED 2026-04-26, FAILED, REVERTED**
 - **Where:** `vllm/model_executor/layers/utils.py:rocm_unquantized_gemm_gfx908_impl` — currently runs the custom op for ALL calls, even when LLMM1/wvSplitK can't help (n>4) and we fall back to F.linear.
 - **Why:** Round-3 Stage 5h shipped the custom-op inductor escape hatch (+18.9% TPOT at c=1) but introduced a regression at c=64 (−4%) and c=128 (−9.3%). The opaque custom-op extern call breaks inductor's ability to inline `F.linear` to `aten::mm` cleanly when the dispatch falls through.
-- **Fix:** Hoist the n>4 check up to the wrapper level so the custom op is only invoked when LLMM1/wvSplitK can fire. For the high-n cases, return F.linear directly so inductor can inline it.
-- **Effort:** ~30 lines, half a day including bench validation.
-- **Expected:** restore round-2 perf at c=64+128 while keeping all round-3 c=1–32 wins. Net: a small absolute win at c=64+128 (~5-9% recovery), no change at c=1–32.
+- **Fix attempted:** Hoist the n>4 check up to the wrapper level (`rocm_unquantized_gemm_gfx908`). Wrapper computes `n = x.numel() // x.size(-1)`, checks LLMM1/wvSplitK/AITER conditions, and either calls the opaque custom op (when skinny path can fire) or `F.linear` directly (when not, so inductor can inline to `aten::mm`).
+- **Result (round-4 Phase 1 K bench, 2026-04-26 on Qwen3.6-35B-A3B-GPTQ-8bit, 4×MI100 TP=4):** REGRESSED c=1 by **+17% TPOT** (12.94 ms vs round-3 baseline 11.04 ms — Decode Stress Test went 10.95 → 12.87 ms). c=2/c=4 also regressed +10–12%. c=8 through c=128 flat — and crucially, **c=64/c=128 did NOT recover** (still at round-3 perf). The hoist made everything worse and fixed nothing.
+- **Root cause:** the Python-level shape conditional (`if n == 1 and m % 4 == 0 ...`) breaks inductor's clean trace through the wrapper. Inductor can't fold it (`x.numel()` looks dynamic), so it inserts a graph break and runs the wrapper in eager Python on every GEMM call. Per-call Python overhead (~10 µs) × ~129 GEMM calls per token ≈ 1.3 ms/token — matches the observed ~1.9 ms regression at c=1.
+- **Why c=64+ didn't recover either:** the per-layer dispatch still went through the custom op for those shapes too (the wrapper's conditional structure routes large-n shapes through F.linear, but the *eager-Python* execution of the wrapper added overhead that swamped any inductor benefit on the F.linear path).
+- **Verdict: do NOT retry this approach.** The "right fix" exists but is invasive and doesn't help c=1 — see lever **L** below.
+- **Bench artifact:** `~/mi100-llm-testing/Model_Reports/benchmark_Qwen3.6-35B-A3B-GPTQ-8bit_v0.20_round4_phase1_K_v0.19_round3.md`
+
+### L — Per-layer dispatch closure binding (the "right fix" for K's intent)
+- **Why this exists:** lever K above failed because runtime shape conditionals in the wrapper break inductor tracing. The right structural fix is to make the dispatch decision ONCE per layer at construction time (when shapes are static and the cost is amortized over millions of forward calls), not on every call.
+- **Where the binding happens:** `vllm/model_executor/layers/linear.py:UnquantizedLinearMethod.apply()` at line 228 currently calls `dispatch_unquantized_gemm()(layer, x, layer.weight, bias)` per forward. Two complementary edit points:
+  - `process_weights_after_loading()` (line 214): inspect `layer.weight.shape`, dtype, and contiguity. Pre-decide which path the dispatch would take (LLMM1 / wvSplitK / AITER / F.linear). Cache the chosen callable on the layer as `layer._gfx908_gemm_op`.
+  - `apply()` (line 220): fast-path `if hasattr(layer, "_gfx908_gemm_op"): return layer._gfx908_gemm_op(x, layer.weight, bias)` — single op call, no conditional.
+- **Pre-bound callables (one of):**
+  - `_call_llmm1` — wraps `ops.LLMM1(weight, x_view, 4)` + reshape (for n==1, m%4==0, k≤8192, no bias)
+  - `_call_wvsplitk` — wraps `ops.wvSplitK(weight, x_view, cu_count, bias)` + reshape (for m>8 layers; n must be ≤4 at call time, but in practice the caller controls this)
+  - `_call_aiter` — wraps `gemm_a16w16(...)` for the lm_head whitelist
+  - `_call_flinear` — wraps `F.linear(x, weight, bias)` (the high-N path)
+  - Each closure could itself be `direct_register_custom_op`-registered (preserves the inductor-opaque guarantee for the dispatch ops, while letting the F.linear closure remain inductor-inlinable)
+- **Important subtlety:** wvSplitK's eligibility depends on BOTH static `m > 8` AND dynamic `0 < n ≤ 4`. Per-layer binding fixes m statically, but n still varies per call. Two options:
+  1. Bind `_call_wvsplitk` for `m > 8` layers, accept that we lose dispatch when n>4 (i.e., wvSplitK forwards to its own internal F.linear fallback — which is fine, it's a single op call, no Python conditional)
+  2. Bind a "decode-vs-prefill" pair: use cudagraph capture size as a static signal (every captured size has a static n), and pre-build per-capture-size dispatch callables. Cleaner but more invasive.
+  - Option 1 is the recommended starting point.
+- **Effort:** ~1 day end-to-end. Touches `linear.py`, `utils.py`, possibly `vocab_parallel_embedding.py` (lm_head consumer at line 75) and `compressed_tensors/transform/module.py:119,129`. Test with full BenchAndReport.
+- **Expected yield:** restore round-2 perf at c=64 (+~4%) and c=128 (+~9%), zero change at c=1 (still hits the same dispatch — just via pre-bound closure instead of runtime conditional).
+- **Why this is NOT round-4 priority:** round-4 is targeting c=1 throughput (break 100 tok/s). Lever L only moves c=64/c=128 numbers — useful for high-throughput serving but orthogonal to our goal. Park this until c=64+ recovery becomes a stated objective (e.g., a future "round-4.5: high-concurrency cleanup" if c=128 throughput becomes important to a downstream user).
+- **Stop conditions if attempted later:** any c=1 regression > 0.5% (verifies the closure-binding doesn't have its own Python-overhead surprise); coherence 4/4 pre+post.

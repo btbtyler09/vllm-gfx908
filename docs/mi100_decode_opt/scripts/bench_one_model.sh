@@ -43,6 +43,7 @@ docker run -d --name decode_opt \
   -v /home/tyler/vllm-gfx908/vllm/platforms/rocm.py:/usr/local/lib/python3.12/dist-packages/vllm/platforms/rocm.py:ro \
   -v /home/tyler/vllm-gfx908/vllm/model_executor/layers/utils.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/utils.py:ro \
   -v /home/tyler/vllm-gfx908/vllm/distributed/device_communicators/custom_all_reduce.py:/usr/local/lib/python3.12/dist-packages/vllm/distributed/device_communicators/custom_all_reduce.py:ro \
+  -v /home/tyler/vllm-gfx908/vllm/v1/attention/ops:/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops:ro \
   "$IMG" \
   vllm serve "/models/${MODEL_DIR}" \
     --served-model-name "$SERVED" \
@@ -103,7 +104,7 @@ docker exec decode_opt python3 /bench/BenchAndReport.py \
   --model "$SERVED" \
   --tokenizer "/models/${MODEL_DIR}" \
   --base-url http://localhost:8000 \
-  --hardware "4x AMD MI100 (gfx908) - Round-3 ship: 5h custom-op + 5j NCCL Tree+LL" \
+  --hardware "${HARDWARE:-4x AMD MI100 (gfx908) - Round-3 ship: 5h custom-op + 5j NCCL Tree+LL}" \
   --output "$REPORT_PATH_CONT" \
   --scaffolded-report \
   --save-results 2>&1 | tee "/tmp/decode_opt/bench_${SERVED}.log"

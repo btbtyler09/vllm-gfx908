@@ -421,6 +421,17 @@ def rocm_unquantized_gemm_gfx908(
     (round-3 Stage 5h). Without this wrapping, inductor inlines our Python and
     lowers the trailing `F.linear` straight to `aten::mm` → rocBLAS, bypassing
     the dispatch.
+
+    Note: round-4 lever K (hoisting the n>4 check up here so inductor could
+    inline F.linear at high concurrency) was attempted on 2026-04-26 and
+    REGRESSED c=1 by 17% — the Python-level shape conditional broke the
+    inductor trace and forced eager Python execution on every GEMM call
+    (~10 µs × ~129 calls/token ≈ ~1.3 ms/token overhead). Reverted. The
+    c=64 (-4%) / c=128 (-9.3%) regression vs round-2 stands; recovery would
+    require per-layer closure binding (decide dispatch fn at layer init based
+    on weight.shape, no runtime conditional), which is invasive and doesn't
+    help the c=1 throughput target. See docs/mi100_decode_opt/round4_candidates.md
+    lever K for the full post-mortem.
     """
     return torch.ops.vllm.rocm_unquantized_gemm_gfx908(x, weight, bias)
 
