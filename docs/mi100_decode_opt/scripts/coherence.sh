@@ -37,7 +37,7 @@ check() {
   if echo "$content" | grep -qE '\b([A-Za-z]+( +[A-Za-z]+){3})( +\1){4,}'; then
     echo "FAIL: $name (4-gram repeated 5+ times)"; return 1
   fi
-  if ! echo "$content" | grep -qiE "$regex"; then
+  if ! echo "$content" | tr '\n' ' ' | grep -qiE "$regex"; then
     echo "FAIL: $name (regex '$regex' missed). Content: $(echo "$content" | head -c 200)"; return 1
   fi
   echo "PASS: $name"

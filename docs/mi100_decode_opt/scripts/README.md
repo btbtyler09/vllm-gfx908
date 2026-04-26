@@ -1,7 +1,7 @@
 # Decode Optimization Test Harness — gfx908 / Qwen3.6-35B-A3B
 
 Reproduction scripts for the decode optimization investigation.
-Findings docs: see [parent dir](../) (start with `00_FINAL_SUMMARY.md`).
+Findings docs: see [parent dir](../) — start with `README.md` for the methodology overview, or `qwen3_6_35b.md` for the consolidated 35B story (rounds 1–3, all shipped).
 
 ## Quick layout
 
