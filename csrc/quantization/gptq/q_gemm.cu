@@ -22,7 +22,7 @@ https://github.com/qwopqwop200/GPTQ-for-LLaMa
 namespace vllm {
 namespace gptq {
 
-#define BLOCK_KN_SIZE 128
+#define BLOCK_KN_SIZE 256  // round-5 winner: 128=baseline, 256=+6.4%, 320=-12%, 512=-45%. 4 wavefronts × 64 = optimal SIMD occupancy on gfx908 (4 SIMDs/CU).
 #define BLOCK_M_SIZE_MAX 8
 #define MAX_GROUPS_IN_BLOCK (BLOCK_KN_SIZE / 32)
 #define MAX_Q_GEMM_ROWS 50
@@ -188,7 +188,8 @@ typedef void (*fp_gemm_half_q_half_gptq_kernel)(const half*, const uint32_t*,
                                                 const bool, const int*);
 
 template <bool first_block, int m_count>
-__global__ void gemm_half_q_half_gptq_4bit_kernel(
+__global__ __launch_bounds__(BLOCK_KN_SIZE, 1)
+void gemm_half_q_half_gptq_4bit_kernel(
     const half* __restrict__ a, const uint32_t* __restrict__ b_q_weight,
     const uint32_t* __restrict__ b_gptq_qzeros,
     const half* __restrict__ b_gptq_scales, half* __restrict__ c,
@@ -563,7 +564,8 @@ __global__ void gemm_half_q_half_gptq_3bit_kernel(
 }
 
 template <bool first_block, int m_count>
-__global__ void gemm_half_q_half_gptq_8bit_kernel(
+__global__ __launch_bounds__(BLOCK_KN_SIZE, 1)
+void gemm_half_q_half_gptq_8bit_kernel(
     const half* __restrict__ a, const uint32_t* __restrict__ b_q_weight,
     const uint32_t* __restrict__ b_gptq_qzeros,
     const half* __restrict__ b_gptq_scales, half* __restrict__ c,

@@ -20,13 +20,22 @@ BUCKETS = [
                       "_fwd_kernel_stage", "attention_2d"]),
 
     # --- all-reduce / collectives ---
-    ("all-reduce",   ["ncclDevKernel", "ncclAllReduce", "rccl", "one_shot_", "two_shot_", "custom_ar"]),
+    ("all-reduce",   ["ncclDevKernel", "ncclAllReduce", "rccl", "one_shot_", "two_shot_",
+                      "custom_ar", "cross_device_reduce"]),
 
     # --- MoE kernels (routing + fused GEMM) ---
     ("moe-gemm",     ["fused_moe_kernel", "moe_stage1", "fmoe_stage1", "moe_gemm_stage1",
                       "moe_stage2", "fmoe_stage2", "moe_gemm_stage2"]),
     ("moe-routing",  ["topkGating", "moe_align_block_size", "moe_sorting", "count_and_sort_expert",
                       "moe_permute", "moe_unpermute", "act_and_mul_kernel", "moe_reduce"]),
+
+    # --- vLLM custom skinny GEMM (M=1 decode path; round-3 stage 5h escape hatch) ---
+    ("linear-llgemm", ["LLGemm1_kernel", "wvSplitK", "wvSpltK"]),
+
+    # --- GPTQ dense kernel (vllm._custom_ops.gptq_gemm — dense path on ROCm/gfx908) ---
+    # NB: actual HIP kernel name TBD from trace; common candidates listed.
+    ("gptq-gemm",    ["gptq_gemm", "gemm_half_q_half", "q4_matmul", "q8_matmul",
+                      "vec_quant_matmul", "exllama", "Exllama"]),
 
     # --- linear projections (rocBLAS Tensile kernels — QKV, O, router, shared experts) ---
     ("linear-rocblas", ["Cijk_", "PostGSU"]),
