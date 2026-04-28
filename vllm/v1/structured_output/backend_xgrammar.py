@@ -10,8 +10,8 @@ import torch
 import vllm.envs
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
-from vllm.transformers_utils.tokenizers.mistral import MistralTokenizer
 from vllm.utils.import_utils import LazyLoader
+from vllm.utils.mistral import is_mistral_tokenizer
 from vllm.v1.structured_output.backend_types import (
     StructuredOutputBackend,
     StructuredOutputGrammar,
@@ -38,7 +38,7 @@ class XgrammarBackend(StructuredOutputBackend):
             self.vllm_config.structured_outputs_config.disable_any_whitespace
         )
 
-        if isinstance(self.tokenizer, MistralTokenizer):
+        if is_mistral_tokenizer(self.tokenizer):
             # NOTE: ideally, xgrammar should handle this accordingly.
             # refer to https://github.com/mlc-ai/xgrammar/blob/d77c0a0173ef14779c918e3be7966ba852f7910f/python/xgrammar/tokenizer_info.py#L98
             stop_token_ids = [self.tokenizer.eos_token_id]
@@ -103,7 +103,6 @@ class XgrammarBackend(StructuredOutputBackend):
                 ]
                 ctx = self.compiler.compile_structural_tag(tags, s_tag["triggers"])
             else:
-                logger.info("Compiling structural tag grammar_spec: %s", grammar_spec)
                 ctx = self.compiler.compile_structural_tag(grammar_spec)
         else:
             logger.error(
@@ -200,6 +199,25 @@ class XgrammarGrammar(StructuredOutputGrammar):
         self.matcher.reset()
 
 
+# cf https://github.com/mlc-ai/xgrammar/blob/a32ac892676d2eedc0327416105b9b06edfb94b2/cpp/json_schema_converter.cc
+STRING_SUPPORTED_FORMATS = {
+    "email",
+    "date",
+    "time",
+    "date-time",
+    "duration",
+    "ipv4",
+    "ipv6",
+    "hostname",
+    "uuid",
+    "uri",
+    "uri-reference",
+    "uri-template",
+    "json-pointer",
+    "relative-json-pointer",
+}
+
+
 def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:
     """Check if JSON schema contains features unsupported by xgrammar."""
 
@@ -219,18 +237,16 @@ def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:
             return True
 
         # Unsupported keywords for strings
-        if obj.get("type") == "string" and "format" in obj:
+        if (
+            obj.get("type") == "string"
+            and "format" in obj
+            and obj["format"] not in STRING_SUPPORTED_FORMATS
+        ):
             return True
 
         # Unsupported keywords for objects
         if obj.get("type") == "object" and any(
-            key in obj
-            for key in (
-                "minProperties",
-                "maxProperties",
-                "propertyNames",
-                "patternProperties",
-            )
+            key in obj for key in ("patternProperties", "propertyNames")
         ):
             return True
 
@@ -273,7 +289,7 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
             xgr.Grammar.from_ebnf(choice_grammar)
         except Exception as err:
             raise ValueError(
-                "Failed to transform choices into a grammar: {err}"
+                f"Failed to transform choices into a grammar: {err}"
             ) from err
         so_params.choice = None
         so_params.grammar = choice_grammar
@@ -288,17 +304,17 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
         else:
             schema = so_params.json
 
+        if has_xgrammar_unsupported_json_features(schema):
+            raise ValueError(
+                "The provided JSON schema contains features not supported by xgrammar."
+            )
+
         try:
             xgr.Grammar.from_json_schema(schema)
         except Exception as err:
             raise ValueError(
                 f"Failed to transform json schema into a grammar: {err}"
             ) from err
-
-        if has_xgrammar_unsupported_json_features(schema):
-            raise ValueError(
-                "The provided JSON schema contains features not supported by xgrammar."
-            )
         return
 
     if so_params.grammar:

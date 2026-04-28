@@ -3,7 +3,6 @@
 """Benchmark offline prioritization."""
 
 import argparse
-import dataclasses
 import json
 import random
 import time
@@ -11,7 +10,7 @@ import time
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from vllm.engine.arg_utils import EngineArgs
-from vllm.utils import FlexibleArgumentParser
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
 # Select a equi-probable random priority
@@ -79,7 +78,7 @@ def run_vllm(
 ) -> float:
     from vllm import LLM, SamplingParams
 
-    llm = LLM(**dataclasses.asdict(engine_args))
+    llm = LLM.from_engine_args(engine_args)
 
     assert all(
         llm.llm_engine.model_config.max_model_len >= (request[1] + request[2])

@@ -3,6 +3,12 @@
 dist
 vllm/*.so
 
+# mi100-ops build artifacts (must be rebuilt inside container)
+mi100-ops/build/
+mi100-ops/*.egg-info/
+mi100-ops/mi100_ops/_hip_ext*.so
+mi100-ops/mi100_ops/*.so
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

@@ -5,6 +5,7 @@ Reinforcement Learning from Human Feedback (RLHF) is a technique that fine-tunes
 The following open-source RL libraries use vLLM for fast rollouts (sorted alphabetically and non-exhaustive):
 
 - [Cosmos-RL](https://github.com/nvidia-cosmos/cosmos-rl)
+- [ms-swift](https://github.com/modelscope/ms-swift/tree/main)
 - [NeMo-RL](https://github.com/NVIDIA-NeMo/RL)
 - [Open Instruct](https://github.com/allenai/open-instruct)
 - [OpenRLHF](https://github.com/OpenRLHF/OpenRLHF)
@@ -15,11 +16,9 @@ The following open-source RL libraries use vLLM for fast rollouts (sorted alphab
 - [Unsloth](https://github.com/unslothai/unsloth)
 - [verl](https://github.com/volcengine/verl)
 
-See the following basic examples to get started if you don't want to use an existing library:
+For weight synchronization between training and inference, see the [Weight Transfer](weight_transfer/README.md) documentation, which covers the pluggable backend system with [NCCL](weight_transfer/nccl.md) (multi-GPU) and [IPC](weight_transfer/ipc.md) (same-GPU) engines.
 
-- [Training and inference processes are located on separate GPUs (inspired by OpenRLHF)](../examples/offline_inference/rlhf.md)
-- [Training and inference processes are colocated on the same GPUs using Ray](../examples/offline_inference/rlhf_colocate.md)
-- [Utilities for performing RLHF with vLLM](../examples/offline_inference/rlhf_utils.md)
+For pipelining generation and training to improve GPU utilization and throughput, see the [Async Reinforcement Learning](async_rl.md) guide, which covers the pause/resume API for safely updating weights mid-flight.
 
 See the following notebooks showing how to use vLLM for GRPO:
 

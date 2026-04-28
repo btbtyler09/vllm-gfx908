@@ -14,14 +14,12 @@ import typing
 import vllm.env_override  # noqa: F401
 
 MODULE_ATTRS = {
-    "bc_linter_skip": "._bc_linter:bc_linter_skip",
-    "bc_linter_include": "._bc_linter:bc_linter_include",
     "AsyncEngineArgs": ".engine.arg_utils:AsyncEngineArgs",
     "EngineArgs": ".engine.arg_utils:EngineArgs",
     "AsyncLLMEngine": ".engine.async_llm_engine:AsyncLLMEngine",
     "LLMEngine": ".engine.llm_engine:LLMEngine",
     "LLM": ".entrypoints.llm:LLM",
-    "initialize_ray_cluster": ".executor.ray_utils:initialize_ray_cluster",
+    "initialize_ray_cluster": ".v1.executor.ray_utils:initialize_ray_cluster",
     "PromptType": ".inputs:PromptType",
     "TextPrompt": ".inputs:TextPrompt",
     "TokensPrompt": ".inputs:TokensPrompt",
@@ -45,7 +43,6 @@ if typing.TYPE_CHECKING:
     from vllm.engine.async_llm_engine import AsyncLLMEngine
     from vllm.engine.llm_engine import LLMEngine
     from vllm.entrypoints.llm import LLM
-    from vllm.executor.ray_utils import initialize_ray_cluster
     from vllm.inputs import PromptType, TextPrompt, TokensPrompt
     from vllm.model_executor.models import ModelRegistry
     from vllm.outputs import (
@@ -62,8 +59,7 @@ if typing.TYPE_CHECKING:
     )
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
-
-    from ._bc_linter import bc_linter_include, bc_linter_skip
+    from vllm.v1.executor.ray_utils import initialize_ray_cluster
 else:
 
     def __getattr__(name: str) -> typing.Any:
@@ -79,8 +75,6 @@ else:
 
 __all__ = [
     "__version__",
-    "bc_linter_skip",
-    "bc_linter_include",
     "__version_tuple__",
     "LLM",
     "ModelRegistry",

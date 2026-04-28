@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
+import os
 import traceback
 from itertools import chain
 from typing import TYPE_CHECKING
 
 from vllm import envs
 from vllm.plugins import PLATFORM_PLUGINS_GROUP, load_plugins_by_group
-from vllm.utils import supports_xccl
 from vllm.utils.import_utils import resolve_obj_by_qualname
+from vllm.utils.torch_utils import supports_xccl
 
 from .interface import CpuArchEnum, Platform, PlatformEnum
 
@@ -38,7 +39,7 @@ def tpu_platform_plugin() -> str | None:
     # Check for Pathways TPU proxy
     if envs.VLLM_TPU_USING_PATHWAYS:
         logger.debug("Confirmed TPU platform is available via Pathways proxy.")
-        return "tpu_inference.platforms.tpu_jax.TpuPlatform"
+        return "tpu_inference.platforms.tpu_platform.TpuPlatform"
 
     # Check for libtpu installation
     try:
@@ -60,7 +61,7 @@ def cuda_platform_plugin() -> str | None:
     is_cuda = False
     logger.debug("Checking if CUDA platform is available.")
     try:
-        from vllm.utils import import_pynvml
+        from vllm.utils.import_utils import import_pynvml
 
         pynvml = import_pynvml()
         pynvml.nvmlInit()
@@ -132,27 +133,31 @@ def xpu_platform_plugin() -> str | None:
     is_xpu = False
     logger.debug("Checking if XPU platform is available.")
     try:
-        # installed IPEX if the machine has XPUs.
-        import intel_extension_for_pytorch  # noqa: F401
         import torch
 
         if supports_xccl():
             dist_backend = "xccl"
-        else:
-            dist_backend = "ccl"
-            import oneccl_bindings_for_pytorch  # noqa: F401
-
-        if hasattr(torch, "xpu") and torch.xpu.is_available():
-            is_xpu = True
             from vllm.platforms.xpu import XPUPlatform
 
             XPUPlatform.dist_backend = dist_backend
             logger.debug("Confirmed %s backend is available.", XPUPlatform.dist_backend)
+
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            is_xpu = True
             logger.debug("Confirmed XPU platform is available.")
     except Exception as e:
         logger.debug("XPU platform is not available because: %s", str(e))
 
     return "vllm.platforms.xpu.XPUPlatform" if is_xpu else None
+
+
+def _is_amd_zen_cpu() -> bool:
+    """Detect AMD CPU with AVX-512 via /proc/cpuinfo."""
+    if not os.path.exists("/proc/cpuinfo"):
+        return False
+    with open("/proc/cpuinfo") as f:
+        cpuinfo = f.read()
+    return "AuthenticAMD" in cpuinfo and "avx512" in cpuinfo
 
 
 def cpu_platform_plugin() -> str | None:
@@ -172,11 +177,27 @@ def cpu_platform_plugin() -> str | None:
                 logger.debug(
                     "Confirmed CPU platform is available because the machine is MacOS."
                 )
-
     except Exception as e:
         logger.debug("CPU platform is not available because: %s", str(e))
 
-    return "vllm.platforms.cpu.CpuPlatform" if is_cpu else None
+    if not is_cpu:
+        return None
+
+    if _is_amd_zen_cpu():
+        try:
+            import zentorch  # noqa: F401
+
+            logger.debug(
+                "AMD Zen CPU detected with zentorch installed, using ZenCpuPlatform."
+            )
+            return "vllm.platforms.zen_cpu.ZenCpuPlatform"
+        except ImportError:
+            logger.debug(
+                "AMD Zen CPU detected but zentorch not installed, "
+                "falling back to CpuPlatform."
+            )
+
+    return "vllm.platforms.cpu.CpuPlatform"
 
 
 builtin_platform_plugins = {
@@ -222,10 +243,12 @@ def resolve_current_platform_cls_qualname() -> str:
         )
     elif len(activated_builtin_plugins) == 1:
         platform_cls_qualname = builtin_platform_plugins[activated_builtin_plugins[0]]()
-        logger.info("Automatically detected platform %s.", activated_builtin_plugins[0])
+        logger.debug(
+            "Automatically detected platform %s.", activated_builtin_plugins[0]
+        )
     else:
         platform_cls_qualname = "vllm.platforms.interface.UnspecifiedPlatform"
-        logger.info("No platform detected, vLLM is running on UnspecifiedPlatform")
+        logger.debug("No platform detected, vLLM is running on UnspecifiedPlatform")
     return platform_cls_qualname
 
 
@@ -272,4 +295,11 @@ def __setattr__(name: str, value):
         raise AttributeError(f"No attribute named '{name}' exists in {__name__}.")
 
 
-__all__ = ["Platform", "PlatformEnum", "current_platform", "CpuArchEnum", "_init_trace"]
+__all__ = [
+    "Platform",
+    "PlatformEnum",
+    "current_platform",
+    "CpuArchEnum",
+    "_init_trace",
+    "_is_amd_zen_cpu",
+]

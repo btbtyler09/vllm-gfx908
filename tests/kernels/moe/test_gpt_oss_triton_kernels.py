@@ -6,7 +6,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vllm.utils import has_triton_kernels
+from vllm.platforms import current_platform
+from vllm.utils.import_utils import has_triton_kernels
 
 if not has_triton_kernels():
     pytest.skip(
@@ -14,6 +15,7 @@ if not has_triton_kernels():
         allow_module_level=True,
     )
 
+import triton_kernels.matmul_ogs_details.opt_flags as opt_flags
 import triton_kernels.swiglu
 from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 from triton_kernels.numerics import InFlexData
@@ -22,18 +24,13 @@ from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
 from triton_kernels.tensor_details import layout
 from triton_kernels.testing import assert_close
 
-from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
-from vllm.model_executor.layers.fused_moe.fused_batched_moe import (
-    BatchedPrepareAndFinalize,
-)
-from vllm.model_executor.layers.fused_moe.fused_moe import fused_topk
-from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import (
-    BatchedOAITritonExperts,
+from vllm.model_executor.layers.fused_moe.config import mxfp4_w4a16_moe_quant_config
+from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (
     triton_kernel_moe_forward,
 )
-from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEModularKernel
-from vllm.model_executor.layers.utils import shuffle_weight
-from vllm.utils import round_up
+from vllm.utils.math_utils import round_up
+
+from .utils import shuffle_weight
 
 
 def deshuffle(w: torch.Tensor):
@@ -96,10 +93,18 @@ def init_compute_data(M, K, N, E, a_dtype: str, w_dtype: str, num_warps: int):
     if w_dtype != "mx4":
         pytest.skip("NYI")
     else:  # quantize to mx4
-        # careful on the padding here, the activation padding need to be
-        # multiple of 64, the actual engine is not implemented
-        w1_bottom_pad = round_up(w1_tri.shape[1], 64) - w1_tri.shape[1]
-        w1_right_pad = round_up(w1_tri.shape[2], 128) - w1_tri.shape[2]
+        # Padding alignment depends on the platform.  On CDNA4 the scale
+        # swizzle requires SCALE_K % 8 == 0 (K % 256) and
+        # SCALE_N % 32 == 0 (2*N % 512), matching the production
+        # alignment in mxfp4_round_up_hidden_size_and_intermediate_size.
+        # On CUDA (Hopper) the scale layout pads internally, so the
+        # original 64/128 alignment is sufficient.
+        if current_platform.is_rocm():
+            k_align, n2_align = 256, 512
+        else:
+            k_align, n2_align = 64, 128
+        w1_bottom_pad = round_up(w1_tri.shape[1], k_align) - w1_tri.shape[1]
+        w1_right_pad = round_up(w1_tri.shape[2], n2_align) - w1_tri.shape[2]
 
         w2_bottom_pad = w1_right_pad // 2
         w2_right_pad = w1_bottom_pad
@@ -207,7 +212,7 @@ class ModelConfig:
     sliding_window: int = 128
     initial_context_length: int = 4096
     rope_theta: float = 150000.0
-    rope_scaling_factor: float = 32.0
+    rope_parameters_factor: float = 32.0
     rope_ntk_alpha: float = 1.0
     rope_ntk_beta: float = 32.0
 
@@ -275,7 +280,12 @@ class Case:
 )
 @pytest.mark.parametrize("num_token", [2])
 @pytest.mark.parametrize("tp", [1, 2, 4, 8])
-def test_equiv(num_token, a_dtype, w_dtype, tp):
+def test_equiv(num_token, a_dtype, w_dtype, tp, workspace_init):
+    from triton_kernels.tensor_details import layout
+
+    if not hasattr(layout, "make_default_matmul_mxfp4_w_layout"):
+        pytest.skip("make_default_matmul_mxfp4_w_layout not available")
+
     M = num_token
     E = ModelConfig.num_experts
     K = ModelConfig.hidden_size
@@ -299,12 +309,24 @@ def test_equiv(num_token, a_dtype, w_dtype, tp):
         pc2,
     ) = init_compute_data(M, K, N, E, a_dtype, w_dtype, num_warps=8)
 
-    quant_config = FusedMoEQuantConfig.make(
-        w1_bias=w1_bias_tri,
-        w2_bias=w2_bias_tri,
-        w1_precision=pc1,
-        w2_precision=pc2,
-    )
+    if current_platform.is_device_capability_family(100):
+        constraints = {
+            "is_persistent": True,
+        }
+        opt_flags.update_opt_flags_constraints(constraints)
+
+    if a_dtype == "bf16" and w_dtype == "mx4":
+        quant_config = mxfp4_w4a16_moe_quant_config(
+            w1_scale=pc1,
+            w2_scale=pc2,
+            w1_bias=w1_bias_tri,
+            w2_bias=w2_bias_tri,
+        )
+    else:
+        raise NotImplementedError(
+            f"Quantization configuration for activation={a_dtype} and weight={w_dtype} "
+            f"has not been implemented."
+        )
 
     out_triton_monolithic = triton_kernel_moe_forward(
         hidden_states=x_tri,
@@ -327,115 +349,6 @@ def test_equiv(num_token, a_dtype, w_dtype, tp):
         topk=topk,
     )
     assert_close(ref=out_ref, tri=out_triton_monolithic, maxtol=0.025, rmstol=0.005)
-
-
-def batched_moe(
-    a: torch.Tensor,
-    w1,
-    w2,
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    w1_bias: torch.Tensor,
-    w2_bias: torch.Tensor,
-    w1_precision: PrecisionConfig,
-    w2_precision: PrecisionConfig,
-) -> torch.Tensor:
-    max_num_tokens = round_up(a.shape[0], 64)
-
-    quant_config = FusedMoEQuantConfig.make(
-        w1_precision=w1_precision,
-        w2_precision=w2_precision,
-        w1_bias=w1_bias,
-        w2_bias=w2_bias,
-    )
-
-    fused_experts = FusedMoEModularKernel(
-        BatchedPrepareAndFinalize(
-            max_num_tokens,
-            num_dispatchers=1,
-            num_local_experts=w1.shape[0],
-            rank=0,
-        ),
-        BatchedOAITritonExperts(
-            max_num_tokens=max_num_tokens,
-            num_dispatchers=1,
-            quant_config=quant_config,
-        ),
-    )
-
-    topk_weight, topk_ids, _ = fused_topk(a, gating_output, topk, renormalize)
-
-    return fused_experts(
-        a,
-        w1,
-        w2,
-        topk_weight,
-        topk_ids,
-    )
-
-
-@pytest.mark.parametrize(
-    ", ".join(f.name for f in fields(Case)),
-    [
-        tuple(getattr(case, f.name) for f in fields(Case))
-        for case in [
-            # Case(a_dtype="bf16", w_dtype="bf16"),
-            # Case(a_dtype="fp8_e4m3", w_dtype="fp8_e5m2"),
-            Case(a_dtype="bf16", w_dtype="mx4")
-        ]
-    ],
-)
-@pytest.mark.parametrize("num_token", [64])
-@pytest.mark.parametrize("ep", [1, 2, 4, 8])
-def test_triton_kernel_batched_moe(num_token, a_dtype, w_dtype, ep):
-    M = num_token
-    E = ModelConfig.num_experts // ep
-    K = ModelConfig.hidden_size
-    N = ModelConfig.intermediate_size
-    topk = ModelConfig.experts_per_token
-
-    (
-        x,
-        w1,
-        w1_bias,
-        w2,
-        w2_bias,
-        exp_data,
-        x_tri,
-        w1_tri,
-        w2_tri,
-        exp_data_tri,
-        w1_bias_tri,
-        w2_bias_tri,
-        pc1,
-        pc2,
-    ) = init_compute_data(M, K, N, E, a_dtype, w_dtype, num_warps=4)
-
-    out_tri = batched_moe(
-        a=x_tri,
-        w1=w1_tri,
-        w2=w2_tri,
-        gating_output=exp_data_tri,
-        topk=topk,
-        renormalize=True,
-        w1_bias=w1_bias_tri,
-        w2_bias=w2_bias_tri,
-        w1_precision=pc1,
-        w2_precision=pc2,
-    )
-    out_tri = out_tri[..., :K]
-
-    out_ref = oai_moe_forward(
-        hidden_states=x,
-        w1=w1,
-        w1_bias=w1_bias,
-        w2=w2,
-        w2_bias=w2_bias,
-        gating_output=exp_data,
-        topk=topk,
-    )
-    assert_close(ref=out_ref, tri=out_tri, maxtol=0.025, rmstol=0.005)
 
 
 def test_unit_shuffle():

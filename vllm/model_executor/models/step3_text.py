@@ -9,17 +9,18 @@ from typing import Any
 import torch
 from torch import nn
 
-from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoE,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -31,12 +32,12 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
+from vllm.transformers_utils.configs.step3_vl import Step3TextConfig
 
 from .interfaces import SupportsPP
 from .utils import (
@@ -71,7 +72,6 @@ class FusedMoEBlock(nn.Module):
             top_k=config.moe_top_k,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            reduce_results=False,
             renormalize=config.norm_expert_weight,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
@@ -94,8 +94,6 @@ class FusedMoEBlock(nn.Module):
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(orig_shape)
 
@@ -145,9 +143,8 @@ class Step3TextAttention(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         norm_eps: float,
-        rope_theta: int,
+        rope_parameters: dict[str, Any],
         share_q_dim: int | None = None,
-        rope_scaling: dict[str, Any] | None = None,
         max_position_embedding: int = 8192,
         head_dim: int = 256,
         cache_config: CacheConfig | None = None,
@@ -197,10 +194,8 @@ class Step3TextAttention(nn.Module):
         )
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.head_dim,
             max_position=max_position_embedding,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
+            rope_parameters=rope_parameters,
         )
         scaling = self.head_dim**-0.5
         self.attn = Attention(
@@ -228,15 +223,13 @@ class Step3TextAttention(nn.Module):
 class Step3TextDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: ModelConfig,
+        config: Step3TextConfig,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
-        config = config.hf_config
         self.hidden_size = config.hidden_size
-        rope_scaling = getattr(config, "rope_scaling", None)
 
         self.self_attn = Step3TextAttention(
             hidden_size=self.hidden_size,
@@ -248,8 +241,7 @@ class Step3TextDecoderLayer(nn.Module):
             max_position_embedding=config.max_position_embedding,
             head_dim=config.head_dim,
             share_q_dim=config.share_q_dim,
-            rope_theta=config.rope_theta,
-            rope_scaling=rope_scaling,
+            rope_parameters=config.rope_parameters,
             prefix=f"{prefix}.self_attn",
         )
 
@@ -339,7 +331,7 @@ class Step3TextModel(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: Step3TextDecoderLayer(
-                config=vllm_config.model_config,
+                config=config,
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=prefix,
@@ -355,12 +347,12 @@ class Step3TextModel(nn.Module):
             ["hidden_states"], config.hidden_size
         )
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -369,7 +361,7 @@ class Step3TextModel(nn.Module):
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
-                hidden_states = self.get_input_embeddings(input_ids)
+                hidden_states = self.embed_input_ids(input_ids)
             residual = None
         else:
             assert intermediate_tensors is not None
@@ -400,28 +392,19 @@ class Step3TextForCausalLM(nn.Module, SupportsPP):
     ):
         super().__init__()
         config = vllm_config.model_config.hf_config
-        lora_config = vllm_config.lora_config
+
         self.config = config
         self.vllm_config = vllm_config
 
         self.model = Step3TextModel(vllm_config=vllm_config, prefix=prefix)
 
         if get_pp_group().is_last_rank:
-            self.unpadded_vocab_size = config.vocab_size
-            if lora_config:
-                self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
             self.lm_head = ParallelLMHead(
-                self.unpadded_vocab_size,
+                config.vocab_size,
                 config.hidden_size,
-                org_num_embeddings=config.vocab_size,
-                padding_size=DEFAULT_VOCAB_PADDING_SIZE
-                if not lora_config
-                else lora_config.lora_vocab_padding_size,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
-            self.logits_processor = LogitsProcessor(
-                self.unpadded_vocab_size, config.vocab_size
-            )
+            self.logits_processor = LogitsProcessor(config.vocab_size)
         else:
             self.lm_head = PPMissingLayer()
 
@@ -429,12 +412,12 @@ class Step3TextForCausalLM(nn.Module, SupportsPP):
             self.model.make_empty_intermediate_tensors
         )
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.get_input_embeddings(input_ids)
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids)
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -482,11 +465,14 @@ class Step3TextForCausalLM(nn.Module, SupportsPP):
         ]
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        base_layer = (
+            "base_layer." if any(".base_layer." in name for name in params_dict) else ""
+        )
 
         expert_params_mapping = [
-            (".moe.experts.w13_weight", ".moe.gate_proj.weight", "w1"),
-            (".moe.experts.w13_weight", ".moe.up_proj.weight", "w3"),
-            (".moe.experts.w2_weight", ".moe.down_proj.weight", "w2"),
+            (f".moe.experts.{base_layer}w13_weight", ".moe.gate_proj.weight", "w1"),
+            (f".moe.experts.{base_layer}w13_weight", ".moe.up_proj.weight", "w3"),
+            (f".moe.experts.{base_layer}w2_weight", ".moe.down_proj.weight", "w2"),
         ]
 
         disable_moe_stacked_params = [data[1] for data in expert_params_mapping]

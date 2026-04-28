@@ -17,7 +17,6 @@ from vllm.distributed.device_communicators.all_reduce_utils import (
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.utils import cuda_device_count_stateless
 
 try:
     ops.meta_size()
@@ -34,7 +33,7 @@ def _can_p2p(rank: int, world_size: int) -> bool:
         if i == rank:
             continue
         if envs.VLLM_SKIP_P2P_CHECK:
-            logger.info("Skipping P2P check and trusting the driver's P2P report.")
+            logger.debug("Skipping P2P check and trusting the driver's P2P report.")
             return torch.cuda.can_device_access_peer(rank, i)
         if not gpu_p2p_access_check(rank, i):
             return False
@@ -135,7 +134,7 @@ class CustomAllreduce:
         if cuda_visible_devices:
             device_ids = list(map(int, cuda_visible_devices.split(",")))
         else:
-            device_ids = list(range(cuda_device_count_stateless()))
+            device_ids = list(range(current_platform.device_count()))
 
         physical_device_id = device_ids[device.index]
         tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
@@ -271,6 +270,17 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
+                # gfx908: route captured all-reduce through the pre-registered
+                # uncached buffer_ptrs (registered=False) instead of binding
+                # `input` directly (registered=True). HIP IPC views of cached
+                # cudaMalloc'd memory don't see peer writes consistently under
+                # graph replay → drift → NaN. The uncached buffer_ptrs path is
+                # coherent. See docs/mi100_decode_opt/scripts/test_e_persistent_car
+                # for the soak that proved this.
+                if current_platform.is_rocm():
+                    from vllm.platforms.rocm import on_gfx908
+                    if on_gfx908():
+                        return self.all_reduce(input, registered=False)
                 return self.all_reduce(input, registered=True)
             else:
                 # If warm up, mimic the allocation pattern since custom

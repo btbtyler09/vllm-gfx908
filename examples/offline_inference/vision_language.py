@@ -11,18 +11,17 @@ on HuggingFace model repository.
 import os
 import random
 from contextlib import contextmanager
-from dataclasses import asdict
 from typing import NamedTuple
 
 from huggingface_hub import snapshot_download
-from transformers import AutoTokenizer
+from transformers import AutoProcessor, AutoTokenizer
 
 from vllm import LLM, EngineArgs, SamplingParams
 from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.image import convert_image_mode
-from vllm.utils import FlexibleArgumentParser
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
 class ModelRequestData(NamedTuple):
@@ -30,6 +29,7 @@ class ModelRequestData(NamedTuple):
     prompts: list[str]
     stop_token_ids: list[int] | None = None
     lora_requests: list[LoRARequest] | None = None
+    sampling_params: list[SamplingParams] | None = None
 
 
 # NOTE: The default `max_num_seqs` and `max_model_len` may result in OOM on
@@ -71,7 +71,7 @@ def run_aria(questions: list[str], modality: str) -> ModelRequestData:
 # Aya Vision
 def run_aya_vision(questions: list[str], modality: str) -> ModelRequestData:
     assert modality == "image"
-    model_name = "CohereForAI/aya-vision-8b"
+    model_name = "CohereLabs/aya-vision-8b"
 
     engine_args = EngineArgs(
         model=model_name,
@@ -84,6 +84,59 @@ def run_aya_vision(questions: list[str], modality: str) -> ModelRequestData:
         f"<|START_OF_TURN_TOKEN|><|USER_TOKEN|><image>{question}<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
         for question in questions
     ]
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+    )
+
+
+# Bee-8B
+def run_bee(questions: list[str], modality: str) -> ModelRequestData:
+    assert modality == "image"
+    model_name = "Open-Bee/Bee-8B-RL"
+
+    prompts = [
+        (
+            f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            f"<|im_start|>user\n<image>\n{question}<|im_end|>"
+            f"<|im_start|>assistant\n<think>\n"
+        )
+        for question in questions
+    ]
+
+    engine_args = EngineArgs(
+        model=model_name,
+        max_model_len=16384,
+        limit_mm_per_prompt={modality: 1},
+        trust_remote_code=True,
+    )
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+    )
+
+
+def run_bagel(questions: list[str], modality: str) -> ModelRequestData:
+    assert modality == "image"
+    model_name = "ByteDance-Seed/BAGEL-7B-MoT"
+
+    engine_args = EngineArgs(
+        model=model_name,
+        trust_remote_code=True,
+        max_model_len=8192,
+        max_num_seqs=2,
+        limit_mm_per_prompt={modality: 1},
+    )
+
+    prompts = [
+        (
+            f"<|im_start|>user\n<|image_pad|>\n{question}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+        for question in questions
+    ]
+
     return ModelRequestData(
         engine_args=engine_args,
         prompts=prompts,
@@ -126,16 +179,26 @@ def run_chameleon(questions: list[str], modality: str) -> ModelRequestData:
     )
 
 
-# Dots-OCR
-def run_dots_ocr(questions: list[str], modality: str) -> ModelRequestData:
+# Cheers
+def run_cheers(questions: list[str], modality: str) -> ModelRequestData:
     assert modality == "image"
+    model_name = "ai9stars/Cheers"
 
-    prompts = [f"<|img|><|imgpad|><|endofimg|>{question}" for question in questions]
     engine_args = EngineArgs(
-        model="rednote-hilab/dots.ocr",
-        limit_mm_per_prompt={modality: 1},
+        model=model_name,
         trust_remote_code=True,
+        max_model_len=4096,
+        limit_mm_per_prompt={modality: 1},
     )
+
+    prompts = [
+        (
+            f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            f"<|im_start|>user\n<|image_pad|>{question}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+        for question in questions
+    ]
 
     return ModelRequestData(
         engine_args=engine_args,
@@ -190,27 +253,213 @@ def run_deepseek_vl2(questions: list[str], modality: str) -> ModelRequestData:
     )
 
 
-# Ernie4.5-VL
-def run_ernie45_vl(questions: list[str], modality: str) -> ModelRequestData:
-    model_name = "baidu/ERNIE-4.5-VL-28B-A3B-PT"
+def run_deepseek_ocr(questions: list[str], modality: str) -> ModelRequestData:
+    from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor
+
+    assert modality == "image"
+
+    model_name = "deepseek-ai/DeepSeek-OCR"
 
     engine_args = EngineArgs(
         model=model_name,
-        max_model_len=4096,
-        max_num_seqs=5,
+        limit_mm_per_prompt={modality: 1},
+        logits_processors=[NGramPerReqLogitsProcessor],
+    )
+
+    # deepseek-ocr use plain prompt template
+    prompts = [f"<image>\n{question}" for question in questions]
+
+    # The following sampling params config is taken from
+    # the official Deepseek-OCR inference example.
+    # (IMPORTANT) Use the custom logits processor and avoid skipping
+    # special tokens for this model for the optimal OCR performance.
+    sampling_params = [
+        SamplingParams(
+            temperature=0.0,
+            max_tokens=8192,
+            # ngram logit processor args
+            extra_args=dict(
+                ngram_size=30,
+                window_size=90,
+                # whitelist: <td>, </td>
+                whitelist_token_ids={128821, 128822},
+            ),
+            skip_special_tokens=False,
+        )
+        for _ in questions
+    ]
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+        sampling_params=sampling_params,
+    )
+
+
+def run_deepseek_ocr2(questions: list[str], modality: str) -> ModelRequestData:
+    from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor
+
+    assert modality == "image"
+
+    model_name = "deepseek-ai/DeepSeek-OCR-2"
+
+    engine_args = EngineArgs(
+        model=model_name,
+        limit_mm_per_prompt={modality: 1},
+        logits_processors=[NGramPerReqLogitsProcessor],
+    )
+
+    # deepseek-ocr use plain prompt template
+    prompts = [f"<image>\n{question}" for question in questions]
+
+    # The following sampling params config is taken from
+    # the official Deepseek-OCR inference example.
+    # (IMPORTANT) Use the custom logits processor and avoid skipping
+    # special tokens for this model for the optimal OCR performance.
+    sampling_params = [
+        SamplingParams(
+            temperature=0.0,
+            max_tokens=8192,
+            # ngram logit processor args
+            extra_args=dict(
+                ngram_size=30,
+                window_size=90,
+                # whitelist: <td>, </td>
+                whitelist_token_ids={128821, 128822},
+            ),
+            skip_special_tokens=False,
+        )
+        for _ in questions
+    ]
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+        sampling_params=sampling_params,
+    )
+
+
+# Dots-OCR
+def run_dots_ocr(questions: list[str], modality: str) -> ModelRequestData:
+    assert modality == "image"
+
+    prompts = [f"<|img|><|imgpad|><|endofimg|>{question}" for question in questions]
+    engine_args = EngineArgs(
+        model="rednote-hilab/dots.ocr",
         limit_mm_per_prompt={modality: 1},
         trust_remote_code=True,
     )
 
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+    )
+
+
+# Eagle2.5-VL
+def run_eagle2_5(questions: list[str], modality: str) -> ModelRequestData:
+    assert modality == "image"
+
+    model_name = "nvidia/Eagle2.5-8B"
+
+    engine_args = EngineArgs(
+        model=model_name,
+        max_model_len=4096,
+        max_num_seqs=2,
+        trust_remote_code=True,
+        limit_mm_per_prompt={modality: 1},
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    messages = [
+        [{"role": "user", "content": f"<image>\n{question}"}] for question in questions
+    ]
+    prompts = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+    # Stop tokens for Eagle2.5 (Qwen2 based)
+    stop_tokens = ["<|endoftext|>", "<|im_start|>", "<|im_end|>"]
+    stop_token_ids = [tokenizer.convert_tokens_to_ids(i) for i in stop_tokens]
+    stop_token_ids = [token_id for token_id in stop_token_ids if token_id is not None]
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+        stop_token_ids=stop_token_ids,
+    )
+
+
+# Ernie4.5-VL
+def run_ernie45_vl(questions: list[str], modality: str) -> ModelRequestData:
+    model_name = "baidu/ERNIE-4.5-VL-28B-A3B-PT"
+
+    mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
+    engine_args = EngineArgs(
+        model=model_name,
+        max_model_len=4096,
+        max_num_seqs=5,
+        limit_mm_per_prompt=mm_limit,
+        trust_remote_code=True,
+    )
+
+    image_placeholder = "Picture 1:<|IMAGE_START|><|image@placeholder|><|IMAGE_END|>"
+    video_placeholder = "Video 1:<|VIDEO_START|><|video@placeholder|><|VIDEO_END|>"
+
     if modality == "image":
-        placeholder = "Picture 1:<|IMAGE_START|><|image@placeholder|><|IMAGE_END|>"
+        placeholder = image_placeholder
     elif modality == "video":
-        placeholder = "Video 1:<|VIDEO_START|><|video@placeholder|><|VIDEO_END|>"
+        placeholder = video_placeholder
+    elif modality == "image+video":
+        placeholder = image_placeholder + video_placeholder
 
     prompts = [
         (
             f"<|begin_of_sentence|>User: {question}{placeholder}\n"
             "Assistant: <think></think>"
+        )
+        for question in questions
+    ]
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+    )
+
+
+# EXAONE-4.5
+def run_exaone4_5(questions: list[str], modality: str) -> ModelRequestData:
+    model_name = "LGAI-EXAONE/EXAONE-4.5-33B"
+
+    mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
+    engine_args = EngineArgs(
+        model=model_name,
+        max_model_len=4096,
+        max_num_seqs=5,
+        mm_processor_kwargs={
+            "min_pixels": 28 * 28,
+            "max_pixels": 1280 * 28 * 28,
+            "fps": 1,
+        },
+        limit_mm_per_prompt=mm_limit,
+    )
+
+    image_placeholder = "<vision><|image_pad|></vision>"
+    video_placeholder = "<vision><|video_pad|></vision>"
+
+    if modality == "image":
+        placeholder = image_placeholder
+    elif modality == "video":
+        placeholder = video_placeholder
+    elif modality == "image+video":
+        placeholder = image_placeholder + video_placeholder
+
+    prompts = [
+        (
+            "<|system|>\nYou are a helpful assistant.<|endofturn|>\n"
+            f"<|user|>\n{placeholder}"
+            f"{question}<|endofturn|>\n"
+            "<|assistant|>\n"
         )
         for question in questions
     ]
@@ -248,8 +497,7 @@ def run_gemma3(questions: list[str], modality: str) -> ModelRequestData:
         model=model_name,
         max_model_len=2048,
         max_num_seqs=2,
-        # TODO: Support this in transformers backend
-        # mm_processor_kwargs={"do_pan_and_scan": True},
+        mm_processor_kwargs={"do_pan_and_scan": True},
         limit_mm_per_prompt={modality: 1},
     )
 
@@ -330,6 +578,7 @@ def run_glm4v(questions: list[str], modality: str) -> ModelRequestData:
 def run_glm4_1v(questions: list[str], modality: str) -> ModelRequestData:
     model_name = "zai-org/GLM-4.1V-9B-Thinking"
 
+    mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
     engine_args = EngineArgs(
         model=model_name,
         max_model_len=4096,
@@ -338,14 +587,19 @@ def run_glm4_1v(questions: list[str], modality: str) -> ModelRequestData:
             "size": {"shortest_edge": 12544, "longest_edge": 47040000},
             "fps": 1,
         },
-        limit_mm_per_prompt={modality: 1},
+        limit_mm_per_prompt=mm_limit,
         enforce_eager=True,
     )
 
+    image_placeholder = "<|begin_of_image|><|image|><|end_of_image|>"
+    video_placeholder = "<|begin_of_video|><|video|><|end_of_video|>"
+
     if modality == "image":
-        placeholder = "<|begin_of_image|><|image|><|end_of_image|>"
+        placeholder = image_placeholder
     elif modality == "video":
-        placeholder = "<|begin_of_video|><|video|><|end_of_video|>"
+        placeholder = video_placeholder
+    elif modality == "image+video":
+        placeholder = image_placeholder + video_placeholder
 
     prompts = [
         (
@@ -366,6 +620,7 @@ def run_glm4_1v(questions: list[str], modality: str) -> ModelRequestData:
 def run_glm4_5v(questions: list[str], modality: str) -> ModelRequestData:
     model_name = "zai-org/GLM-4.5V"
 
+    mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
     engine_args = EngineArgs(
         model=model_name,
         max_model_len=4096,
@@ -374,15 +629,20 @@ def run_glm4_5v(questions: list[str], modality: str) -> ModelRequestData:
             "size": {"shortest_edge": 12544, "longest_edge": 47040000},
             "fps": 1,
         },
-        limit_mm_per_prompt={modality: 1},
+        limit_mm_per_prompt=mm_limit,
         enforce_eager=True,
         tensor_parallel_size=4,
     )
 
+    image_placeholder = "<|begin_of_image|><|image|><|end_of_image|>"
+    video_placeholder = "<|begin_of_video|><|video|><|end_of_video|>"
+
     if modality == "image":
-        placeholder = "<|begin_of_image|><|image|><|end_of_image|>"
+        placeholder = image_placeholder
     elif modality == "video":
-        placeholder = "<|begin_of_video|><|video|><|end_of_video|>"
+        placeholder = video_placeholder
+    elif modality == "image+video":
+        placeholder = image_placeholder + video_placeholder
 
     prompts = [
         (
@@ -403,6 +663,7 @@ def run_glm4_5v(questions: list[str], modality: str) -> ModelRequestData:
 def run_glm4_5v_fp8(questions: list[str], modality: str) -> ModelRequestData:
     model_name = "zai-org/GLM-4.5V-FP8"
 
+    mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
     engine_args = EngineArgs(
         model=model_name,
         max_model_len=4096,
@@ -411,15 +672,62 @@ def run_glm4_5v_fp8(questions: list[str], modality: str) -> ModelRequestData:
             "size": {"shortest_edge": 12544, "longest_edge": 47040000},
             "fps": 1,
         },
-        limit_mm_per_prompt={modality: 1},
+        limit_mm_per_prompt=mm_limit,
         enforce_eager=True,
         tensor_parallel_size=4,
     )
 
+    image_placeholder = "<|begin_of_image|><|image|><|end_of_image|>"
+    video_placeholder = "<|begin_of_video|><|video|><|end_of_video|>"
+
     if modality == "image":
-        placeholder = "<|begin_of_image|><|image|><|end_of_image|>"
+        placeholder = image_placeholder
     elif modality == "video":
-        placeholder = "<|begin_of_video|><|video|><|end_of_video|>"
+        placeholder = video_placeholder
+    elif modality == "image+video":
+        placeholder = image_placeholder + video_placeholder
+
+    prompts = [
+        (
+            "[gMASK]<sop><|system|>\nYou are a helpful assistant.<|user|>\n"
+            f"{placeholder}"
+            f"{question}<|assistant|>assistant\n"
+        )
+        for question in questions
+    ]
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+    )
+
+
+# GLM-OCR
+def run_glm_ocr(questions: list[str], modality: str) -> ModelRequestData:
+    model_name = "zai-org/GLM-OCR"
+
+    mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
+    engine_args = EngineArgs(
+        model=model_name,
+        max_model_len=4096,
+        max_num_seqs=2,
+        mm_processor_kwargs={
+            "size": {"shortest_edge": 12544, "longest_edge": 47040000},
+            "fps": 1,
+        },
+        limit_mm_per_prompt=mm_limit,
+        enforce_eager=True,
+    )
+
+    image_placeholder = "<|begin_of_image|><|image|><|end_of_image|>"
+    video_placeholder = "<|begin_of_video|><|video|><|end_of_video|>"
+
+    if modality == "image":
+        placeholder = image_placeholder
+    elif modality == "video":
+        placeholder = video_placeholder
+    elif modality == "image+video":
+        placeholder = image_placeholder + video_placeholder
 
     prompts = [
         (
@@ -468,6 +776,31 @@ def run_h2ovl(questions: list[str], modality: str) -> ModelRequestData:
     )
 
 
+# HunyuanOCR
+def run_hunyuan_vl(questions: list[str], modality: str) -> ModelRequestData:
+    assert modality == "image"
+
+    model_name = "tencent/HunyuanOCR"
+
+    engine_args = EngineArgs(
+        model=model_name,
+        max_model_len=8192,
+        limit_mm_per_prompt={modality: 1},
+    )
+
+    placeholder = "<｜hy_place▁holder▁no▁100｜><｜hy_place▁holder▁no▁102｜><｜hy_place▁holder▁no▁101｜>"  # noqa: E501
+    prompts = [
+        f"<｜hy_begin▁of▁sentence｜>{placeholder}{question}<｜hy_User｜>"
+        for question in questions
+    ]
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+        stop_token_ids=None,
+    )
+
+
 # naver-hyperclovax/HyperCLOVAX-SEED-Vision-Instruct-3B
 def run_hyperclovax_seed_vision(
     questions: list[str], modality: str
@@ -475,11 +808,12 @@ def run_hyperclovax_seed_vision(
     model_name = "naver-hyperclovax/HyperCLOVAX-SEED-Vision-Instruct-3B"
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 
+    mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
     engine_args = EngineArgs(
         model=model_name,
         trust_remote_code=True,
-        max_model_len=8192 if modality == "image" else 16384,
-        limit_mm_per_prompt={modality: 1},
+        max_model_len=16384 if modality in ("video", "image+video") else 8192,
+        limit_mm_per_prompt=mm_limit,
     )
 
     messages = list()
@@ -520,6 +854,29 @@ def run_hyperclovax_seed_vision(
                     {
                         "role": "user",
                         "content": [
+                            {
+                                "type": "video",
+                            },
+                            {
+                                "type": "text",
+                                "text": question,
+                            },
+                        ],
+                    }
+                ]
+            )
+        elif modality == "image+video":
+            messages.append(
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "ocr": "",
+                                "lens_keywords": "",
+                                "lens_local_keywords": "",
+                            },
                             {
                                 "type": "video",
                             },
@@ -579,19 +936,65 @@ def run_idefics3(questions: list[str], modality: str) -> ModelRequestData:
 def run_interns1(questions: list[str], modality: str) -> ModelRequestData:
     model_name = "internlm/Intern-S1-mini"
 
+    mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
     engine_args = EngineArgs(
         model=model_name,
         trust_remote_code=True,
         max_model_len=8192,
         max_num_seqs=2,
-        limit_mm_per_prompt={modality: 1},
+        limit_mm_per_prompt=mm_limit,
         enforce_eager=True,
     )
 
+    image_placeholder = "<IMG_CONTEXT>"
+    video_placeholder = "<video>"
+
     if modality == "image":
-        placeholder = "<IMG_CONTEXT>"
+        placeholder = image_placeholder
     elif modality == "video":
-        placeholder = "<video>"
+        placeholder = video_placeholder
+    elif modality == "image+video":
+        placeholder = image_placeholder + "\n" + video_placeholder
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    messages = [
+        [{"role": "user", "content": f"{placeholder}\n{question}"}]
+        for question in questions
+    ]
+    prompts = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+    )
+
+
+# Intern-S1-Pro
+def run_interns1_pro(questions: list[str], modality: str) -> ModelRequestData:
+    model_name = "internlm/Intern-S1-Pro"
+
+    mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
+    engine_args = EngineArgs(
+        model=model_name,
+        trust_remote_code=True,
+        max_model_len=8192,
+        max_num_seqs=2,
+        limit_mm_per_prompt=mm_limit,
+        enforce_eager=True,
+        tensor_parallel_size=4,
+    )
+
+    image_placeholder = "<|vision_start|><|image_pad|><|vision_end|>"
+    video_placeholder = "<|vision_start|><|video_pad|><|vision_end|>"
+
+    if modality == "image":
+        placeholder = image_placeholder
+    elif modality == "video":
+        placeholder = video_placeholder
+    elif modality == "image+video":
+        placeholder = image_placeholder + video_placeholder
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     messages = [
@@ -612,17 +1015,23 @@ def run_interns1(questions: list[str], modality: str) -> ModelRequestData:
 def run_internvl(questions: list[str], modality: str) -> ModelRequestData:
     model_name = "OpenGVLab/InternVL3-2B"
 
+    mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
     engine_args = EngineArgs(
         model=model_name,
         trust_remote_code=True,
         max_model_len=8192,
-        limit_mm_per_prompt={modality: 1},
+        limit_mm_per_prompt=mm_limit,
     )
 
+    image_placeholder = "<image>"
+    video_placeholder = "<video>"
+
     if modality == "image":
-        placeholder = "<image>"
+        placeholder = image_placeholder
     elif modality == "video":
-        placeholder = "<video>"
+        placeholder = video_placeholder
+    elif modality == "image+video":
+        placeholder = image_placeholder + "\n" + video_placeholder
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     messages = [
@@ -648,9 +1057,11 @@ def run_internvl(questions: list[str], modality: str) -> ModelRequestData:
     )
 
 
-# Keye-VL
-def run_keye_vl(questions: list[str], modality: str) -> ModelRequestData:
-    model_name = "Kwai-Keye/Keye-VL-8B-Preview"
+# Kanana-V
+def run_kanana_v(questions: list[str], modality: str) -> ModelRequestData:
+    assert modality == "image"
+
+    model_name = "kakaocorp/kanana-1.5-v-3b-instruct"
 
     engine_args = EngineArgs(
         model=model_name,
@@ -659,14 +1070,45 @@ def run_keye_vl(questions: list[str], modality: str) -> ModelRequestData:
         limit_mm_per_prompt={modality: 1},
     )
 
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    messages = [
+        [{"role": "user", "content": f"<image>\n{question}"}] for question in questions
+    ]
+    prompts = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+    )
+
+
+# Keye-VL
+def run_keye_vl(questions: list[str], modality: str) -> ModelRequestData:
+    model_name = "Kwai-Keye/Keye-VL-8B-Preview"
+
+    mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
+    engine_args = EngineArgs(
+        model=model_name,
+        max_model_len=8192,
+        trust_remote_code=True,
+        limit_mm_per_prompt=mm_limit,
+    )
+
+    image_placeholder = "<|vision_start|><|image_pad|><|vision_end|>"
+    video_placeholder = "<|vision_start|><|video_pad|><|vision_end|>"
+
     if modality == "image":
-        placeholder = "<|image_pad|>"
+        placeholder = image_placeholder
     elif modality == "video":
-        placeholder = "<|video_pad|>"
+        placeholder = video_placeholder
+    elif modality == "image+video":
+        placeholder = image_placeholder + video_placeholder
 
     prompts = [
         (
-            f"<|im_start|>user\n<|vision_start|>{placeholder}<|vision_end|>"
+            f"<|im_start|>user\n{placeholder}"
             f"{question}<|im_end|>\n"
             "<|im_start|>assistant\n"
         )
@@ -683,21 +1125,27 @@ def run_keye_vl(questions: list[str], modality: str) -> ModelRequestData:
 def run_keye_vl1_5(questions: list[str], modality: str) -> ModelRequestData:
     model_name = "Kwai-Keye/Keye-VL-1.5-8B"
 
+    mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
     engine_args = EngineArgs(
         model=model_name,
         max_model_len=8192,
         trust_remote_code=True,
-        limit_mm_per_prompt={modality: 1},
+        limit_mm_per_prompt=mm_limit,
     )
 
+    image_placeholder = "<|vision_start|><|image_pad|><|vision_end|>"
+    video_placeholder = "<|vision_start|><|video_pad|><|vision_end|>"
+
     if modality == "image":
-        placeholder = "<|image_pad|>"
+        placeholder = image_placeholder
     elif modality == "video":
-        placeholder = "<|video_pad|>"
+        placeholder = video_placeholder
+    elif modality == "image+video":
+        placeholder = image_placeholder + video_placeholder
 
     prompts = [
         (
-            f"<|im_start|>user\n<|vision_start|>{placeholder}<|vision_end|>"
+            f"<|im_start|>user\n{placeholder}"
             f"{question}<|im_end|>\n"
             "<|im_start|>assistant\n"
         )
@@ -734,6 +1182,31 @@ def run_kimi_vl(questions: list[str], modality: str) -> ModelRequestData:
     )
 
 
+# Kimi-VL
+def run_kimi_k25(questions: list[str], modality: str) -> ModelRequestData:
+    assert modality == "vision_chunk"
+
+    prompts = [
+        "<|im_user|>user<|media_begin|>image<|media_content|>"
+        f"<|media_pad|><|media_end|>{question}<|im_end|>"
+        "<|im_assistant|>assistant<|im_middle|>"
+        for question in questions
+    ]
+
+    engine_args = EngineArgs(
+        model="moonshotai/Kimi-K2.5",
+        trust_remote_code=True,
+        max_model_len=4096,
+        limit_mm_per_prompt={modality: 1},
+        tensor_parallel_size=4,
+    )
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+    )
+
+
 # LightOnOCR
 def run_lightonocr(questions: list[str], modality: str) -> ModelRequestData:
     assert modality == "image"
@@ -746,6 +1219,37 @@ def run_lightonocr(questions: list[str], modality: str) -> ModelRequestData:
     engine_args = EngineArgs(
         model="lightonai/LightOnOCR-1B",
         limit_mm_per_prompt={modality: 1},
+    )
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+    )
+
+
+def run_lfm2_vl(questions: list[str], modality: str) -> ModelRequestData:
+    assert modality == "image"
+
+    model_name = "LiquidAI/LFM2-VL-450M"
+
+    engine_args = EngineArgs(
+        model=model_name,
+        max_model_len=4096,
+        limit_mm_per_prompt={modality: 1},
+    )
+
+    processor = AutoProcessor.from_pretrained(model_name)
+    messages = [
+        [
+            {
+                "role": "user",
+                "content": [{"type": "image"}, {"type": "text", "text": question}],
+            }
+        ]
+        for question in questions
+    ]
+    prompts = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
     )
 
     return ModelRequestData(
@@ -845,22 +1349,26 @@ def run_llava_next_video(questions: list[str], modality: str) -> ModelRequestDat
 
 # LLaVA-OneVision
 def run_llava_onevision(questions: list[str], modality: str) -> ModelRequestData:
-    if modality == "video":
-        prompts = [
-            f"<|im_start|>user <video>\n{question}<|im_end|><|im_start|>assistant\n"
-            for question in questions
-        ]
+    image_placeholder = "<image>"
+    video_placeholder = "<video>"
 
-    elif modality == "image":
-        prompts = [
-            f"<|im_start|>user <image>\n{question}<|im_end|><|im_start|>assistant\n"
-            for question in questions
-        ]
+    if modality == "image":
+        placeholder = image_placeholder
+    elif modality == "video":
+        placeholder = video_placeholder
+    elif modality == "image+video":
+        placeholder = image_placeholder + "\n" + video_placeholder
 
+    prompts = [
+        (f"<|im_start|>user {placeholder}\n{question}<|im_end|><|im_start|>assistant\n")
+        for question in questions
+    ]
+
+    mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
     engine_args = EngineArgs(
         model="llava-hf/llava-onevision-qwen2-7b-ov-hf",
         max_model_len=16384,
-        limit_mm_per_prompt={modality: 1},
+        limit_mm_per_prompt=mm_limit,
     )
 
     return ModelRequestData(
@@ -893,7 +1401,7 @@ def run_mantis(questions: list[str], modality: str) -> ModelRequestData:
 
 # MiniCPM-V
 def run_minicpmv_base(questions: list[str], modality: str, model_name):
-    assert modality in ["image", "video"]
+    assert modality in ["image", "video", "image+video"]
     # If you want to use `MiniCPM-o-2_6` with audio inputs, check `audio_language.py` # noqa
 
     # 2.0
@@ -915,12 +1423,13 @@ def run_minicpmv_base(questions: list[str], modality: str, model_name):
     # o2.6: image, video, audio
     # model_name = "openbmb/MiniCPM-o-2_6"
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
     engine_args = EngineArgs(
         model=model_name,
         max_model_len=4096,
         max_num_seqs=2,
         trust_remote_code=True,
-        limit_mm_per_prompt={modality: 1},
+        limit_mm_per_prompt=mm_limit,
     )
     # NOTE The stop_token_ids are different for various versions of MiniCPM-V
     # 2.0
@@ -933,17 +1442,22 @@ def run_minicpmv_base(questions: list[str], modality: str, model_name):
     stop_tokens = ["<|im_end|>", "<|endoftext|>"]
     stop_token_ids = [tokenizer.convert_tokens_to_ids(i) for i in stop_tokens]
 
-    modality_placeholder = {
-        "image": "(<image>./</image>)",
-        "video": "(<video>./</video>)",
-    }
+    image_placeholder = "(<image>./</image>)"
+    video_placeholder = "(<video>./</video>)"
+
+    if modality == "image":
+        placeholder = image_placeholder
+    elif modality == "video":
+        placeholder = video_placeholder
+    elif modality == "image+video":
+        placeholder = image_placeholder + "\n" + video_placeholder
 
     prompts = [
         tokenizer.apply_chat_template(
             [
                 {
                     "role": "user",
-                    "content": f"{modality_placeholder[modality]}\n{question}",
+                    "content": f"{placeholder}\n{question}",
                 }
             ],
             tokenize=False,
@@ -1048,6 +1562,40 @@ def run_molmo(questions: list[str], modality: str) -> ModelRequestData:
     )
 
 
+# Molmo2
+def run_molmo2(questions: list[str], modality: str) -> ModelRequestData:
+    model_name = "allenai/Molmo2-8B"
+
+    mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
+    engine_args = EngineArgs(
+        model=model_name,
+        trust_remote_code=True,
+        dtype="bfloat16",
+        limit_mm_per_prompt=mm_limit,
+        max_num_batched_tokens=36864,
+    )
+
+    image_placeholder = "<|image|>"
+    video_placeholder = "<|video|>"
+
+    if modality == "image":
+        placeholder = image_placeholder
+    elif modality == "video":
+        placeholder = video_placeholder
+    elif modality == "image+video":
+        placeholder = image_placeholder + video_placeholder
+
+    prompts = [
+        f"{placeholder}<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
+        for question in questions
+    ]
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+    )
+
+
 # Nemontron_VL
 def run_nemotron_vl(questions: list[str], modality: str) -> ModelRequestData:
     model_name = "nvidia/Llama-3.1-Nemotron-Nano-VL-8B-V1"
@@ -1115,6 +1663,43 @@ def run_nvlm_d(questions: list[str], modality: str) -> ModelRequestData:
     )
 
 
+# OpenPangu
+def run_openpangu_vl(questions: list[str], modality: str) -> ModelRequestData:
+    model_name = "FreedomIntelligence/openPangu-VL-7B"
+
+    mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
+    engine_args = EngineArgs(
+        model=model_name,
+        max_model_len=4096,
+        max_num_seqs=4,
+        trust_remote_code=True,
+        enforce_eager=True,
+        limit_mm_per_prompt=mm_limit,
+    )
+
+    image_placeholder = "[unused19]"
+    video_placeholder = "[unused32]"
+
+    if modality == "image":
+        placeholder = image_placeholder
+    elif modality == "video":
+        placeholder = video_placeholder
+    elif modality == "image+video":
+        placeholder = image_placeholder + video_placeholder
+
+    prompts = [
+        (
+            f"<s>[unused9]系统：[unused10][unused9]用户：[unused18]{placeholder}[unused20]{question}[unused10][unused9]助手："
+        )
+        for question in questions
+    ]
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+    )
+
+
 # Ovis
 def run_ovis(questions: list[str], modality: str) -> ModelRequestData:
     assert modality == "image"
@@ -1148,21 +1733,54 @@ def run_ovis(questions: list[str], modality: str) -> ModelRequestData:
 def run_ovis2_5(questions: list[str], modality: str) -> ModelRequestData:
     model_name = "AIDC-AI/Ovis2.5-2B"
 
+    mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
     engine_args = EngineArgs(
         model=model_name,
         max_model_len=4096,
         max_num_seqs=2,
         trust_remote_code=True,
         dtype="half",
-        limit_mm_per_prompt={modality: 1},
+        limit_mm_per_prompt=mm_limit,
     )
+
+    image_placeholder = "<image>"
+    video_placeholder = "<video>"
+
     if modality == "image":
-        placeholder = "<image>"
+        placeholder = image_placeholder
     elif modality == "video":
-        placeholder = "<video>"
+        placeholder = video_placeholder
+    elif modality == "image+video":
+        placeholder = image_placeholder + "\n" + video_placeholder
 
     prompts = [
         f"<|im_start|>user\n\n{placeholder}\n{question}<|im_end|>\n<|im_start|>assistant\n"
+        for question in questions
+    ]
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+    )
+
+
+# PaddleOCR-VL
+def run_paddleocr_vl(questions: list[str], modality: str) -> ModelRequestData:
+    assert modality == "image"
+
+    model_name = "PaddlePaddle/PaddleOCR-VL"
+
+    engine_args = EngineArgs(
+        model=model_name,
+        max_model_len=4096,
+        max_num_seqs=2,
+        limit_mm_per_prompt={modality: 1},
+        trust_remote_code=True,
+    )
+
+    placeholder = "<|IMAGE_START|><|IMAGE_PLACEHOLDER|><|IMAGE_END|>"
+    prompts = [
+        (f"<|begin_of_sentence|>User: {question}{placeholder}\nAssistant: ")
         for question in questions
     ]
 
@@ -1277,38 +1895,24 @@ def run_phi4mm(questions: list[str], modality: str) -> ModelRequestData:
     )
 
 
-# HF format Phi-4-multimodal-instruct
-def run_phi4_multimodal(questions: list[str], modality: str) -> ModelRequestData:
-    """
-    Phi-4-multimodal-instruct supports both image and audio inputs. Here, we
-    show how to process image inputs.
-    """
+# Phi-4-reasoning-vision
+def run_phi4siglip(questions: list[str], modality: str) -> ModelRequestData:
     assert modality == "image"
-    model_path = snapshot_download(
-        "microsoft/Phi-4-multimodal-instruct", revision="refs/pr/70"
-    )
-    # Since the vision-lora and speech-lora co-exist with the base model,
-    # we have to manually specify the path of the lora weights.
-    vision_lora_path = os.path.join(model_path, "vision-lora")
+    model_name = "microsoft/Phi-4-reasoning-vision-15B"
     prompts = [
-        f"<|user|><|image|>{question}<|end|><|assistant|>" for question in questions
+        f"<|user|>\n<image>\n{question}<|end|>\n<|assistant|>\n"
+        for question in questions
     ]
     engine_args = EngineArgs(
-        model=model_path,
-        max_model_len=5120,
+        model=model_name,
+        trust_remote_code=True,
+        max_model_len=8192,
         max_num_seqs=2,
-        max_num_batched_tokens=12800,
-        enable_lora=True,
-        max_lora_rank=320,
-        # Note - mm_processor_kwargs can also be passed to generate/chat calls
-        mm_processor_kwargs={"dynamic_hd": 16},
-        limit_mm_per_prompt={"image": 1},
+        limit_mm_per_prompt={modality: 1},
     )
-
     return ModelRequestData(
         engine_args=engine_args,
         prompts=prompts,
-        lora_requests=[LoRARequest("vision", 1, vision_lora_path)],
     )
 
 
@@ -1359,6 +1963,7 @@ def run_qwen_vl(questions: list[str], modality: str) -> ModelRequestData:
 def run_qwen2_vl(questions: list[str], modality: str) -> ModelRequestData:
     model_name = "Qwen/Qwen2-VL-7B-Instruct"
 
+    mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
     engine_args = EngineArgs(
         model=model_name,
         max_model_len=4096,
@@ -1368,18 +1973,23 @@ def run_qwen2_vl(questions: list[str], modality: str) -> ModelRequestData:
             "min_pixels": 28 * 28,
             "max_pixels": 1280 * 28 * 28,
         },
-        limit_mm_per_prompt={modality: 1},
+        limit_mm_per_prompt=mm_limit,
     )
 
+    image_placeholder = "<|vision_start|><|image_pad|><|vision_end|>"
+    video_placeholder = "<|vision_start|><|video_pad|><|vision_end|>"
+
     if modality == "image":
-        placeholder = "<|image_pad|>"
+        placeholder = image_placeholder
     elif modality == "video":
-        placeholder = "<|video_pad|>"
+        placeholder = video_placeholder
+    elif modality == "image+video":
+        placeholder = image_placeholder + video_placeholder
 
     prompts = [
         (
             "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-            f"<|im_start|>user\n<|vision_start|>{placeholder}<|vision_end|>"
+            f"<|im_start|>user\n{placeholder}"
             f"{question}<|im_end|>\n"
             "<|im_start|>assistant\n"
         )
@@ -1396,6 +2006,7 @@ def run_qwen2_vl(questions: list[str], modality: str) -> ModelRequestData:
 def run_qwen2_5_vl(questions: list[str], modality: str) -> ModelRequestData:
     model_name = "Qwen/Qwen2.5-VL-3B-Instruct"
 
+    mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
     engine_args = EngineArgs(
         model=model_name,
         max_model_len=4096,
@@ -1405,18 +2016,23 @@ def run_qwen2_5_vl(questions: list[str], modality: str) -> ModelRequestData:
             "max_pixels": 1280 * 28 * 28,
             "fps": 1,
         },
-        limit_mm_per_prompt={modality: 1},
+        limit_mm_per_prompt=mm_limit,
     )
 
+    image_placeholder = "<|vision_start|><|image_pad|><|vision_end|>"
+    video_placeholder = "<|vision_start|><|video_pad|><|vision_end|>"
+
     if modality == "image":
-        placeholder = "<|image_pad|>"
+        placeholder = image_placeholder
     elif modality == "video":
-        placeholder = "<|video_pad|>"
+        placeholder = video_placeholder
+    elif modality == "image+video":
+        placeholder = image_placeholder + video_placeholder
 
     prompts = [
         (
             "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-            f"<|im_start|>user\n<|vision_start|>{placeholder}<|vision_end|>"
+            f"<|im_start|>user\n{placeholder}"
             f"{question}<|im_end|>\n"
             "<|im_start|>assistant\n"
         )
@@ -1433,6 +2049,7 @@ def run_qwen2_5_vl(questions: list[str], modality: str) -> ModelRequestData:
 def run_qwen2_5_omni(questions: list[str], modality: str):
     model_name = "Qwen/Qwen2.5-Omni-7B"
 
+    mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
     engine_args = EngineArgs(
         model=model_name,
         max_model_len=4096,
@@ -1440,15 +2057,20 @@ def run_qwen2_5_omni(questions: list[str], modality: str):
         mm_processor_kwargs={
             "min_pixels": 28 * 28,
             "max_pixels": 1280 * 28 * 28,
-            "fps": [1],
+            "fps": 1,
         },
-        limit_mm_per_prompt={modality: 1},
+        limit_mm_per_prompt=mm_limit,
     )
 
+    image_placeholder = "<|vision_bos|><|IMAGE|><|vision_eos|>"
+    video_placeholder = "<|vision_bos|><|VIDEO|><|vision_eos|>"
+
     if modality == "image":
-        placeholder = "<|IMAGE|>"
+        placeholder = image_placeholder
     elif modality == "video":
-        placeholder = "<|VIDEO|>"
+        placeholder = video_placeholder
+    elif modality == "image+video":
+        placeholder = image_placeholder + video_placeholder
 
     default_system = (
         "You are Qwen, a virtual human developed by the Qwen Team, Alibaba "
@@ -1459,7 +2081,7 @@ def run_qwen2_5_omni(questions: list[str], modality: str):
     prompts = [
         (
             f"<|im_start|>system\n{default_system}<|im_end|>\n"
-            f"<|im_start|>user\n<|vision_bos|>{placeholder}<|vision_eos|>"
+            f"<|im_start|>user\n{placeholder}"
             f"{question}<|im_end|>\n"
             "<|im_start|>assistant\n"
         )
@@ -1475,6 +2097,7 @@ def run_qwen2_5_omni(questions: list[str], modality: str):
 def run_qwen3_vl(questions: list[str], modality: str) -> ModelRequestData:
     model_name = "Qwen/Qwen3-VL-4B-Instruct"
 
+    mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
     engine_args = EngineArgs(
         model=model_name,
         max_model_len=4096,
@@ -1484,18 +2107,23 @@ def run_qwen3_vl(questions: list[str], modality: str) -> ModelRequestData:
             "max_pixels": 1280 * 28 * 28,
             "fps": 1,
         },
-        limit_mm_per_prompt={modality: 1},
+        limit_mm_per_prompt=mm_limit,
     )
 
+    image_placeholder = "<|vision_start|><|image_pad|><|vision_end|>"
+    video_placeholder = "<|vision_start|><|video_pad|><|vision_end|>"
+
     if modality == "image":
-        placeholder = "<|image_pad|>"
+        placeholder = image_placeholder
     elif modality == "video":
-        placeholder = "<|video_pad|>"
+        placeholder = video_placeholder
+    elif modality == "image+video":
+        placeholder = image_placeholder + video_placeholder
 
     prompts = [
         (
             "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-            f"<|im_start|>user\n<|vision_start|>{placeholder}<|vision_end|>"
+            f"<|im_start|>user\n{placeholder}"
             f"{question}<|im_end|>\n"
             "<|im_start|>assistant\n"
         )
@@ -1512,6 +2140,7 @@ def run_qwen3_vl(questions: list[str], modality: str) -> ModelRequestData:
 def run_qwen3_vl_moe(questions: list[str], modality: str) -> ModelRequestData:
     model_name = "Qwen/Qwen3-VL-30B-A3B-Instruct"
 
+    mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
     engine_args = EngineArgs(
         model=model_name,
         max_model_len=4096,
@@ -1521,18 +2150,23 @@ def run_qwen3_vl_moe(questions: list[str], modality: str) -> ModelRequestData:
             "max_pixels": 1280 * 28 * 28,
             "fps": 1,
         },
-        limit_mm_per_prompt={modality: 1},
+        limit_mm_per_prompt=mm_limit,
     )
 
+    image_placeholder = "<|vision_start|><|image_pad|><|vision_end|>"
+    video_placeholder = "<|vision_start|><|video_pad|><|vision_end|>"
+
     if modality == "image":
-        placeholder = "<|image_pad|>"
+        placeholder = image_placeholder
     elif modality == "video":
-        placeholder = "<|video_pad|>"
+        placeholder = video_placeholder
+    elif modality == "image+video":
+        placeholder = image_placeholder + video_placeholder
 
     prompts = [
         (
             "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-            f"<|im_start|>user\n<|vision_start|>{placeholder}<|vision_end|>"
+            f"<|im_start|>user\n{placeholder}"
             f"{question}<|im_end|>\n"
             "<|im_start|>assistant\n"
         )
@@ -1655,6 +2289,32 @@ def run_step3(questions: list[str], modality: str) -> ModelRequestData:
     )
 
 
+# StepVL10B
+def run_step_vl(questions: list[str], modality: str) -> ModelRequestData:
+    assert modality == "image"
+
+    model_name = "stepfun-ai/Step3-VL-10B"
+    engine_args = EngineArgs(
+        model=model_name,
+        max_num_batched_tokens=4096,
+        tensor_parallel_size=1,
+        trust_remote_code=True,
+        limit_mm_per_prompt={modality: 1},
+        reasoning_parser="deepseek_r1",
+    )
+
+    prompts = [
+        "<｜begin▁of▁sentence｜> You are a helpful assistant.<|BOT|>user\n "
+        f"<im_patch>{question} <|EOT|><|BOT|>assistant\n<think>\n"
+        for question in questions
+    ]
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+    )
+
+
 # omni-research/Tarsier-7b
 def run_tarsier(questions: list[str], modality: str) -> ModelRequestData:
     assert modality == "image"
@@ -1677,22 +2337,31 @@ def run_tarsier(questions: list[str], modality: str) -> ModelRequestData:
 def run_tarsier2(questions: list[str], modality: str) -> ModelRequestData:
     model_name = "omni-research/Tarsier2-Recap-7b"
 
+    mm_limit = {"image": 1, "video": 1} if modality == "image+video" else {modality: 1}
     engine_args = EngineArgs(
         model=model_name,
         max_model_len=4096,
-        hf_overrides={"architectures": ["Tarsier2ForConditionalGeneration"]},
-        limit_mm_per_prompt={modality: 1},
+        hf_overrides={
+            "architectures": ["Tarsier2ForConditionalGeneration"],
+            "model_type": "tarsier2",
+        },
+        limit_mm_per_prompt=mm_limit,
     )
 
+    image_placeholder = "<|vision_start|><|image_pad|><|vision_end|>"
+    video_placeholder = "<|vision_start|><|video_pad|><|vision_end|>"
+
     if modality == "image":
-        placeholder = "<|image_pad|>"
+        placeholder = image_placeholder
     elif modality == "video":
-        placeholder = "<|video_pad|>"
+        placeholder = video_placeholder
+    elif modality == "image+video":
+        placeholder = image_placeholder + video_placeholder
 
     prompts = [
         (
             "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-            f"<|im_start|>user\n<|vision_start|>{placeholder}<|vision_end|>"
+            f"<|im_start|>user\n{placeholder}"
             f"{question}<|im_end|>\n"
             "<|im_start|>assistant\n"
         )
@@ -1708,12 +2377,19 @@ def run_tarsier2(questions: list[str], modality: str) -> ModelRequestData:
 model_example_map = {
     "aria": run_aria,
     "aya_vision": run_aya_vision,
+    "bagel": run_bagel,
+    "cheers": run_cheers,
+    "bee": run_bee,
     "blip-2": run_blip2,
     "chameleon": run_chameleon,
-    "dots_ocr": run_dots_ocr,
     "command_a_vision": run_command_a_vision,
     "deepseek_vl_v2": run_deepseek_vl2,
+    "deepseek_ocr": run_deepseek_ocr,
+    "deepseek_ocr2": run_deepseek_ocr2,
+    "dots_ocr": run_dots_ocr,
+    "eagle2_5": run_eagle2_5,
     "ernie45_vl": run_ernie45_vl,
+    "exaone4_5": run_exaone4_5,
     "fuyu": run_fuyu,
     "gemma3": run_gemma3,
     "gemma3n": run_gemma3n,
@@ -1721,15 +2397,21 @@ model_example_map = {
     "glm4_1v": run_glm4_1v,
     "glm4_5v": run_glm4_5v,
     "glm4_5v_fp8": run_glm4_5v_fp8,
+    "glm_ocr": run_glm_ocr,
     "h2ovl_chat": run_h2ovl,
+    "hunyuan_vl": run_hunyuan_vl,
     "hyperclovax_seed_vision": run_hyperclovax_seed_vision,
     "idefics3": run_idefics3,
     "interns1": run_interns1,
+    "interns1_pro": run_interns1_pro,
     "internvl_chat": run_internvl,
+    "kanana_v": run_kanana_v,
     "keye_vl": run_keye_vl,
     "keye_vl1_5": run_keye_vl1_5,
     "kimi_vl": run_kimi_vl,
+    "kimi_k25": run_kimi_k25,
     "lightonocr": run_lightonocr,
+    "lfm2_vl": run_lfm2_vl,
     "llama4": run_llama4,
     "llava": run_llava,
     "llava-next": run_llava_next,
@@ -1741,15 +2423,18 @@ model_example_map = {
     "minimax_vl_01": run_minimax_vl_01,
     "mistral3": run_mistral3,
     "molmo": run_molmo,
+    "molmo2": run_molmo2,
     "nemotron_vl": run_nemotron_vl,
     "NVLM_D": run_nvlm_d,
+    "openpangu_vl": run_openpangu_vl,
     "ovis": run_ovis,
     "ovis2_5": run_ovis2_5,
+    "paddleocr_vl": run_paddleocr_vl,
     "paligemma": run_paligemma,
     "paligemma2": run_paligemma2,
     "phi3_v": run_phi3v,
     "phi4_mm": run_phi4mm,
-    "phi4_multimodal": run_phi4_multimodal,
+    "phi4_siglip": run_phi4siglip,
     "pixtral_hf": run_pixtral_hf,
     "qwen_vl": run_qwen_vl,
     "qwen2_vl": run_qwen2_vl,
@@ -1761,6 +2446,7 @@ model_example_map = {
     "skywork_chat": run_skyworkr1v,
     "smolvlm": run_smolvlm,
     "step3": run_step3,
+    "stepvl": run_step_vl,
     "tarsier": run_tarsier,
     "tarsier2": run_tarsier2,
 }
@@ -1768,8 +2454,16 @@ model_example_map = {
 
 MODELS_NEED_VIDEO_METADATA = [
     "glm4_1v",
+    "glm_ocr",
     "glm4_5v",
     "glm4_5v_fp8",
+    "molmo2",
+    "qwen3_vl",
+    "qwen3_vl_moe",
+]
+
+
+MODELS_SUPPORT_VIT_CUDA_GRAPH = [
     "qwen3_vl",
     "qwen3_vl_moe",
 ]
@@ -1807,6 +2501,37 @@ def get_multi_modal_input(args):
         return {
             "data": ([(video, metadata)] if needs_metadata else video),
             "questions": vid_questions,
+        }
+
+    if args.modality == "vision_chunk":
+        # Input vision chunks and question
+        image = convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB")
+        vision_chunk_questions = [
+            "What is the content of this image chunk?",
+            "Describe the content of this image chunk in detail.",
+        ]
+
+        return {
+            "data": {"type": "image", "image": image},
+            "questions": vision_chunk_questions,
+        }
+
+    if args.modality == "image+video":
+        image = convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB")
+        needs_metadata = args.model_type in MODELS_NEED_VIDEO_METADATA
+        video = VideoAsset(name="baby_reading", num_frames=args.num_frames).np_ndarrays
+        metadata = VideoAsset(name="baby_reading", num_frames=args.num_frames).metadata
+        img_video_questions = [
+            "What is shown in the image? What happens in the video?",
+            "Describe both the image and the video content.",
+        ]
+
+        return {
+            "data": {
+                "image": image,
+                "video": ([(video, metadata)] if needs_metadata else video),
+            },
+            "questions": img_video_questions,
         }
 
     msg = f"Modality {args.modality} is not supported."
@@ -1856,6 +2581,29 @@ def apply_image_repeat(
     return inputs, inputs_with_empty_media
 
 
+def maybe_add_vit_cuda_graph_compilation_config(args, engine_args):
+    model = args.model_type
+    modality = args.modality
+    enable_vit_cuda_graph = args.enable_vit_cuda_graph
+
+    if enable_vit_cuda_graph and model in MODELS_SUPPORT_VIT_CUDA_GRAPH:
+        if modality == "image" or modality == "video":
+            vision_items_per_batch = 1
+        elif modality == "image+video":
+            vision_items_per_batch = 2
+        else:
+            raise ValueError(
+                f"modality={modality} is not supported for vit cuda graph."
+            )
+
+        engine_args.compilation_config = {
+            "cudagraph_mm_encoder": True,
+            "encoder_cudagraph_max_vision_items_per_batch": vision_items_per_batch,
+        }
+
+    return engine_args
+
+
 @contextmanager
 def time_counter(enable: bool):
     if enable:
@@ -1891,7 +2639,7 @@ def parse_args():
         "--modality",
         type=str,
         default="image",
-        choices=["image", "video"],
+        choices=["image", "video", "image+video", "vision_chunk"],
         help="Modality of the input.",
     )
     parser.add_argument(
@@ -1903,41 +2651,48 @@ def parse_args():
     parser.add_argument(
         "--seed",
         type=int,
-        default=None,
+        default=0,
         help="Set the seed when initializing `vllm.LLM`.",
     )
-
     parser.add_argument(
         "--image-repeat-prob",
         type=float,
         default=None,
         help="Simulates the hit-ratio for multi-modal preprocessor cache (if enabled)",
     )
-
     parser.add_argument(
         "--disable-mm-processor-cache",
         action="store_true",
         help="If True, disables caching of multi-modal processor.",
     )
-
     parser.add_argument(
         "--time-generate",
         action="store_true",
         help="If True, then print the total generate() call time",
     )
-
     parser.add_argument(
         "--use-different-prompt-per-request",
         action="store_true",
         help="If True, then use different prompt (with the same multi-modal "
         "data) for each request.",
     )
-
     parser.add_argument(
         "--verify-mm-cache-hit-with-uuids",
         action="store_true",
         help="If True, will send all requests in a second batch with empty mm "
         "data to verify cache hits with UUIDs.",
+    )
+    parser.add_argument(
+        "--tensor-parallel-size",
+        "-tp",
+        type=int,
+        default=None,
+        help="Tensor parallel size to override the model's default setting. ",
+    )
+    parser.add_argument(
+        "--enable-vit-cuda-graph",
+        action="store_true",
+        help="If True, will enable vit cuda graph capture and replay for the model.",
     )
     return parser.parse_args()
 
@@ -1947,6 +2702,12 @@ def main(args):
     if model not in model_example_map:
         raise ValueError(f"Model type {model} is not supported.")
 
+    if args.tensor_parallel_size is not None and args.tensor_parallel_size < 1:
+        raise ValueError(
+            f"tensor_parallel_size must be a positive integer, "
+            f"got {args.tensor_parallel_size}"
+        )
+
     modality = args.modality
     mm_input = get_multi_modal_input(args)
     data = mm_input["data"]
@@ -1955,16 +2716,19 @@ def main(args):
     req_data = model_example_map[model](questions, modality)
 
     # Disable other modalities to save memory
-    default_limits = {"image": 0, "video": 0, "audio": 0}
+    default_limits = {"image": 0, "video": 0, "audio": 0, "vision_chunk": 0}
     req_data.engine_args.limit_mm_per_prompt = default_limits | dict(
         req_data.engine_args.limit_mm_per_prompt or {}
     )
 
-    engine_args = asdict(req_data.engine_args) | {
-        "seed": args.seed,
-        "mm_processor_cache_gb": 0 if args.disable_mm_processor_cache else 4,
-    }
-    llm = LLM(**engine_args)
+    engine_args = req_data.engine_args
+    engine_args.seed = args.seed
+    mm_processor_cache_gb = 0 if args.disable_mm_processor_cache else 4
+    engine_args.mm_processor_cache_gb = mm_processor_cache_gb
+    if args.tensor_parallel_size is not None:
+        engine_args.tensor_parallel_size = args.tensor_parallel_size
+    engine_args = maybe_add_vit_cuda_graph_compilation_config(args, engine_args)
+    llm = LLM.from_engine_args(engine_args)
 
     # Don't want to check the flag multiple times, so just hijack `prompts`.
     prompts = (
@@ -1975,9 +2739,28 @@ def main(args):
 
     # We set temperature to 0.2 so that outputs can be different
     # even when all prompts are identical when running batch inference.
-    sampling_params = SamplingParams(
-        temperature=0.2, max_tokens=64, stop_token_ids=req_data.stop_token_ids
+    sampling_params = (
+        SamplingParams(
+            temperature=0.2, max_tokens=64, stop_token_ids=req_data.stop_token_ids
+        )
+        if req_data.sampling_params is None
+        else req_data.sampling_params
     )
+
+    def _mm_data(data, modality):
+        if modality == "image+video":
+            return {"image": data["image"], "video": data["video"]}
+        return {modality: data}
+
+    def _mm_uuid(uuid, modality):
+        if modality == "image+video":
+            return {"image": uuid, "video": uuid + "v"}
+        return {modality: uuid}
+
+    def _mm_empty(modality):
+        if modality == "image+video":
+            return {"image": None, "video": None}
+        return {modality: None}
 
     assert args.num_prompts > 0
     if args.num_prompts == 1:
@@ -1985,17 +2768,21 @@ def main(args):
         uuid = "uuid_0"
         inputs = {
             "prompt": prompts[0],
-            "multi_modal_data": {modality: data},
-            "multi_modal_uuids": {modality: uuid},
+            "multi_modal_data": _mm_data(data, modality),
+            "multi_modal_uuids": _mm_uuid(uuid, modality),
         }
         inputs_with_empty_media = {
             "prompt": prompts[0],
-            "multi_modal_data": {modality: None},
-            "multi_modal_uuids": {modality: uuid},
+            "multi_modal_data": _mm_empty(modality),
+            "multi_modal_uuids": _mm_uuid(uuid, modality),
         }
     else:
         # Batch inference
         if args.image_repeat_prob is not None:
+            if modality == "image+video":
+                raise ValueError(
+                    "--image-repeat-prob is not supported for 'image+video' modality"
+                )
             # Repeat images with specified probability of "image_repeat_prob"
             inputs, inputs_with_empty_media = apply_image_repeat(
                 args.image_repeat_prob,
@@ -2005,7 +2792,7 @@ def main(args):
                 modality,
             )
         else:
-            # Use the same image for all prompts
+            # Use the same image/video for all prompts
             inputs = []
             inputs_with_empty_media = []
             for i in range(args.num_prompts):
@@ -2013,15 +2800,15 @@ def main(args):
                 inputs.append(
                     {
                         "prompt": prompts[i % len(prompts)],
-                        "multi_modal_data": {modality: data},
-                        "multi_modal_uuids": {modality: uuid},
+                        "multi_modal_data": _mm_data(data, modality),
+                        "multi_modal_uuids": _mm_uuid(uuid, modality),
                     }
                 )
                 inputs_with_empty_media.append(
                     {
                         "prompt": prompts[i % len(prompts)],
-                        "multi_modal_data": {modality: None},
-                        "multi_modal_uuids": {modality: uuid},
+                        "multi_modal_data": _mm_empty(modality),
+                        "multi_modal_uuids": _mm_uuid(uuid, modality),
                     }
                 )
 

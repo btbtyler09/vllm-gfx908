@@ -15,7 +15,7 @@ llm = LLM(model="ibm-granite/granite-3.1-8b-instruct", tensor_parallel_size=2)
 ```
 
 !!! warning
-    To ensure that vLLM initializes CUDA correctly, you should avoid calling related functions (e.g. [torch.cuda.set_device][])
+    To ensure that vLLM initializes CUDA correctly, you should avoid calling related functions (e.g. [torch.accelerator.set_device_index][])
     before initializing vLLM. Otherwise, you may run into an error like `RuntimeError: Cannot re-initialize CUDA in forked subprocess`.
 
     To control which devices are used, please instead set the `CUDA_VISIBLE_DEVICES` environment variable.
@@ -48,9 +48,6 @@ llm = LLM(model="adept/fuyu-8b", max_model_len=2048, max_num_seqs=2)
 ## Reduce CUDA Graphs
 
 By default, we optimize model inference using CUDA graphs which take up extra memory in the GPU.
-
-!!! warning
-    CUDA graph capture takes up more memory in V1 than in V0.
 
 You can adjust `compilation_config` to achieve a better balance between inference speed and memory usage:
 

@@ -3,7 +3,7 @@
 
 # Supports FP-Quant compression, see https://arxiv.org/abs/2509.23202
 
-from typing import Any
+from typing import Any, Literal, cast
 
 import torch
 from torch.nn.parameter import Parameter
@@ -24,7 +24,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.layers.quantization.qutlass_utils import to_blocked
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
-from vllm.utils import direct_register_custom_op
+from vllm.utils.torch_utils import direct_register_custom_op
 
 
 class FPQuantConfig(QuantizationConfig):
@@ -248,14 +248,14 @@ class FPQuantLinearMethod(LinearMethodBase):
         )
 
 
-def ceil_div(a, b):
-    return (a + b - 1) // b
-
-
 def fused_quantize_mx(
     x_flat: torch.Tensor, hadamard_matrix: torch.Tensor, forward_method: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return fusedQuantizeMx(x_flat, hadamard_matrix, method=forward_method)
+    return fusedQuantizeMx(
+        x_flat,
+        hadamard_matrix,
+        method=cast(Literal["quest", "abs_max"], forward_method),
+    )
 
 
 def fused_quantize_mx_fake(x_flat, hadamard_matrix, forward_method):

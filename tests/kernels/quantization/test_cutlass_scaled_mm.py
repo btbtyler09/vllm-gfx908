@@ -13,7 +13,10 @@ import torch
 from tests.kernels.utils import baseline_scaled_mm, opcheck, to_fp8, to_int8
 from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
-from vllm.utils import cdiv
+from vllm.utils.math_utils import cdiv
+
+if not current_platform.is_cuda():
+    pytest.skip("These tests use CUTLASS which requires CUDA", allow_module_level=True)
 
 MNK_FACTORS = [
     (1, 256, 128),
@@ -37,7 +40,9 @@ MNK_FACTORS = [
     (512, 24576, 128),
 ]
 
-CUDA_DEVICES = [f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)]
+CUDA_DEVICES = [
+    f"cuda:{i}" for i in range(1 if torch.accelerator.device_count() == 1 else 2)
+]
 
 # -1 means full extent in that dimension
 TENSORWISE_GROUP_SHAPE = (-1, -1)

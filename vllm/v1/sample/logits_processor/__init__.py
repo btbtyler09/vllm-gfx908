@@ -5,7 +5,7 @@ import inspect
 import itertools
 from abc import abstractmethod
 from collections.abc import Sequence
-from functools import partial
+from functools import lru_cache, partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -13,10 +13,12 @@ import torch
 from vllm.logger import init_logger
 from vllm.logits_process import LogitsProcessor as RequestLogitsProcessor
 from vllm.sampling_params import SamplingParams
+from vllm.utils.torch_utils import guard_cuda_initialization
 from vllm.v1.sample.logits_processor.builtin import (
     LogitBiasLogitsProcessor,
     MinPLogitsProcessor,
     MinTokensLogitsProcessor,
+    ThinkingTokenBudgetLogitsProcessor,
     process_dict_updates,
 )
 from vllm.v1.sample.logits_processor.interface import (
@@ -40,7 +42,7 @@ STR_POOLING_REJECTS_LOGITSPROCS = (
 # Error message when the user tries to initialize vLLM with a speculative
 # decoding enabled and custom logitsproces
 STR_SPEC_DEC_REJECTS_LOGITSPROCS = (
-    "Custom logits processors are not supportedwhen speculative decoding is enabled."
+    "Custom logits processors are not supported when speculative decoding is enabled."
 )
 
 LOGITSPROCS_GROUP = "vllm.logits_processors"
@@ -49,6 +51,7 @@ BUILTIN_LOGITS_PROCESSORS: list[type[LogitsProcessor]] = [
     MinTokensLogitsProcessor,
     LogitBiasLogitsProcessor,
     MinPLogitsProcessor,
+    ThinkingTokenBudgetLogitsProcessor,
 ]
 
 
@@ -72,8 +75,10 @@ def _load_logitsprocs_plugins() -> list[type[LogitsProcessor]]:
                 entrypoint.name,
                 entrypoint.value,
             )
-            classes.append(entrypoint.load())
+            with guard_cuda_initialization():
+                classes.append(entrypoint.load())
         except Exception as e:
+            logger.error("Failed to load LogitsProcessor plugin %s: %s", entrypoint, e)
             raise RuntimeError(
                 f"Failed to load LogitsProcessor plugin {entrypoint}"
             ) from e
@@ -126,8 +131,15 @@ def _load_logitsprocs_by_fqcns(
 
         try:
             # Load module
-            module = importlib.import_module(module_path)
+            with guard_cuda_initialization():
+                module = importlib.import_module(module_path)
         except Exception as e:
+            logger.error(
+                "Failed to load %sth LogitsProcessor plugin %s: %s",
+                ldx,
+                logitproc,
+                e,
+            )
             raise RuntimeError(
                 f"Failed to load {ldx}th LogitsProcessor plugin {logitproc}"
             ) from e
@@ -192,10 +204,11 @@ def build_logitsprocs(
         if custom_logitsprocs:
             raise ValueError(STR_SPEC_DEC_REJECTS_LOGITSPROCS)
         logger.warning(
-            "min_p, logit_bias, and min_tokens parameters won't currently work "
-            "with speculative decoding enabled."
+            "min_p and logit_bias parameters won't work with speculative decoding."
         )
-        return LogitsProcessors()
+        return LogitsProcessors(
+            [MinTokensLogitsProcessor(vllm_config, device, is_pin_memory)]
+        )
 
     custom_logitsprocs_classes = _load_custom_logitsprocs(custom_logitsprocs)
     return LogitsProcessors(
@@ -204,6 +217,20 @@ def build_logitsprocs(
             BUILTIN_LOGITS_PROCESSORS, custom_logitsprocs_classes
         )
     )
+
+
+cached_load_custom_logitsprocs = lru_cache(_load_custom_logitsprocs)
+
+
+def validate_logits_processors_parameters(
+    logits_processors: Sequence[str | type[LogitsProcessor]] | None,
+    sampling_params: SamplingParams,
+):
+    logits_processors = (
+        tuple(logits_processors) if logits_processors is not None else None
+    )
+    for logits_procs in cached_load_custom_logitsprocs(logits_processors):
+        logits_procs.validate_params(sampling_params)
 
 
 class AdapterLogitsProcessor(LogitsProcessor):
@@ -284,11 +311,15 @@ class AdapterLogitsProcessor(LogitsProcessor):
 
         """
         if req_lp := self.new_req_logits_processor(params):
-            args = (
-                [prompt_ids, output_ids]
-                if (len(inspect.signature(req_lp).parameters) == 3)
-                else [output_ids]
-            )
+            if len(inspect.signature(req_lp).parameters) == 3:
+                if prompt_ids is None:
+                    raise ValueError(
+                        "Prompt token ids are required for this "
+                        "logits processor but were not provided."
+                    )
+                args = [prompt_ids, output_ids]
+            else:
+                args = [output_ids]
             return partial(req_lp, *args)
         return None
 
@@ -325,4 +356,5 @@ __all__ = [
     "STR_POOLING_REJECTS_LOGITSPROCS",
     "LOGITSPROCS_GROUP",
     "AdapterLogitsProcessor",
+    "ThinkingTokenBudgetLogitsProcessor",
 ]

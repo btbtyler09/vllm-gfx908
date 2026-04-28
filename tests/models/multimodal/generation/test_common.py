@@ -5,19 +5,21 @@ image, embedding, and video support for different VLMs in vLLM.
 """
 
 import math
-import os
 from collections import defaultdict
 from pathlib import PosixPath
 
 import pytest
+from packaging.version import Version
 from transformers import (
     AutoModel,
+    AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForTextToWaveform,
 )
+from transformers import __version__ as TRANSFORMERS_VERSION
 
 from vllm.platforms import current_platform
-from vllm.utils.functools import identity
+from vllm.utils.func_utils import identity
 
 from ....conftest import (
     IMAGE_ASSETS,
@@ -37,13 +39,6 @@ from .vlm_utils.types import (
     VLMTestInfo,
     VLMTestType,
 )
-
-# This hack is needed for phi3v & paligemma models
-# ROCm Triton FA can run into shared memory issues with these models,
-# use other backends in the meantime
-# FIXME (mattwong, gshtrasb, hongxiayan)
-if current_platform.is_rocm():
-    os.environ["VLLM_USE_TRITON_FLASH_ATTN"] = "0"
 
 COMMON_BROADCAST_SETTINGS = {
     "test_type": VLMTestType.IMAGE,
@@ -91,6 +86,29 @@ COMMON_BROADCAST_SETTINGS = {
 # which cases would be selected and deselected by pytest. In general,
 # this is a good idea for checking your command first, since tests are slow.
 
+
+def _granite4_vision_vllm_to_hf_output(vllm_output, model):
+    """Post-processor for granite4_vision vLLM output.
+
+    Self-contained to avoid calling AutoConfig/AutoTokenizer without
+    trust_remote_code (needed while the model is not in upstream HF).
+    """
+    output_ids, output_str, out_logprobs = vllm_output
+    mm_token_id = 100352
+    hf_output_ids = [
+        token_id
+        for idx, token_id in enumerate(output_ids)
+        if token_id != mm_token_id or idx == 0 or output_ids[idx - 1] != mm_token_id
+    ]
+    hf_output_str = (
+        output_str[1:] if output_str and output_str[0] == " " else output_str
+    )
+    eos_token_id = 100257
+    if hf_output_ids and hf_output_ids[-1] == eos_token_id:
+        hf_output_str = hf_output_str + "<|end_of_text|>"
+    return hf_output_ids, hf_output_str, out_logprobs
+
+
 VLM_TEST_SETTINGS = {
     #### Core tests to always run in the CI
     "llava": VLMTestInfo(
@@ -109,9 +127,23 @@ VLM_TEST_SETTINGS = {
                 limit_mm_per_prompt={"image": 4},
             )
         ],
-        # TODO: Revert to "auto" when CPU backend can use torch > 2.6
-        dtype="bfloat16" if current_platform.is_cpu() else "auto",
+        vllm_runner_kwargs={"enable_mm_embeds": True},
         marks=[pytest.mark.core_model, pytest.mark.cpu_model],
+    ),
+    "paligemma": VLMTestInfo(
+        models=["google/paligemma-3b-mix-224"],
+        test_type=VLMTestType.IMAGE,
+        prompt_formatter=identity,
+        img_idx_to_prompt=lambda idx: "",
+        # Paligemma uses its own sample prompts because the default one fails
+        single_image_prompts=IMAGE_ASSETS.prompts(
+            {
+                "stop_sign": "caption es",
+                "cherry_blossom": "What is in the picture?",
+            }
+        ),
+        auto_cls=AutoModelForImageTextToText,
+        vllm_output_post_proc=model_utils.paligemma_vllm_to_hf_output,
     ),
     "qwen2_5_vl": VLMTestInfo(
         models=["Qwen/Qwen2.5-VL-3B-Instruct"],
@@ -119,11 +151,12 @@ VLM_TEST_SETTINGS = {
         prompt_formatter=lambda img_prompt: f"<|im_start|>User\n{img_prompt}<|im_end|>\n<|im_start|>assistant\n",  # noqa: E501
         img_idx_to_prompt=lambda idx: "<|vision_start|><|image_pad|><|vision_end|>",
         video_idx_to_prompt=lambda idx: "<|vision_start|><|video_pad|><|vision_end|>",
+        enforce_eager=False,
         max_model_len=4096,
         max_num_seqs=2,
         auto_cls=AutoModelForImageTextToText,
         vllm_output_post_proc=model_utils.qwen2_vllm_to_hf_output,
-        image_size_factors=[(), (0.25,), (0.25, 0.25, 0.25), (0.25, 0.2, 0.15)],
+        image_size_factors=[(0.25,), (0.25, 0.25, 0.25), (0.25, 0.2, 0.15)],
         marks=[pytest.mark.core_model, pytest.mark.cpu_model],
     ),
     "qwen2_5_omni": VLMTestInfo(
@@ -138,8 +171,34 @@ VLM_TEST_SETTINGS = {
         auto_cls=AutoModelForTextToWaveform,
         vllm_output_post_proc=model_utils.qwen2_vllm_to_hf_output,
         patch_hf_runner=model_utils.qwen2_5_omni_patch_hf_runner,
-        image_size_factors=[(), (0.25,), (0.25, 0.25, 0.25), (0.25, 0.2, 0.15)],
+        image_size_factors=[(0.25,), (0.25, 0.25, 0.25), (0.25, 0.2, 0.15)],
         marks=[pytest.mark.core_model, pytest.mark.cpu_model],
+    ),
+    "qwen3_vl": VLMTestInfo(
+        models=["Qwen/Qwen3-VL-4B-Instruct"],
+        test_type=(
+            VLMTestType.IMAGE,
+            VLMTestType.MULTI_IMAGE,
+            VLMTestType.VIDEO,
+        ),
+        enforce_eager=False,
+        needs_video_metadata=True,
+        prompt_formatter=lambda img_prompt: f"<|im_start|>User\n{img_prompt}<|im_end|>\n<|im_start|>assistant\n",  # noqa: E501
+        img_idx_to_prompt=lambda idx: "<|vision_start|><|image_pad|><|vision_end|>",  # noqa: E501
+        video_idx_to_prompt=lambda idx: "<|vision_start|><|video_pad|><|vision_end|>",  # noqa: E501
+        max_model_len=4096,
+        max_num_seqs=2,
+        num_logprobs=20,
+        auto_cls=AutoModelForImageTextToText,
+        vllm_output_post_proc=model_utils.qwen2_vllm_to_hf_output,
+        patch_hf_runner=model_utils.qwen3_vl_patch_hf_runner,
+        image_size_factors=[(0.25,), (0.25, 0.25, 0.25), (0.25, 0.2, 0.15)],
+        marks=[
+            pytest.mark.core_model,
+        ],
+        vllm_runner_kwargs={"attention_backend": "TRITON_ATTN"}
+        if current_platform.is_rocm()
+        else {},
     ),
     "ultravox": VLMTestInfo(
         models=["fixie-ai/ultravox-v0_5-llama-3_2-1b"],
@@ -150,7 +209,14 @@ VLM_TEST_SETTINGS = {
         max_num_seqs=2,
         auto_cls=AutoModel,
         hf_output_post_proc=model_utils.ultravox_trunc_hf_output,
-        marks=[pytest.mark.core_model, pytest.mark.cpu_model],
+        marks=[
+            pytest.mark.core_model,
+            pytest.mark.cpu_model,
+            # TODO: Remove skip once model has been upstreamed to Transformers
+            pytest.mark.skip(
+                reason="Custom model code is not compatible with Transformers v5"
+            ),
+        ],
     ),
     #### Transformers fallback to test
     ## To reduce test burden, we only test batching arbitrary image size
@@ -170,33 +236,24 @@ VLM_TEST_SETTINGS = {
             "model_impl": "transformers",
             "default_torch_num_threads": 1,
         },
-        # FIXME: Investigate why the test hangs
-        # when processing the 3rd prompt in vLLM
-        marks=[pytest.mark.core_model, pytest.mark.skip(reason="Test hangs")],
+        marks=[pytest.mark.core_model],
     ),
     # Gemma3 has bidirectional mask on images
     "gemma3-transformers": VLMTestInfo(
         models=["google/gemma-3-4b-it"],
-        test_type=(VLMTestType.IMAGE, VLMTestType.MULTI_IMAGE),
-        prompt_formatter=lambda img_prompt: f"<bos><start_of_turn>user\n{img_prompt}<end_of_turn>\n<start_of_turn>model\n",  # noqa: E501
-        single_image_prompts=IMAGE_ASSETS.prompts(
-            {
-                "stop_sign": "<start_of_image>What's the content in the center of the image?",  # noqa: E501
-                "cherry_blossom": "<start_of_image>What is the season?",
-            }
-        ),
-        multi_image_prompt="<start_of_image><start_of_image>Describe the two images in detail.",  # noqa: E501
-        max_model_len=8192,
+        test_type=VLMTestType.IMAGE,
+        prompt_formatter=lambda vid_prompt: f"<'<bos><start_of_turn>user\n{vid_prompt}<start_of_image><end_of_turn>\n<start_of_turn>model\n",  # noqa: E501
+        max_model_len=4096,
         auto_cls=AutoModelForImageTextToText,
-        # TODO: Support `do_pan_and_scan` in transformers backend
-        # patch_hf_runner=model_utils.gemma3_patch_hf_runner,
         vllm_output_post_proc=model_utils.gemma3_vllm_to_hf_output,
         image_size_factors=[(0.25, 0.5, 1.0)],
         vllm_runner_kwargs={
             "model_impl": "transformers",
-            # "mm_processor_kwargs": {"do_pan_and_scan": True},
         },
-        marks=[pytest.mark.core_model],
+        marks=[
+            pytest.mark.core_model,
+            *([large_gpu_mark(min_gb=80)] if current_platform.is_rocm() else []),
+        ],
     ),
     "idefics3-transformers": VLMTestInfo(
         models=["HuggingFaceTB/SmolVLM-256M-Instruct"],
@@ -207,27 +264,6 @@ VLM_TEST_SETTINGS = {
         max_num_seqs=2,
         auto_cls=AutoModelForImageTextToText,
         hf_output_post_proc=model_utils.idefics3_trunc_hf_output,
-        image_size_factors=[(0.25, 0.5, 1.0)],
-        vllm_runner_kwargs={
-            "model_impl": "transformers",
-        },
-        marks=[pytest.mark.core_model],
-    ),
-    # PaliGemma has PrefixLM attention
-    "paligemma-transformers": VLMTestInfo(
-        models=["google/paligemma-3b-mix-224"],
-        test_type=VLMTestType.IMAGE,
-        prompt_formatter=identity,
-        img_idx_to_prompt=lambda idx: "",
-        # PaliGemma uses its own sample prompts because the default one fails
-        single_image_prompts=IMAGE_ASSETS.prompts(
-            {
-                "stop_sign": "caption es",
-                "cherry_blossom": "What is in the picture?",
-            }
-        ),
-        auto_cls=AutoModelForImageTextToText,
-        vllm_output_post_proc=model_utils.paligemma_vllm_to_hf_output,
         image_size_factors=[(0.25, 0.5, 1.0)],
         vllm_runner_kwargs={
             "model_impl": "transformers",
@@ -247,8 +283,19 @@ VLM_TEST_SETTINGS = {
         image_size_factors=[(0.25, 0.2, 0.15)],
         vllm_runner_kwargs={
             "model_impl": "transformers",
+            # TODO: [ROCm] Revert this once issue #30167 is resolved
+            **(
+                {
+                    "mm_processor_kwargs": {
+                        "min_pixels": 256 * 28 * 28,
+                        "max_pixels": 1280 * 28 * 28,
+                    },
+                }
+                if current_platform.is_rocm()
+                else {}
+            ),
         },
-        marks=[large_gpu_mark(min_gb=32)],
+        marks=[large_gpu_mark(min_gb=80 if current_platform.is_rocm() else 32)],
     ),
     #### Extended model tests
     "aria": VLMTestInfo(
@@ -272,7 +319,7 @@ VLM_TEST_SETTINGS = {
         marks=[large_gpu_mark(min_gb=64)],
     ),
     "aya_vision": VLMTestInfo(
-        models=["CohereForAI/aya-vision-8b"],
+        models=["CohereLabs/aya-vision-8b"],
         test_type=(VLMTestType.IMAGE),
         prompt_formatter=lambda img_prompt: f"<|START_OF_TURN_TOKEN|><|USER_TOKEN|>{img_prompt}<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>",  # noqa: E501
         single_image_prompts=IMAGE_ASSETS.prompts(
@@ -288,7 +335,7 @@ VLM_TEST_SETTINGS = {
         vllm_runner_kwargs={"mm_processor_kwargs": {"crop_to_patches": True}},
     ),
     "aya_vision-multi_image": VLMTestInfo(
-        models=["CohereForAI/aya-vision-8b"],
+        models=["CohereLabs/aya-vision-8b"],
         test_type=(VLMTestType.MULTI_IMAGE),
         prompt_formatter=lambda img_prompt: f"<|START_OF_TURN_TOKEN|><|USER_TOKEN|>{img_prompt}<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>",  # noqa: E501
         single_image_prompts=IMAGE_ASSETS.prompts(
@@ -344,7 +391,7 @@ VLM_TEST_SETTINGS = {
         patch_hf_runner=model_utils.deepseekvl2_patch_hf_runner,
         hf_output_post_proc=model_utils.deepseekvl2_trunc_hf_output,
         stop_str=["<｜end▁of▁sentence｜>", "<｜begin▁of▁sentence｜>"],
-        image_size_factors=[(), (1.0,), (1.0, 1.0, 1.0), (0.1, 0.5, 1.0)],
+        image_size_factors=[(1.0,), (1.0, 1.0, 1.0), (0.1, 0.5, 1.0)],
     ),
     "fuyu": VLMTestInfo(
         models=["adept/fuyu-8b"],
@@ -357,8 +404,49 @@ VLM_TEST_SETTINGS = {
         use_tokenizer_eos=True,
         vllm_output_post_proc=model_utils.fuyu_vllm_to_hf_output,
         num_logprobs=10,
-        image_size_factors=[(), (0.25,), (0.25, 0.25, 0.25), (0.25, 0.2, 0.15)],
+        image_size_factors=[(0.25,), (0.25, 0.25, 0.25), (0.25, 0.2, 0.15)],
         marks=[large_gpu_mark(min_gb=32)],
+    ),
+    "gemma3": VLMTestInfo(
+        models=["google/gemma-3-4b-it"],
+        test_type=(VLMTestType.IMAGE, VLMTestType.MULTI_IMAGE),
+        prompt_formatter=lambda img_prompt: f"<bos><start_of_turn>user\n{img_prompt}<end_of_turn>\n<start_of_turn>model\n",  # noqa: E501
+        single_image_prompts=IMAGE_ASSETS.prompts(
+            {
+                "stop_sign": "<start_of_image>What's the content in the center of the image?",  # noqa: E501
+                "cherry_blossom": "<start_of_image>What is the season?",
+            }
+        ),
+        multi_image_prompt="<start_of_image><start_of_image>Describe the two images in detail.",  # noqa: E501
+        max_model_len=4096,
+        max_num_seqs=2,
+        auto_cls=AutoModelForImageTextToText,
+        vllm_runner_kwargs={"mm_processor_kwargs": {"do_pan_and_scan": True}},
+        patch_hf_runner=model_utils.gemma3_patch_hf_runner,
+    ),
+    "gemma4": VLMTestInfo(
+        models=["google/gemma-4-E2B-it"],
+        test_type=(VLMTestType.IMAGE, VLMTestType.MULTI_IMAGE),
+        prompt_formatter=lambda img_prompt: f"<bos><|turn>user\n{img_prompt}<turn|>\n<|turn>model\n",  # noqa: E501
+        single_image_prompts=IMAGE_ASSETS.prompts(
+            {
+                "stop_sign": "<|image|>What's the content in the center of the image?",  # noqa: E501
+                "cherry_blossom": "<|image|>What is the season?",
+            }
+        ),
+        multi_image_prompt="<|image|><|image|>Describe the two images in detail.",  # noqa: E501
+        max_model_len=4096,
+        max_num_seqs=2,
+        auto_cls=AutoModelForImageTextToText,
+        vllm_runner_kwargs={"limit_mm_per_prompt": {"image": 4}},
+    ),
+    "granite_vision": VLMTestInfo(
+        models=["ibm-granite/granite-vision-3.3-2b"],
+        test_type=(VLMTestType.IMAGE),
+        prompt_formatter=lambda img_prompt: f"<|user|>\n{img_prompt}\n<|assistant|>\n",
+        max_model_len=8192,
+        auto_cls=AutoModelForImageTextToText,
+        vllm_output_post_proc=model_utils.llava_image_vllm_to_hf_output,
     ),
     "glm4v": VLMTestInfo(
         models=["zai-org/glm-4v-9b"],
@@ -379,19 +467,20 @@ VLM_TEST_SETTINGS = {
         # So, we need to reduce the number of tokens for the test to pass.
         max_tokens=8,
         num_logprobs=10,
+        auto_cls=AutoModelForCausalLM,
         marks=[large_gpu_mark(min_gb=32)],
     ),
     "glm4_1v": VLMTestInfo(
         models=["zai-org/GLM-4.1V-9B-Thinking"],
         test_type=(VLMTestType.IMAGE, VLMTestType.MULTI_IMAGE),
-        prompt_formatter=lambda img_prompt: f"<|user|>\n{img_prompt}<|assistant|>",
+        prompt_formatter=lambda img_prompt: f"[gMASK]<|user|>\n{img_prompt}<|assistant|>\n",  # noqa: E501
         img_idx_to_prompt=lambda idx: "<|begin_of_image|><|image|><|end_of_image|>",
         video_idx_to_prompt=lambda idx: "<|begin_of_video|><|video|><|end_of_video|>",
         max_model_len=2048,
         max_num_seqs=2,
         get_stop_token_ids=lambda tok: [151329, 151336, 151338],
         num_logprobs=10,
-        image_size_factors=[(), (0.25,), (0.25, 0.25, 0.25), (0.25, 0.2, 0.15)],
+        image_size_factors=[(0.25,), (0.25, 0.25, 0.25), (0.25, 0.2, 0.15)],
         auto_cls=AutoModelForImageTextToText,
         marks=[large_gpu_mark(min_gb=32)],
     ),
@@ -399,6 +488,7 @@ VLM_TEST_SETTINGS = {
         models=["zai-org/GLM-4.1V-9B-Thinking"],
         # GLM4.1V require include video metadata for input
         test_type=VLMTestType.CUSTOM_INPUTS,
+        prompt_formatter=lambda vid_prompt: f"[gMASK]<|user|>\n{vid_prompt}<|assistant|>\n",  # noqa: E501
         max_model_len=4096,
         max_num_seqs=2,
         auto_cls=AutoModelForImageTextToText,
@@ -410,6 +500,34 @@ VLM_TEST_SETTINGS = {
             )
         ],
         marks=[large_gpu_mark(min_gb=32)],
+    ),
+    "glm_ocr": VLMTestInfo(
+        models=["zai-org/GLM-OCR"],
+        test_type=(VLMTestType.IMAGE, VLMTestType.MULTI_IMAGE),
+        prompt_formatter=lambda img_prompt: f"[gMASK]<|user|>\n{img_prompt}<|assistant|>\n",  # noqa: E501
+        img_idx_to_prompt=lambda idx: "<|begin_of_image|><|image|><|end_of_image|>",
+        video_idx_to_prompt=lambda idx: "<|begin_of_video|><|video|><|end_of_video|>",
+        max_model_len=2048,
+        max_num_seqs=2,
+        get_stop_token_ids=lambda tok: [151329, 151336, 151338],
+        num_logprobs=10,
+        image_size_factors=[(0.25,), (0.25, 0.25, 0.25), (0.25, 0.2, 0.15)],
+        auto_cls=AutoModelForImageTextToText,
+        marks=[large_gpu_mark(min_gb=32)],
+    ),
+    "granite4_vision": VLMTestInfo(
+        models=["ibm-granite/granite-vision-4.1-4b"],
+        test_type=(VLMTestType.IMAGE),
+        prompt_formatter=lambda img_prompt: f"<|user|>\n{img_prompt}\n<|assistant|>\n",
+        max_model_len=8192,
+        auto_cls=AutoModelForImageTextToText,
+        vllm_output_post_proc=_granite4_vision_vllm_to_hf_output,
+        image_size_factors=[(1.0,)],
+        vllm_runner_kwargs={
+            "enable_lora": True,
+            "max_lora_rank": 256,
+            "default_mm_loras": {"image": "ibm-granite/granite-vision-4.1-4b"},
+        },
     ),
     "h2ovl": VLMTestInfo(
         models=[
@@ -459,6 +577,12 @@ VLM_TEST_SETTINGS = {
         max_model_len=4096,
         use_tokenizer_eos=True,
         patch_hf_runner=model_utils.internvl_patch_hf_runner,
+        # TODO: Remove skip once model has been upstreamed to Transformers
+        marks=[
+            pytest.mark.skip(
+                reason="Custom model code tries to access data from meta-tensor"
+            )
+        ],
     ),
     "intern_vl-video": VLMTestInfo(
         models=[
@@ -470,6 +594,13 @@ VLM_TEST_SETTINGS = {
         max_model_len=8192,
         use_tokenizer_eos=True,
         patch_hf_runner=model_utils.internvl_patch_hf_runner,
+        num_logprobs=10 if current_platform.is_rocm() else 5,
+        # TODO: Remove skip once model has been upstreamed to Transformers
+        marks=[
+            pytest.mark.skip(
+                reason="Custom model code tries to access data from meta-tensor"
+            )
+        ],
     ),
     "intern_vl-hf": VLMTestInfo(
         models=["OpenGVLab/InternVL3-1B-hf"],
@@ -484,6 +615,40 @@ VLM_TEST_SETTINGS = {
         max_model_len=8192,
         use_tokenizer_eos=True,
         auto_cls=AutoModelForImageTextToText,
+    ),
+    "isaac": VLMTestInfo(
+        # NOTE: PerceptronAI/Isaac-0.1 removed because the upstream HF
+        # repo has a stale model.safetensors.index.json that references
+        # shard files which no longer exist (consolidated into a single
+        # model.safetensors on 2026-03-20). Re-add once upstream fixes
+        # the index file.
+        models=[
+            "PerceptronAI/Isaac-0.2-2B-Preview",
+        ],
+        test_type=(VLMTestType.IMAGE, VLMTestType.MULTI_IMAGE),
+        prompt_formatter=lambda img_prompt: (
+            f"<|im_start|>User\n{img_prompt}<|im_end|>\n<|im_start|>assistant\n"
+        ),
+        img_idx_to_prompt=lambda idx: "<image>",
+        single_image_prompts=IMAGE_ASSETS.prompts(
+            {
+                "stop_sign": "<vlm_image>Please describe the image shortly.",
+                "cherry_blossom": "<vlm_image>Please infer the season with reason.",
+            }
+        ),
+        multi_image_prompt=(
+            "Picture 1: <vlm_image>\n"
+            "Picture 2: <vlm_image>\n"
+            "Describe these two images with one paragraph respectively."
+        ),
+        enforce_eager=False,
+        max_model_len=4096,
+        max_num_seqs=2,
+        hf_model_kwargs={"device_map": "auto"},
+        patch_hf_runner=model_utils.isaac_patch_hf_runner,
+        image_size_factors=[(0.25,), (0.25, 0.25, 0.25), (0.25, 0.2, 0.15)],
+        # TODO: Remove skip once model has been upstreamed to Transformers
+        marks=[pytest.mark.skip(reason="Custom model imports deleted object")],  # noqa: E501
     ),
     "kimi_vl": VLMTestInfo(
         models=["moonshotai/Kimi-VL-A3B-Instruct"],
@@ -620,7 +785,17 @@ VLM_TEST_SETTINGS = {
         hf_output_post_proc=model_utils.minimax_vl_01_hf_output,
         patch_hf_runner=model_utils.minimax_vl_01_patch_hf_runner,
         auto_cls=AutoModelForImageTextToText,
-        marks=[large_gpu_mark(min_gb=80)],
+        marks=[
+            large_gpu_mark(min_gb=80),
+            # TODO: [ROCm] Fix pickle issue with ROCm spawn and tp>1
+            pytest.mark.skipif(
+                current_platform.is_rocm(),
+                reason=(
+                    "ROCm: Model too large for single GPU; "
+                    "multi-GPU blocked by HF _LazyConfigMapping pickle issue with spawn"
+                ),
+            ),
+        ],
     ),
     "molmo": VLMTestInfo(
         models=["allenai/Molmo-7B-D-0924"],
@@ -668,6 +843,35 @@ VLM_TEST_SETTINGS = {
         patch_hf_runner=model_utils.ovis2_5_patch_hf_runner,
         hf_model_kwargs={"revision": "refs/pr/5"},
     ),
+    "paddleocr_vl": VLMTestInfo(
+        models=["PaddlePaddle/PaddleOCR-VL"],
+        test_type=(VLMTestType.IMAGE, VLMTestType.MULTI_IMAGE),
+        prompt_formatter=lambda img_prompt: f"USER: {img_prompt}\nASSISTANT:",
+        img_idx_to_prompt=lambda idx: (
+            "<|IMAGE_START|><|IMAGE_PLACEHOLDER|><|IMAGE_END|>"
+        ),
+        multi_image_prompt=(
+            "Image-1: <|IMAGE_START|><|IMAGE_PLACEHOLDER|><|IMAGE_END|>\n"
+            "Image-2: <|IMAGE_START|><|IMAGE_PLACEHOLDER|><|IMAGE_END|>\n"
+            "Describe these two images separately."
+        ),
+        max_model_len=8192,
+        max_num_seqs=2,
+        auto_cls=AutoModelForCausalLM,
+        patch_hf_runner=model_utils.paddleocr_vl_patch_hf_runner,
+        image_size_factors=[(0.25,)],
+        marks=[
+            pytest.mark.skipif(
+                Version(TRANSFORMERS_VERSION) == Version("4.57.3"),
+                reason="This model is broken in Transformers v4.57.3",
+            ),
+            pytest.mark.skipif(
+                Version(TRANSFORMERS_VERSION) >= Version("5.0.0"),
+                reason="Model's custom code uses ROPE_INIT_FUNCTIONS"
+                "['default'] which was removed in transformers v5",
+            ),
+        ],
+    ),
     "phi3v": VLMTestInfo(
         models=["microsoft/Phi-3.5-vision-instruct"],
         test_type=(VLMTestType.IMAGE, VLMTestType.MULTI_IMAGE),
@@ -690,7 +894,13 @@ VLM_TEST_SETTINGS = {
         max_model_len=8192,
         max_num_seqs=2,
         auto_cls=AutoModelForImageTextToText,
-        marks=[large_gpu_mark(min_gb=48)],
+        marks=[
+            large_gpu_mark(min_gb=48),
+            pytest.mark.skipif(
+                current_platform.is_rocm(),
+                reason="Model produces a vector of <UNK> output in HF on ROCm",
+            ),
+        ],
     ),
     "qwen_vl": VLMTestInfo(
         models=["Qwen/Qwen-VL"],
@@ -711,9 +921,10 @@ VLM_TEST_SETTINGS = {
         multi_image_prompt="Picture 1: <vlm_image>\nPicture 2: <vlm_image>\nDescribe these two images with one paragraph respectively.",  # noqa: E501
         max_model_len=4096,
         max_num_seqs=2,
+        num_logprobs=10,
         auto_cls=AutoModelForImageTextToText,
         vllm_output_post_proc=model_utils.qwen2_vllm_to_hf_output,
-        image_size_factors=[(), (0.25,), (0.25, 0.25, 0.25), (0.25, 0.2, 0.15)],
+        image_size_factors=[(0.25,), (0.25, 0.25, 0.25), (0.25, 0.2, 0.15)],
         marks=[pytest.mark.cpu_model],
     ),
     "skywork_r1v": VLMTestInfo(
@@ -765,7 +976,7 @@ VLM_TEST_SETTINGS = {
         max_model_len=4096,
         max_num_seqs=2,
         auto_cls=AutoModelForImageTextToText,
-        image_size_factors=[(), (0.25,), (0.25, 0.25, 0.25), (0.25, 0.2, 0.15)],
+        image_size_factors=[(0.25,), (0.25, 0.25, 0.25), (0.25, 0.2, 0.15)],
         marks=[pytest.mark.skip("Model initialization hangs")],
     ),
     ### Tensor parallel / multi-gpu broadcast tests
@@ -812,6 +1023,12 @@ VLM_TEST_SETTINGS = {
                 limit_mm_per_prompt={"image": 2},
             )
             for inp in custom_inputs.different_patch_input_cases_internvl()
+        ],
+        # TODO: Remove skip once model has been upstreamed to Transformers
+        marks=[
+            pytest.mark.skip(
+                reason="Custom model code tries to access data from meta-tensor"
+            )
         ],
     ),
     "llava_onevision-multiple-images": VLMTestInfo(

@@ -4,7 +4,6 @@
 import os
 from collections.abc import Sequence
 
-import librosa
 import pytest
 import regex as re
 from huggingface_hub import snapshot_download
@@ -14,7 +13,7 @@ from vllm.assets.image import ImageAsset
 from vllm.logprobs import SampleLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.image import convert_image_mode, rescale_image_size
-from vllm.platforms import current_platform
+from vllm.multimodal.media.audio import load_audio
 
 from ....conftest import (
     IMAGE_ASSETS,
@@ -67,12 +66,6 @@ def vllm_to_hf_output(
 
 
 target_dtype = "half"
-
-# ROCm Triton FA can run into shared memory issues with these models,
-# use other backends in the meantime
-# FIXME (mattwong, gshtrasb, hongxiayan)
-if current_platform.is_rocm():
-    os.environ["VLLM_USE_TRITON_FLASH_ATTN"] = "0"
 
 
 def run_test(
@@ -177,8 +170,6 @@ def run_test(
 @pytest.mark.parametrize(
     "size_factors",
     [
-        # No image
-        [],
         # Single-scale
         [1.0],
         # Single-scale, batched
@@ -299,7 +290,7 @@ def test_vision_speech_models(
     num_logprobs: int,
 ) -> None:
     # use the example speech question so that the model outputs are reasonable
-    audio = librosa.load(speech_question, sr=None)
+    audio = load_audio(speech_question, sr=None)
     image = convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB")
 
     inputs_vision_speech = [

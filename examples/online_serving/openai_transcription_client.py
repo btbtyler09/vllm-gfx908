@@ -18,6 +18,7 @@ The script performs:
 2. Streaming transcription using raw HTTP request to the vLLM server.
 """
 
+import argparse
 import asyncio
 
 from openai import AsyncOpenAI, OpenAI
@@ -25,35 +26,45 @@ from openai import AsyncOpenAI, OpenAI
 from vllm.assets.audio import AudioAsset
 
 
-def sync_openai(audio_path: str, client: OpenAI):
+def sync_openai(
+    audio_path: str,
+    client: OpenAI,
+    model: str,
+    *,
+    repetition_penalty: float = 1.3,
+    hotwords: str = None,
+):
     """
     Perform synchronous transcription using OpenAI-compatible API.
     """
     with open(audio_path, "rb") as f:
         transcription = client.audio.transcriptions.create(
             file=f,
-            model="openai/whisper-large-v3",
+            model=model,
             language="en",
             response_format="json",
             temperature=0.0,
             # Additional sampling params not provided by OpenAI API.
             extra_body=dict(
                 seed=4419,
-                repetition_penalty=1.3,
+                repetition_penalty=repetition_penalty,
+                hotwords=hotwords,
             ),
         )
-        print("transcription result:", transcription.text)
+        print("transcription result [sync]:", transcription.text)
 
 
-async def stream_openai_response(audio_path: str, client: AsyncOpenAI):
+async def stream_openai_response(
+    audio_path: str, client: AsyncOpenAI, model: str, hotwords: str = None
+):
     """
     Perform asynchronous transcription using OpenAI-compatible API.
     """
-    print("\ntranscription result:", end=" ")
+    print("\ntranscription result [stream]:", end=" ")
     with open(audio_path, "rb") as f:
         transcription = await client.audio.transcriptions.create(
             file=f,
-            model="openai/whisper-large-v3",
+            model=model,
             language="en",
             response_format="json",
             temperature=0.0,
@@ -61,6 +72,7 @@ async def stream_openai_response(audio_path: str, client: AsyncOpenAI):
             extra_body=dict(
                 seed=420,
                 top_p=0.6,
+                hotwords=hotwords,
             ),
             stream=True,
         )
@@ -72,7 +84,47 @@ async def stream_openai_response(audio_path: str, client: AsyncOpenAI):
     print()  # Final newline after stream ends
 
 
-def main():
+def stream_api_response(audio_path: str, model: str, openai_api_base: str):
+    """
+    Perform streaming transcription using raw HTTP requests to the vLLM API server.
+    """
+    import json
+    import os
+
+    import requests
+
+    api_url = f"{openai_api_base}/audio/transcriptions"
+    headers = {"User-Agent": "Transcription-Client"}
+    with open(audio_path, "rb") as f:
+        files = {"file": (os.path.basename(audio_path), f)}
+        data = {
+            "stream": "true",
+            "model": model,
+            "language": "en",
+            "response_format": "json",
+        }
+
+        print("\ntranscription result [stream]:", end=" ")
+        response = requests.post(
+            api_url, headers=headers, files=files, data=data, stream=True
+        )
+        for chunk in response.iter_lines(
+            chunk_size=8192, decode_unicode=False, delimiter=b"\n"
+        ):
+            if chunk:
+                data = chunk[len("data: ") :]
+                data = json.loads(data.decode("utf-8"))
+                data = data["choices"][0]
+                delta = data["delta"]["content"]
+                print(delta, end="", flush=True)
+
+                finish_reason = data.get("finish_reason")
+                if finish_reason is not None:
+                    print(f"\n[Stream finished reason: {finish_reason}]")
+                    break
+
+
+def main(args):
     mary_had_lamb = str(AudioAsset("mary_had_lamb").get_local_path())
     winning_call = str(AudioAsset("winning_call").get_local_path())
 
@@ -84,14 +136,62 @@ def main():
         base_url=openai_api_base,
     )
 
-    sync_openai(mary_had_lamb, client)
-    # Run the asynchronous function
-    client = AsyncOpenAI(
-        api_key=openai_api_key,
-        base_url=openai_api_base,
+    model = client.models.list().data[0].id
+    print(f"Using model: {model}")
+
+    # Run the synchronous function
+    sync_openai(
+        audio_path=args.audio_path if args.audio_path else mary_had_lamb,
+        client=client,
+        model=model,
+        repetition_penalty=args.repetition_penalty,
+        hotwords=args.hotwords,
     )
-    asyncio.run(stream_openai_response(winning_call, client))
+
+    # Run the asynchronous function
+    if "openai" in model:
+        client = AsyncOpenAI(
+            api_key=openai_api_key,
+            base_url=openai_api_base,
+        )
+        asyncio.run(
+            stream_openai_response(
+                args.audio_path if args.audio_path else winning_call,
+                client,
+                model,
+                hotwords=args.hotwords,
+            )
+        )
+    else:
+        stream_api_response(
+            args.audio_path if args.audio_path else winning_call,
+            model,
+            openai_api_base,
+        )
 
 
 if __name__ == "__main__":
-    main()
+    # setup argparser
+    parser = argparse.ArgumentParser(
+        description="OpenAI Transcription Client using vLLM API Server"
+    )
+    parser.add_argument(
+        "--audio_path",
+        type=str,
+        default=None,
+        help="The path to the audio file to transcribe.",
+    )
+    parser.add_argument(
+        "--repetition_penalty",
+        type=float,
+        default=1.3,
+        help="repetition penalty",
+    )
+    parser.add_argument(
+        "--hotwords",
+        type=str,
+        default=None,
+        help="hotwords",
+    )
+    args = parser.parse_args()
+    main(args)

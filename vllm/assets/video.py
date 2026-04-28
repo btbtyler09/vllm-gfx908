@@ -10,14 +10,9 @@ import numpy.typing as npt
 from huggingface_hub import hf_hub_download
 from PIL import Image
 
-from vllm.utils.import_utils import PlaceholderModule
+from vllm.multimodal.media.audio import load_audio_pyav
 
 from .base import get_cache_dir
-
-try:
-    import librosa
-except ImportError:
-    librosa = PlaceholderModule("librosa")  # type: ignore[assignment]
 
 
 @lru_cache
@@ -94,7 +89,7 @@ def video_get_metadata(path: str, num_frames: int = -1) -> dict[str, Any]:
 
     metadata = {
         "total_num_frames": num_frames,
-        "fps": fps,
+        "fps": duration / num_frames,
         "duration": duration,
         "video_backend": "opencv",
         "frames_indices": list(range(num_frames)),
@@ -146,4 +141,4 @@ class VideoAsset:
 
         See also: examples/offline_inference/qwen2_5_omni/only_thinker.py
         """
-        return librosa.load(self.video_path, sr=sampling_rate)[0]
+        return load_audio_pyav(self.video_path, sr=sampling_rate)[0]

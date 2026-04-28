@@ -9,11 +9,10 @@ from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
-from vllm.config import get_current_vllm_config
+from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.utils import cuda_device_count_stateless
 
 logger = init_logger(__name__)
 
@@ -137,7 +136,7 @@ class QuickAllReduce:
         if cuda_visible_devices:
             device_ids = list(map(int, cuda_visible_devices.split(",")))
         else:
-            device_ids = list(range(cuda_device_count_stateless()))
+            device_ids = list(range(current_platform.device_count()))
         physical_device_id = device_ids[device.index]
         tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
         gather_list = [
@@ -184,7 +183,7 @@ class QuickAllReduce:
             )
             return
         self.qr_quant_level = QuickReduceRegime[regime_str]
-        vllm_config = get_current_vllm_config()
+        vllm_config = get_current_vllm_config_or_none()
         if (
             vllm_config is not None
             and hasattr(vllm_config, "model_config")
@@ -227,7 +226,9 @@ class QuickAllReduce:
         try:
             props = torch.cuda.get_device_properties(0)
             gcn_arch = getattr(props, "gcnArchName", "")
-            supported_archs = ["gfx94", "gfx95"]
+            # gfx908 supported via architecture-specific memory ordering
+            # (CDNA1); gfx942/gfx950 are CDNA3/4.
+            supported_archs = ["gfx908", "gfx94", "gfx95"]
             return any(gfx in gcn_arch for gfx in supported_archs)
         except Exception as e:
             logger.warning("Failed to determine ROCm for quick allreduce: %s", e)
