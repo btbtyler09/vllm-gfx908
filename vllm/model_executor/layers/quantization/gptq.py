@@ -22,6 +22,9 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.utils.gptq_utils import (
     get_linear_quant_method,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.triton_w8a16 import (
+    triton_w8a16_gemm,
+)
 from vllm.model_executor.parameter import (
     ChannelQuantScaleParameter,
     GroupQuantScaleParameter,
@@ -240,6 +243,39 @@ class GPTQLinearMethod(LinearMethodBase):
 
         # GPTQ v1 and v2 format deals with zero points differently
         self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
+        self.use_triton_w8a16 = False
+
+        if quant_config.weight_bits == 8 and not quant_config.desc_act:
+            try:
+                from vllm.platforms import current_platform
+                from vllm.platforms.rocm import on_gfx908
+
+                self.use_triton_w8a16 = current_platform.is_rocm() and on_gfx908()
+            except Exception:
+                self.use_triton_w8a16 = False
+
+    @staticmethod
+    def _repack_qweight_for_triton_w8a16(qweight: torch.Tensor) -> torch.Tensor:
+        """Convert GPTQ K-packed qweight [K//4, N] to [K, N//4]."""
+        k4, output_size = qweight.shape
+        if output_size % 4 != 0:
+            raise ValueError(
+                "Triton W8A16 GPTQ path requires output features divisible by 4, "
+                f"got {output_size}."
+            )
+
+        shifts = torch.arange(4, device=qweight.device, dtype=torch.int32) * 8
+        qweight_by_output = qweight.t().contiguous()
+        unpacked = ((qweight_by_output.unsqueeze(-1) >> shifts) & 0xFF).reshape(
+            output_size, k4 * 4
+        )
+        unpacked = unpacked.t().contiguous()
+        repacked = torch.sum(
+            (unpacked.view(k4 * 4, output_size // 4, 4) & 0xFF) << shifts,
+            dim=2,
+            dtype=torch.int32,
+        )
+        return repacked.contiguous()
 
     def create_weights(
         self,
@@ -361,6 +397,21 @@ class GPTQLinearMethod(LinearMethodBase):
         layer.g_idx = Parameter(layer.g_idx.data, requires_grad=False)
         layer.scales = Parameter(layer.scales.data, requires_grad=False)
 
+        if self.use_triton_w8a16:
+            layer.qweight = Parameter(
+                self._repack_qweight_for_triton_w8a16(layer.qweight.data),
+                requires_grad=False,
+            )
+            layer.qzeros = Parameter(layer.qzeros.data.contiguous(), requires_grad=False)
+            layer.scales = Parameter(layer.scales.data.contiguous(), requires_grad=False)
+            layer.g_idx = Parameter(
+                torch.empty((0,), dtype=torch.int, device=layer.qweight.device),
+                requires_grad=False,
+            )
+            layer.exllama_state = ExllamaState.UNUSED
+            layer.gptq_triton_w8a16_ready = True
+            return
+
         # exllama needs to shuffle the weight after the weight is loaded
         # here we do the shuffle on first forward pass
         if layer.exllama_state == ExllamaState.UNINITIALIZED:
@@ -381,6 +432,28 @@ class GPTQLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
         reshaped_x = x.reshape(-1, x.shape[-1])
+
+        if getattr(layer, "gptq_triton_w8a16_ready", False):
+            output_size = layer.scales.shape[-1]
+            out_shape = x.shape[:-1] + (output_size,)
+            group_size = (
+                self.quant_config.group_size
+                if self.quant_config.group_size != -1
+                else reshaped_x.shape[-1]
+            )
+            zero_offset = 0 if self.use_v2_format else 1
+            output = triton_w8a16_gemm(
+                a=reshaped_x.contiguous(),
+                b_q=layer.qweight,
+                scales=layer.scales,
+                qzeros=layer.qzeros,
+                group_size=group_size,
+                zp_bias=0,
+                zero_offset=zero_offset,
+            )
+            if bias is not None:
+                output.add_(bias)
+            return output.reshape(out_shape)
 
         # GPTQ v1 and v2 format checkpoints deals with zero points differently,
         # and require different gemm kernels.

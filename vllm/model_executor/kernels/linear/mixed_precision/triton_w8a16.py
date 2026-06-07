@@ -55,6 +55,7 @@ def triton_w8a16_decode_kernel(
     group_size,
     HAS_ZP: tl.constexpr,
     ZP_BIAS: tl.constexpr,
+    ZERO_OFFSET: tl.constexpr,
     SPLIT_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -115,7 +116,9 @@ def triton_w8a16_decode_kernel(
             z = tl.interleave(z_packed, z_packed)
             z = tl.interleave(z, z)
             z = (z >> shifts_1d) & 0xFF  # [BLOCK_N]
-            b_centered_f32 = (b.to(tl.float32) - z[None, :].to(tl.float32))
+            b_centered_f32 = (
+                b.to(tl.float32) - (z[None, :] + ZERO_OFFSET).to(tl.float32)
+            )
         else:
             b_centered_f32 = (b.to(tl.float32) - ZP_BIAS)
 
@@ -153,6 +156,7 @@ def triton_w8a16_gemm_kernel(
     group_size,
     HAS_ZP: tl.constexpr,
     ZP_BIAS: tl.constexpr,
+    ZERO_OFFSET: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -222,6 +226,7 @@ def triton_w8a16_gemm_kernel(
             z = tl.interleave(z_packed, z_packed)
             z = tl.interleave(z, z)
             z = (z >> shifts_1d) & 0xFF
+            z += ZERO_OFFSET
             z = tl.broadcast_to(z[None, :], (BLOCK_K, BLOCK_N))
         else:
             z = tl.full((BLOCK_K, BLOCK_N), ZP_BIAS, dtype=tl.int32)
@@ -298,6 +303,7 @@ def triton_w8a16_decode(
     qzeros: torch.Tensor | None,
     group_size: int,
     zp_bias: int = 128,
+    zero_offset: int = 0,
     split_k: int | None = None,
     block_n: int | None = None,
     block_k: int | None = None,
@@ -340,6 +346,7 @@ def triton_w8a16_decode(
         group_size=group_size,
         HAS_ZP=has_zp,
         ZP_BIAS=zp_bias,
+        ZERO_OFFSET=zero_offset,
         SPLIT_K=split_k,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
@@ -356,6 +363,7 @@ def triton_w8a16_gemm(
     qzeros: torch.Tensor | None,
     group_size: int,
     zp_bias: int = 128,
+    zero_offset: int = 0,
 ) -> torch.Tensor:
     """Fused W8A16 GEMM using GPTQ-packed int8 weights.
 
@@ -409,6 +417,7 @@ def triton_w8a16_gemm(
         group_size=group_size,
         HAS_ZP=has_zp,
         ZP_BIAS=zp_bias,
+        ZERO_OFFSET=zero_offset,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
@@ -541,6 +550,7 @@ class TritonW8A16LinearKernel(MPLinearKernel):
             qzeros=w_zp,
             group_size=group_size,
             zp_bias=zp_bias,
+            zero_offset=0,
         )
 
         if bias is not None:
