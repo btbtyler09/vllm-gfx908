@@ -16,7 +16,10 @@ import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
-from vllm.env_override import _apply_constrain_to_fx_strides_patch
+from vllm.env_override import (
+    _apply_constrain_to_fx_strides_patch,
+    _apply_dynamo_config_logging_patch,
+)
 from vllm.logger import init_logger
 from vllm.utils.hashing import safe_hash
 from vllm.utils.torch_utils import is_torch_equal_or_newer
@@ -741,6 +744,7 @@ class InductorAdaptor(CompilerInterface):
         if is_torch_equal_or_newer("2.6"):
             import torch._dynamo.utils
 
+            _apply_dynamo_config_logging_patch()
             return torch._dynamo.utils.get_metrics_context()  # type: ignore[no-any-return]
         else:
             return contextlib.nullcontext()
