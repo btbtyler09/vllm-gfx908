@@ -860,6 +860,31 @@ class RocmPlatform(Platform):
                     )
                     compilation_config.mode = CompilationMode.NONE
 
+            speculative_config = vllm_config.speculative_config
+            if (
+                speculative_config is not None
+                and speculative_config.method == "mtp"
+            ):
+                torch_nccl_blocking_wait = os.environ.get(
+                    "TORCH_NCCL_BLOCKING_WAIT"
+                )
+                if torch_nccl_blocking_wait is None:
+                    os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"
+                    logger.info_once(
+                        "gfx908 (MI100): setting TORCH_NCCL_BLOCKING_WAIT=1 "
+                        "for MTP CUDA graph capture. PyTorch's NCCL watchdog "
+                        "queries HIP events recorded in a capturing stream and "
+                        "can abort with hipErrorCapturedEvent."
+                    )
+                elif torch_nccl_blocking_wait != "1":
+                    logger.warning_once(
+                        "gfx908 (MI100): MTP CUDA graph capture may fail "
+                        "because TORCH_NCCL_BLOCKING_WAIT=%r. Set it to 1 to "
+                        "avoid ProcessGroupNCCL watchdog HIP-event queries "
+                        "during capture.",
+                        torch_nccl_blocking_wait,
+                    )
+
         if compilation_config.cudagraph_mode.has_full_cudagraphs():
             # decode context parallel does not support full cudagraphs
             if parallel_config.decode_context_parallel_size > 1:
