@@ -26,6 +26,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.utils import (
+    bind_rocm_unquantized_gemm_gfx908,
     dispatch_unquantized_gemm,
 )
 from vllm.model_executor.parameter import (
@@ -216,6 +217,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
             dispatch_cpu_unquantized_gemm(layer, remove_weight=True)
+        elif current_platform.is_rocm():
+            from vllm.platforms.rocm import on_gfx908
+
+            if on_gfx908():
+                bind_rocm_unquantized_gemm_gfx908(layer)
 
     def apply(
         self,
@@ -225,6 +231,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
+        if (op := getattr(layer, "_vllm_unquantized_gemm", None)) is not None:
+            return op(layer, x, layer.weight, bias)
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
 
