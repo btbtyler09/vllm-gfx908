@@ -442,15 +442,29 @@ class GPTQLinearMethod(LinearMethodBase):
                 else reshaped_x.shape[-1]
             )
             zero_offset = 0 if self.use_v2_format else 1
-            output = triton_w8a16_gemm(
-                a=reshaped_x.contiguous(),
-                b_q=layer.qweight,
-                scales=layer.scales,
-                qzeros=layer.qzeros,
-                group_size=group_size,
-                zp_bias=0,
-                zero_offset=zero_offset,
-            )
+            reshaped_x = reshaped_x.contiguous()
+            if (
+                reshaped_x.shape[0] <= 8
+                and self.quant_config.weight_bits == 8
+                and hasattr(torch.ops._C, "gptq_w8a16_repacked_gemm")
+            ):
+                output = ops.gptq_w8a16_repacked_gemm(
+                    reshaped_x,
+                    layer.qweight,
+                    layer.qzeros,
+                    layer.scales,
+                    self.use_v2_format,
+                )
+            else:
+                output = triton_w8a16_gemm(
+                    a=reshaped_x,
+                    b_q=layer.qweight,
+                    scales=layer.scales,
+                    qzeros=layer.qzeros,
+                    group_size=group_size,
+                    zp_bias=0,
+                    zero_offset=zero_offset,
+                )
             if bias is not None:
                 output.add_(bias)
             return output.reshape(out_shape)

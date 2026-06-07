@@ -779,6 +779,133 @@ void gemm_half_q_half_gptq_8bit_kernel(
   }
 }
 
+__forceinline__ __device__ void dequant_8bit_8_repacked(
+    const uint32_t* __restrict__ b_ptr, const int packed_size_n,
+    const int shift, half2 (&dq)[4], const uint32_t zero) {
+  half dqh[8];
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    dqh[i] = dq_ns(exb(b_ptr[i * packed_size_n], shift, 0xff), zero);
+  }
+
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    dq[i] = __halves2half2(dqh[i * 2], dqh[i * 2 + 1]);
+  }
+}
+
+template <int m_count>
+__global__ __launch_bounds__(BLOCK_KN_SIZE, 1)
+void gemm_half_q_half_gptq_8bit_repacked_kernel(
+    const half* __restrict__ a, const uint32_t* __restrict__ b_q_weight,
+    const uint32_t* __restrict__ b_gptq_qzeros,
+    const half* __restrict__ b_gptq_scales, half* __restrict__ c,
+    const int size_m, const int size_n, const int size_k, const int groups,
+    const bool use_v2_format) {
+  MatrixView_half a_(a, size_m, size_k);
+  MatrixView_half_rw c_(c, size_m, size_n);
+  MatrixView_q8_row b_gptq_qzeros_(b_gptq_qzeros, groups, size_n);
+  MatrixView_half b_gptq_scales_(b_gptq_scales, groups, size_n);
+
+  const int zero_offset = use_v2_format ? 0 : 1;
+  const int t = threadIdx.x;
+  const int packed_size_n = size_n / 4;
+
+  const int offset_n = blockIdx.x * BLOCK_KN_SIZE * 4;
+  const int offset_m = blockIdx.y * m_count;
+  const int offset_k = blockIdx.z * BLOCK_KN_SIZE;
+  const int end_k = min(offset_k + BLOCK_KN_SIZE, size_k);
+
+  const int n = offset_n + t * 4;
+  __shared__ half block_a[m_count][BLOCK_KN_SIZE];
+
+  if (offset_k + t < end_k) {
+#pragma unroll
+    for (int m = 0; m < m_count; ++m) {
+      const half* a_ptr = a_.item_ptr(offset_m + m, 0);
+      block_a[m][t] = a_ptr[offset_k + t];
+    }
+  }
+
+  __syncthreads();
+
+  if (n >= size_n) return;
+
+  const int groupsize = size_k / groups;
+  int group = offset_k / groupsize;
+  int nextgroup = offset_k + groupsize;
+
+  int zeros[4];
+  half scales[4];
+  b_gptq_qzeros_.item4(zeros, group, n);
+  b_gptq_scales_.item4(scales, group, n);
+
+  half block_c[m_count][4] = {};
+  const int packed_n = n / 4;
+  const half* a_ptr = &block_a[0][0];
+  const int a_stride = BLOCK_KN_SIZE;
+
+  int k = offset_k;
+  while (k < end_k) {
+    if (k == nextgroup) {
+      group++;
+      nextgroup += groupsize;
+      b_gptq_qzeros_.item4(zeros, group, n);
+      b_gptq_scales_.item4(scales, group, n);
+    }
+
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const uint32_t* q_ptr =
+          b_q_weight + (k + j * 8) * packed_size_n + packed_n;
+
+      half2 dq[4][4];
+      dequant_8bit_8_repacked(q_ptr, packed_size_n, 0, dq[0],
+                              zeros[0] + zero_offset);
+      dequant_8bit_8_repacked(q_ptr, packed_size_n, 8, dq[1],
+                              zeros[1] + zero_offset);
+      dequant_8bit_8_repacked(q_ptr, packed_size_n, 16, dq[2],
+                              zeros[2] + zero_offset);
+      dequant_8bit_8_repacked(q_ptr, packed_size_n, 24, dq[3],
+                              zeros[3] + zero_offset);
+
+      if constexpr (m_count == 1) {
+        block_c[0][0] =
+            dot22_8_h(dq[0], a_ptr, block_c[0][0], scales[0]);
+        block_c[0][1] =
+            dot22_8_h(dq[1], a_ptr, block_c[0][1], scales[1]);
+        block_c[0][2] =
+            dot22_8_h(dq[2], a_ptr, block_c[0][2], scales[2]);
+        block_c[0][3] =
+            dot22_8_h(dq[3], a_ptr, block_c[0][3], scales[3]);
+      } else {
+#pragma unroll
+        for (int m = 0; m < m_count; m++) {
+          block_c[m][0] = dot22_8_h_dot2(dq[0], a_ptr + m * a_stride,
+                                         block_c[m][0], scales[0]);
+          block_c[m][1] = dot22_8_h_dot2(dq[1], a_ptr + m * a_stride,
+                                         block_c[m][1], scales[1]);
+          block_c[m][2] = dot22_8_h_dot2(dq[2], a_ptr + m * a_stride,
+                                         block_c[m][2], scales[2]);
+          block_c[m][3] = dot22_8_h_dot2(dq[3], a_ptr + m * a_stride,
+                                         block_c[m][3], scales[3]);
+        }
+      }
+      a_ptr += 8;
+    }
+    k += 32;
+  }
+
+#pragma unroll
+  for (int m = 0; m < m_count; m++) {
+    half2* out = (half2*)c_.item_ptr(offset_m + m, n);
+    half2 result01 = __halves2half2(block_c[m][0], block_c[m][1]);
+    half2 result23 = __halves2half2(block_c[m][2], block_c[m][3]);
+    atomicAdd(out, result01);
+    atomicAdd(out + 1, result23);
+  }
+}
+
 fp_gemm_half_q_half_gptq_kernel pick_gemm_half_q_half_gptq_kernel(
     bool first_block, const int m_count, const int bit) {
 #define SELECT_KERNEL(M_COUNT)                                             \
@@ -836,6 +963,39 @@ void gemm_half_q_half_cuda_part(const half* a, const uint32_t* b_q_weight,
   kernel<<<gridDim, blockDim, 0, stream>>>(
       a, b_q_weight, b_gptq_qzeros, b_gptq_scales, c, size_m, size_n, size_k,
       groups, use_v2_format, b_q_perm);
+}
+
+void gemm_half_q_half_repacked_w8_cuda(
+    const half* a, const uint32_t* b_q_weight,
+    const uint32_t* b_gptq_qzeros, const half* b_gptq_scales, half* c,
+    int size_m, int size_n, int size_k, int groups, bool use_v2_format) {
+  dim3 blockDim, gridDim;
+  blockDim.x = BLOCK_KN_SIZE;
+  blockDim.y = 1;
+  blockDim.z = 1;
+  gridDim.x = DIVIDE(size_n, BLOCK_KN_SIZE * 4);
+  gridDim.y = 1;
+  gridDim.z = DIVIDE(size_k, BLOCK_KN_SIZE);
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+#define LAUNCH_REPACKED_W8(M_COUNT)                                         \
+  if (size_m == M_COUNT) {                                                  \
+    gemm_half_q_half_gptq_8bit_repacked_kernel<M_COUNT>                     \
+        <<<gridDim, blockDim, 0, stream>>>(a, b_q_weight, b_gptq_qzeros,     \
+                                           b_gptq_scales, c, size_m, size_n, \
+                                           size_k, groups, use_v2_format);   \
+    return;                                                                 \
+  }
+
+  LAUNCH_REPACKED_W8(1);
+  LAUNCH_REPACKED_W8(2);
+  LAUNCH_REPACKED_W8(3);
+  LAUNCH_REPACKED_W8(4);
+  LAUNCH_REPACKED_W8(5);
+  LAUNCH_REPACKED_W8(6);
+  LAUNCH_REPACKED_W8(7);
+  LAUNCH_REPACKED_W8(8);
+#undef LAUNCH_REPACKED_W8
 }
 
 __global__ void reconstruct_exllama_8bit_kernel(
@@ -1955,4 +2115,43 @@ void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit) {
           ? NULL
           : (int*)q_perm.data_ptr(),
       q_weight.size(0) * 32 / bit, q_weight.size(1), bit);
+}
+
+torch::Tensor gptq_w8a16_repacked_gemm(torch::Tensor a,
+                                       torch::Tensor b_q_weight,
+                                       torch::Tensor b_gptq_qzeros,
+                                       torch::Tensor b_gptq_scales,
+                                       bool use_v2_format) {
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
+  TORCH_CHECK(a.scalar_type() == at::kHalf,
+              "gptq_w8a16_repacked_gemm only supports FP16 activations");
+  TORCH_CHECK(a.dim() == 2, "expected 2D activation tensor");
+  TORCH_CHECK(b_q_weight.dim() == 2, "expected 2D repacked qweight tensor");
+  TORCH_CHECK(a.size(0) >= 1 && a.size(0) <= BLOCK_M_SIZE_MAX,
+              "gptq_w8a16_repacked_gemm only supports M in [1, 8]");
+  TORCH_CHECK(a.size(1) == b_q_weight.size(0),
+              "activation K must match repacked qweight K");
+
+  const int64_t size_m = a.size(0);
+  const int64_t size_k = a.size(1);
+  const int64_t size_n = b_q_weight.size(1) * 4;
+  const int64_t groups = b_gptq_qzeros.size(0);
+  TORCH_CHECK(size_k % groups == 0, "K must be divisible by GPTQ group count");
+  TORCH_CHECK((size_k / groups) % 32 == 0,
+              "GPTQ group size must be a multiple of 32");
+  TORCH_CHECK(b_gptq_qzeros.size(1) == b_q_weight.size(1),
+              "qzeros packed-N dimension must match repacked qweight");
+  TORCH_CHECK(b_gptq_scales.size(0) == groups &&
+                  b_gptq_scales.size(1) == size_n,
+              "scales shape must be [groups, N]");
+
+  auto options = torch::TensorOptions().dtype(a.dtype()).device(a.device());
+  at::Tensor c = torch::zeros({size_m, size_n}, options);
+
+  vllm::gptq::gemm_half_q_half_repacked_w8_cuda(
+      (const half*)a.data_ptr(), (const uint32_t*)b_q_weight.data_ptr(),
+      (const uint32_t*)b_gptq_qzeros.data_ptr(),
+      (const half*)b_gptq_scales.data_ptr(), (half*)c.data_ptr(), size_m,
+      size_n, size_k, groups, use_v2_format);
+  return c;
 }

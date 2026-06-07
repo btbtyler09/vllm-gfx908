@@ -240,6 +240,12 @@ torch::Tensor gptq_gemm(torch::Tensor a, torch::Tensor b_q_weight,
                         torch::Tensor b_gptq_scales, torch::Tensor b_g_idx,
                         bool use_exllama, bool use_v2_format, int64_t bit);
 
+torch::Tensor gptq_w8a16_repacked_gemm(torch::Tensor a,
+                                       torch::Tensor b_q_weight,
+                                       torch::Tensor b_gptq_qzeros,
+                                       torch::Tensor b_gptq_scales,
+                                       bool use_v2_format);
+
 void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit);
 
 void static_scaled_fp8_quant(
