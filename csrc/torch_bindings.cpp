@@ -418,6 +418,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "-> Tensor");
   ops.impl("gptq_gemm", torch::kCUDA, &gptq_gemm);
 
+  ops.def(
+      "gptq_w8a16_repacked_gemm(Tensor a, Tensor b_q_weight, "
+      "Tensor b_gptq_qzeros, Tensor b_gptq_scales, bool use_v2_format) "
+      "-> Tensor");
+  ops.impl("gptq_w8a16_repacked_gemm", torch::kCUDA,
+           &gptq_w8a16_repacked_gemm);
+
   // Post processing for GPTQ.
   ops.def("gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");
   ops.impl("gptq_shuffle", torch::kCUDA, &gptq_shuffle);

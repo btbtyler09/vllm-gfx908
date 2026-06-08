@@ -421,10 +421,16 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
         hidden_states: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        spec_step_idx: int = 0,
         **kwargs: object,
     ):
         hidden_states = self.model(
-            input_ids, positions, hidden_states, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            spec_step_idx,
         )
         return hidden_states
 
@@ -434,6 +440,13 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Vocab-parallel argmax without gathering full logits."""
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names(weights):

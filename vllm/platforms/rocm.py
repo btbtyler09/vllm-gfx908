@@ -532,6 +532,34 @@ class RocmPlatform(Platform):
         device_capability = cls.get_device_capability()
         assert device_capability is not None
 
+        if (
+            isinstance(attn_selector_config.kv_cache_dtype, str)
+            and attn_selector_config.kv_cache_dtype.startswith("turboquant_")
+        ):
+            tq_backend = AttentionBackendEnum.TURBOQUANT
+            if selected_backend is not None and selected_backend != tq_backend:
+                raise ValueError(
+                    f"TurboQuant KV cache requires the {tq_backend.name} "
+                    f"attention backend, but {selected_backend.name} was "
+                    f"selected."
+                )
+            backend_class = tq_backend.get_class()
+            invalid_reasons = backend_class.validate_configuration(
+                device_capability=device_capability,
+                **attn_selector_config._asdict(),
+            )
+            if invalid_reasons:
+                raise ValueError(
+                    f"TurboQuant KV cache requires the {tq_backend.name} "
+                    f"attention backend, but it is not valid for this "
+                    f"configuration. Reason: {invalid_reasons}"
+                )
+            logger.info_once(
+                "Using %s backend for TurboQuant KV cache.",
+                tq_backend.name,
+            )
+            return tq_backend.get_path()
+
         # First try checking just the selected backend, if there is one.
         if selected_backend is not None:
             try:
@@ -859,6 +887,31 @@ class RocmPlatform(Platform):
                         "Set VLLM_MI100_TORCH_COMPILE=1 to override."
                     )
                     compilation_config.mode = CompilationMode.NONE
+
+            speculative_config = vllm_config.speculative_config
+            if (
+                speculative_config is not None
+                and speculative_config.method == "mtp"
+            ):
+                torch_nccl_blocking_wait = os.environ.get(
+                    "TORCH_NCCL_BLOCKING_WAIT"
+                )
+                if torch_nccl_blocking_wait is None:
+                    os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"
+                    logger.info_once(
+                        "gfx908 (MI100): setting TORCH_NCCL_BLOCKING_WAIT=1 "
+                        "for MTP CUDA graph capture. PyTorch's NCCL watchdog "
+                        "queries HIP events recorded in a capturing stream and "
+                        "can abort with hipErrorCapturedEvent."
+                    )
+                elif torch_nccl_blocking_wait != "1":
+                    logger.warning_once(
+                        "gfx908 (MI100): MTP CUDA graph capture may fail "
+                        "because TORCH_NCCL_BLOCKING_WAIT=%r. Set it to 1 to "
+                        "avoid ProcessGroupNCCL watchdog HIP-event queries "
+                        "during capture.",
+                        torch_nccl_blocking_wait,
+                    )
 
         if compilation_config.cudagraph_mode.has_full_cudagraphs():
             # decode context parallel does not support full cudagraphs

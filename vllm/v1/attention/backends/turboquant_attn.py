@@ -18,6 +18,7 @@ Per-head per-position slot layout:
 
 import functools
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -26,6 +27,7 @@ import torch.nn.functional as F
 
 from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
+from vllm.logger import init_logger
 from vllm.triton_utils import triton
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -54,12 +56,21 @@ _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
 if _HAS_FLASH_ATTN:
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 
+logger = init_logger(__name__)
+
 # Continuation prefill: for small continuation chunks (q_len ≤ threshold),
 # use the TQ decode kernel directly instead of full-dequant + flash_attn.
 # do_kv_cache_update already stored all tokens to TQ cache, so the decode
 # kernel can read them efficiently. This avoids O(cached_len) dequant work
 # per continuation, eliminating the O(N²/chunk_size) collapse at long context.
 _CONTINUATION_DECODE_THRESHOLD = 128
+_P67_MULTI_QUERY_ENABLED = os.environ.get(
+    "GENESIS_ENABLE_P67_TQ_MULTI_QUERY_KERNEL", ""
+).strip().lower() in ("1", "true", "yes", "on")
+_P67_GROUPED_KERNEL_ENABLED = os.environ.get(
+    "GENESIS_P67_USE_GROUPED_TQ_DECODE", ""
+).strip().lower() in ("1", "true", "yes", "on")
+_P67_MAX_K_PLUS_1 = int(os.environ.get("GENESIS_P67_MAX_K_PLUS_1", "16"))
 
 
 def _build_hadamard(d: int, device_str: str) -> torch.Tensor:
@@ -174,6 +185,8 @@ class TurboQuantMetadata(AttentionMetadata):
     slot_mapping: torch.Tensor  # (num_tokens,) — cache slot for each token
     block_table: torch.Tensor  # (num_reqs, max_num_blocks)
     query_start_loc: torch.Tensor  # (num_reqs + 1,) — cu_seqlens for queries
+    seq_lens_cpu: torch.Tensor | None = None
+    query_start_loc_cpu: torch.Tensor | None = None
     num_actual_tokens: int = 0  # actual tokens (excluding padding)
     max_query_len: int = 0  # longest query in batch
     max_seq_len: int = 0  # longest context in batch
@@ -198,6 +211,8 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
         # Set seq_lens to 1 so CUDA graph capture is fast
         # (real seq_lens are filled at replay time).
         attn_metadata.seq_lens.fill_(1)
+        if attn_metadata.seq_lens_cpu is not None:
+            attn_metadata.seq_lens_cpu.fill_(1)
         return attn_metadata
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
@@ -211,12 +226,17 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
         num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
             cam, decode_threshold=self.reorder_batch_threshold
         )
+        seq_lens_cpu = cam.seq_lens_cpu_upper_bound
+        if seq_lens_cpu is None:
+            seq_lens_cpu = cam.seq_lens.detach().cpu()
 
         return TurboQuantMetadata(
             seq_lens=cam.seq_lens,
             slot_mapping=cam.slot_mapping,
             block_table=cam.block_table_tensor,
             query_start_loc=cam.query_start_loc,
+            seq_lens_cpu=seq_lens_cpu,
+            query_start_loc_cpu=cam.query_start_loc_cpu,
             num_actual_tokens=cam.num_actual_tokens,
             max_query_len=cam.max_query_len,
             max_seq_len=cam.max_seq_len,
@@ -280,6 +300,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         vllm_config = get_current_vllm_config()
         self.max_num_kv_splits = (
             vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
+        )
+        speculative_config = vllm_config.speculative_config
+        self._p67_expected_k_plus_1 = (
+            speculative_config.num_speculative_tokens + 1
+            if speculative_config is not None
+            else 0
+        )
+        self._p67_multi_query_enabled = (
+            _P67_MULTI_QUERY_ENABLED and self._p67_expected_k_plus_1 > 1
         )
 
     def _flash_attn_varlen(
@@ -446,6 +475,16 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 slot_mapping=attn_metadata.slot_mapping[:num_decode_tokens],
                 block_table=attn_metadata.block_table[:num_decodes],
                 query_start_loc=attn_metadata.query_start_loc[: num_decodes + 1],
+                seq_lens_cpu=(
+                    attn_metadata.seq_lens_cpu[:num_decodes]
+                    if attn_metadata.seq_lens_cpu is not None
+                    else None
+                ),
+                query_start_loc_cpu=(
+                    attn_metadata.query_start_loc_cpu[: num_decodes + 1]
+                    if attn_metadata.query_start_loc_cpu is not None
+                    else None
+                ),
                 num_actual_tokens=num_decode_tokens,
                 max_query_len=1,
                 max_seq_len=attn_metadata.max_seq_len,
@@ -461,16 +500,32 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             # first-chunk prefills. Using full-batch max_seq_len breaks
             # this because decode requests inflate max_seq_len.
             prefill_seq_lens = attn_metadata.seq_lens[num_decodes:]
-            # Use CPU-side max to avoid GPU→CPU sync from .item()
-            prefill_max_seq = max(attn_metadata.seq_lens[num_decodes:].tolist())
+            prefill_seq_lens_cpu = (
+                attn_metadata.seq_lens_cpu[num_decodes:]
+                if attn_metadata.seq_lens_cpu is not None
+                else None
+            )
+            # Use CPU-side max to avoid GPU->CPU sync inside graph capture.
+            prefill_max_seq = (
+                int(prefill_seq_lens_cpu.max().item())
+                if prefill_seq_lens_cpu is not None
+                else max(attn_metadata.seq_lens[num_decodes:].tolist())
+            )
             prefill_qsl = (
                 attn_metadata.query_start_loc[num_decodes:] - num_decode_tokens
+            )
+            prefill_qsl_cpu = (
+                attn_metadata.query_start_loc_cpu[num_decodes:] - num_decode_tokens
+                if attn_metadata.query_start_loc_cpu is not None
+                else None
             )
             prefill_meta = TurboQuantMetadata(
                 seq_lens=prefill_seq_lens,
                 slot_mapping=attn_metadata.slot_mapping[num_decode_tokens:N],
                 block_table=attn_metadata.block_table[num_decodes:],
                 query_start_loc=prefill_qsl,
+                seq_lens_cpu=prefill_seq_lens_cpu,
+                query_start_loc_cpu=prefill_qsl_cpu,
                 num_actual_tokens=N - num_decode_tokens,
                 max_query_len=attn_metadata.max_query_len,
                 max_seq_len=prefill_max_seq,
@@ -560,15 +615,41 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # chunk's raw K/V.
         Hk = key.shape[1]
         use_gqa = Hk < Hq
-        query_start_loc = attn_metadata.query_start_loc
-        num_reqs = query_start_loc.shape[0] - 1
+        query_start_loc_cpu = attn_metadata.query_start_loc_cpu
+        seq_lens_cpu = attn_metadata.seq_lens_cpu
 
         output = torch.zeros(N, Hq, D, device=query.device, dtype=query.dtype)
 
-        # Convert to Python lists once (single CPU-GPU sync) instead of
-        # per-request .item() calls that each force a sync.
-        qsl = query_start_loc.tolist()
-        seq_lens_list = attn_metadata.seq_lens.tolist()
+        # Convert CPU scheduler metadata to Python lists. Doing .tolist() on
+        # device tensors here breaks CUDA graph capture on ROCm.
+        qsl = (
+            query_start_loc_cpu.tolist()
+            if query_start_loc_cpu is not None
+            else attn_metadata.query_start_loc.tolist()
+        )
+        seq_lens_list = (
+            seq_lens_cpu.tolist()
+            if seq_lens_cpu is not None
+            else attn_metadata.seq_lens.tolist()
+        )
+        num_reqs = len(qsl) - 1
+
+        if self._p67_multi_query_enabled:
+            p67_out = self._p67_multi_query_verify(
+                query=query,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                Pi=Pi,
+                centroids=centroids,
+                PiT=PiT,
+                layer=layer,
+                qsl=qsl,
+                seq_lens_list=seq_lens_list,
+                num_reqs=num_reqs,
+                num_tokens=N,
+            )
+            if p67_out is not None:
+                return p67_out
 
         # Pre-allocate cu_seqlens for single-request flash_attn calls
         # to avoid per-request host→device tensor creation.
@@ -662,6 +743,110 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 output[q_start:q_end] = out.to(query.dtype)
 
         return output
+
+    def _p67_multi_query_verify(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TurboQuantMetadata,
+        Pi: torch.Tensor,
+        centroids: torch.Tensor,
+        PiT: torch.Tensor | None,
+        layer: Any,
+        qsl: list[int],
+        seq_lens_list: list[int],
+        num_reqs: int,
+        num_tokens: int,
+    ) -> torch.Tensor | None:
+        """Batch MTP K+1 verifier rows through one TQ decode launch.
+
+        This preserves the existing verifier numerics: each drafted token is
+        still evaluated as an independent decode row with its own synthetic
+        sequence length. P67 only concatenates those rows across requests so
+        we avoid launching the same decode kernels once per request.
+        """
+        k_plus_1 = attn_metadata.max_query_len
+        if (
+            k_plus_1 != self._p67_expected_k_plus_1
+            or k_plus_1 > min(_CONTINUATION_DECODE_THRESHOLD, _P67_MAX_K_PLUS_1)
+            or attn_metadata.max_seq_len <= k_plus_1
+            or num_reqs <= 0
+            or num_tokens != num_reqs * k_plus_1
+            or attn_metadata.block_table.shape[0] < num_reqs
+        ):
+            return None
+
+        capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        if not capturing:
+            if len(qsl) != num_reqs + 1:
+                return None
+            for i in range(num_reqs):
+                if qsl[i] != i * k_plus_1 or qsl[i + 1] - qsl[i] != k_plus_1:
+                    return None
+                if seq_lens_list[i] <= k_plus_1:
+                    return None
+
+        try:
+            if not _P67_GROUPED_KERNEL_ENABLED:
+                seq_lens = attn_metadata.seq_lens[:num_reqs].view(num_reqs, 1)
+                offsets = torch.arange(
+                    0,
+                    k_plus_1,
+                    device=query.device,
+                    dtype=seq_lens.dtype,
+                ).view(1, k_plus_1)
+                synth_seq_lens = (seq_lens - k_plus_1 + 1 + offsets).reshape(-1)
+                # Cudagraph capture metadata can carry tiny dummy seq_lens. Clamp
+                # only protects the warmup/capture execution; real verifier batches
+                # have seq_len >= K+1, so their values are unchanged.
+                synth_seq_lens = synth_seq_lens.clamp_min(1).contiguous()
+                synth_block_table = attn_metadata.block_table[
+                    :num_reqs
+                ].repeat_interleave(k_plus_1, dim=0)
+                query_group_size = 1
+            else:
+                synth_seq_lens = attn_metadata.seq_lens[:num_reqs]
+                synth_block_table = attn_metadata.block_table[:num_reqs]
+                query_group_size = k_plus_1
+
+            mid_o_buf = output_buf = lse_buf = None
+            if layer is not None:
+                mid_o_buf = getattr(layer, "_tq_mid_o_buf", None)
+                output_buf = getattr(layer, "_tq_output_buf", None)
+                lse_buf = getattr(layer, "_tq_lse_buf", None)
+
+            return triton_turboquant_decode_attention(
+                query=query,
+                kv_cache=kv_cache,
+                block_table=synth_block_table,
+                seq_lens=synth_seq_lens,
+                Pi=Pi,
+                centroids=centroids,
+                scale=self.scale,
+                mse_bits=self.tq_config.key_mse_bits,
+                key_packed_size=self.tq_config.key_packed_size,
+                value_quant_bits=self.tq_config.effective_value_quant_bits,
+                key_fp8=self.tq_config.key_fp8,
+                norm_correction=self.tq_config.norm_correction,
+                PiT=PiT,
+                mid_o_buf=mid_o_buf,
+                output_buf=output_buf,
+                lse_buf=lse_buf,
+                buf_holder=layer,
+                max_num_kv_splits=self.max_num_kv_splits,
+                query_group_size=query_group_size,
+            )
+        except Exception:
+            if not getattr(self, "_p67_fallback_warned", False):
+                self._p67_fallback_warned = True
+                logger.warning(
+                    "P67 TurboQuant multi-query verifier failed; falling "
+                    "back to per-request verifier.",
+                    exc_info=True,
+                )
+            return None
 
     def _continuation_prefill(
         self,

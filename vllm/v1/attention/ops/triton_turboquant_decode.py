@@ -83,15 +83,21 @@ def _tq_decode_stage1(
     KEY_FP8: tl.constexpr,  # 1 if K is stored as FP8
     NORM_CORRECTION: tl.constexpr = 0,  # 1 = re-normalize centroids
     FP8_E4B15: tl.constexpr = 0,  # 1 = use e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
+    QUERY_GROUP_SIZE: tl.constexpr = 1,  # K+1 verifier rows per source request
 ):
-    bid = tl.program_id(0)  # batch index
+    bid = tl.program_id(0)  # query-row batch index
     hid = tl.program_id(1)  # q_head index
     sid = tl.program_id(2)  # kv_split index
 
     kv_head = hid // KV_GROUP_SIZE
+    req_bid = bid // QUERY_GROUP_SIZE
+    query_offset = bid - req_bid * QUERY_GROUP_SIZE
 
     # Sequence length for this batch
-    seq_len = tl.load(Seq_lens_ptr + bid)
+    seq_len = tl.load(Seq_lens_ptr + req_bid)
+    if QUERY_GROUP_SIZE > 1:
+        seq_len = seq_len - QUERY_GROUP_SIZE + 1 + query_offset
+        seq_len = tl.maximum(seq_len, 1)
 
     # KV split range
     split_len = tl.cdiv(seq_len, NUM_KV_SPLITS)
@@ -128,7 +134,7 @@ def _tq_decode_stage1(
     l_prev = 0.0
     acc = tl.zeros([BLOCK_D], dtype=tl.float32)
 
-    bt_base = bid * stride_bt_b
+    bt_base = req_bid * stride_bt_b
 
     # ================================================================
     # TILED LOOP: process BLOCK_KV tokens per iteration
@@ -459,6 +465,80 @@ def _tq_full_dequant_kv(
 # Stage 2: Reuse from triton_decode_attention.py
 # ---------------------------------------------------------------------------
 
+
+@triton.jit
+def _tq_decode_stage2_grouped(
+    Mid_O,
+    o,
+    lse,
+    B_Seqlen,
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    stride_obs,
+    stride_oh,
+    stride_lse_bs,
+    NUM_KV_SPLITS: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    Lv: tl.constexpr,
+    QUERY_GROUP_SIZE: tl.constexpr,
+):
+    cur_batch = tl.program_id(0)
+    cur_head = tl.program_id(1)
+
+    req_bid = cur_batch // QUERY_GROUP_SIZE
+    query_offset = cur_batch - req_bid * QUERY_GROUP_SIZE
+    cur_batch_seq_len = tl.load(B_Seqlen + req_bid)
+    cur_batch_seq_len = (
+        cur_batch_seq_len - QUERY_GROUP_SIZE + 1 + query_offset
+    )
+    cur_batch_seq_len = tl.maximum(cur_batch_seq_len, 1)
+
+    offs_d = tl.arange(0, BLOCK_DV)
+    mask_d = offs_d < Lv
+
+    e_sum = 0.0
+    e_max = -float("inf")
+    acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
+
+    offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
+    offs_logic = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + Lv
+
+    for split_kv_id in range(0, NUM_KV_SPLITS):
+        kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
+        split_kv_start = kv_len_per_split * split_kv_id
+        split_kv_end = tl.minimum(
+            split_kv_start + kv_len_per_split, cur_batch_seq_len
+        )
+
+        if split_kv_end > split_kv_start:
+            tv = tl.load(
+                Mid_O + offs_v + split_kv_id * stride_mid_os,
+                mask=mask_d,
+                other=0.0,
+            )
+            tlogic = tl.load(Mid_O + offs_logic + split_kv_id * stride_mid_os)
+            n_e_max = tl.maximum(tlogic, e_max)
+
+            old_scale = tl.exp(e_max - n_e_max)
+            acc *= old_scale
+            exp_logic = tl.exp(tlogic - n_e_max)
+            acc += exp_logic * tv
+
+            e_sum = e_sum * old_scale + exp_logic
+            e_max = n_e_max
+
+    tl.store(
+        o + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
+        acc / e_sum,
+        mask=mask_d,
+    )
+    lse_val = e_max + tl.log(e_sum)
+    tl.store(
+        lse + cur_batch * stride_lse_bs + cur_head,
+        lse_val,
+    )
+
 # ---------------------------------------------------------------------------
 # Launcher — cached constants + fused GEMM
 # ---------------------------------------------------------------------------
@@ -503,6 +583,7 @@ def triton_turboquant_decode_attention(
     lse_buf: torch.Tensor | None = None,
     buf_holder: Any = None,
     max_num_kv_splits: int = 32,  # fixed split count (must be constant for cudagraph)
+    query_group_size: int = 1,  # K+1 verifier rows per source request
 ) -> torch.Tensor:
     """Launch fused TQ decode attention (Triton stage1 + stage2).
 
@@ -583,6 +664,7 @@ def triton_turboquant_decode_attention(
         KEY_FP8=1 if key_fp8 else 0,
         NORM_CORRECTION=1 if norm_correction else 0,
         FP8_E4B15=fp8_e4b15,
+        QUERY_GROUP_SIZE=query_group_size,
         num_warps=1,
         num_stages=1,
     )
@@ -602,22 +684,42 @@ def triton_turboquant_decode_attention(
             buf_holder._tq_lse_buf = lse
 
     grid2 = (B, Hq)
-    _fwd_kernel_stage2[grid2](
-        mid_o,
-        output,
-        lse,
-        seq_lens,
-        mid_o.stride(0),
-        mid_o.stride(1),
-        mid_o.stride(2),
-        output.stride(0),
-        output.stride(1),
-        lse.stride(0),
-        NUM_KV_SPLITS=NUM_KV_SPLITS,
-        BLOCK_DV=cfg["BLOCK_D"],
-        Lv=D,
-        num_warps=4,
-        num_stages=2,
-    )
+    if query_group_size == 1:
+        _fwd_kernel_stage2[grid2](
+            mid_o,
+            output,
+            lse,
+            seq_lens,
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_o.stride(2),
+            output.stride(0),
+            output.stride(1),
+            lse.stride(0),
+            NUM_KV_SPLITS=NUM_KV_SPLITS,
+            BLOCK_DV=cfg["BLOCK_D"],
+            Lv=D,
+            num_warps=4,
+            num_stages=2,
+        )
+    else:
+        _tq_decode_stage2_grouped[grid2](
+            mid_o,
+            output,
+            lse,
+            seq_lens,
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_o.stride(2),
+            output.stride(0),
+            output.stride(1),
+            lse.stride(0),
+            NUM_KV_SPLITS=NUM_KV_SPLITS,
+            BLOCK_DV=cfg["BLOCK_D"],
+            Lv=D,
+            QUERY_GROUP_SIZE=query_group_size,
+            num_warps=4,
+            num_stages=2,
+        )
 
     return output.to(query.dtype)

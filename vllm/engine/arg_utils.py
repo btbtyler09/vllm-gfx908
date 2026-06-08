@@ -6,6 +6,7 @@ import copy
 import dataclasses
 import functools
 import json
+import os
 import sys
 from collections.abc import Callable
 from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass
@@ -1669,22 +1670,48 @@ class EngineArgs:
             kv_offloading_backend=self.kv_offloading_backend,
         )
 
-        # TurboQuant: auto-skip first/last 2 layers (boundary protection).
-        # These layers are most sensitive to quantization error.
+        # TurboQuant: auto-skip first/last 2 full-attention layers (boundary
+        # protection). These layers are most sensitive to quantization error.
         # Users can add extra layers via --kv-cache-dtype-skip-layers.
         if resolved_cache_dtype.startswith("turboquant_"):
-            if model_config.is_hybrid:
+            disable_boundary_skip = (
+                os.environ.get("VLLM_TURBOQUANT_DISABLE_BOUNDARY_SKIP", "0") == "1"
+            )
+            layer_types = getattr(model_config.hf_text_config, "layer_types", None)
+            full_attention_layers: list[str] | None = None
+            if layer_types is not None:
+                full_attention_layers = [
+                    str(layer_idx)
+                    for layer_idx, layer_type in enumerate(layer_types)
+                    if layer_type == "full_attention"
+                ]
+            if (
+                model_config.is_hybrid
+                and not disable_boundary_skip
+                and not full_attention_layers
+            ):
                 raise NotImplementedError(
                     "TurboQuant KV cache is not supported for hybrid "
                     "(attention + Mamba) models. Boundary layer protection "
-                    "requires uniform attention layers."
+                    "requires explicit full-attention layer_types."
                 )
             from vllm.model_executor.layers.quantization.turboquant.config import (
                 TurboQuantConfig,
             )
 
             num_layers = model_config.hf_text_config.num_hidden_layers
-            boundary = TurboQuantConfig.get_boundary_skip_layers(num_layers)
+            if disable_boundary_skip:
+                boundary = []
+                logger.warning(
+                    "TQ: boundary layer skip disabled by "
+                    "VLLM_TURBOQUANT_DISABLE_BOUNDARY_SKIP=1"
+                )
+            elif full_attention_layers is None:
+                boundary = TurboQuantConfig.get_boundary_skip_layers(num_layers)
+            else:
+                boundary = (
+                    full_attention_layers[:2] + full_attention_layers[-2:]
+                )
             existing = set(cache_config.kv_cache_dtype_skip_layers)
             merged = sorted(existing | set(boundary), key=lambda x: int(x))
             cache_config.kv_cache_dtype_skip_layers = merged

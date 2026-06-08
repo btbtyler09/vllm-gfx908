@@ -232,10 +232,14 @@ class SpecDecodeBaseProposer:
                 ROCMAiterMLASparseMetadata,
             )
             from vllm.v1.attention.backends.rocm_attn import RocmAttentionMetadata
+            from vllm.v1.attention.backends.turboquant_attn import (
+                TurboQuantMetadata,
+            )
 
             rocm_types = [
                 TritonAttentionMetadata,
                 RocmAttentionMetadata,
+                TurboQuantMetadata,
                 ROCMAiterMLASparseMetadata,
                 DeepseekV32IndexerMetadata,
             ]
@@ -395,11 +399,17 @@ class SpecDecodeBaseProposer:
 
         self.cudagraph_dispatcher.initialize_cudagraph_keys(eagle_cudagraph_mode)
 
-    def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _greedy_sample(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
         """Greedy-sample draft tokens from hidden states."""
         if self.use_local_argmax_reduction:
             return self.model.get_top_tokens(hidden_states)
-        return self.model.compute_logits(hidden_states).argmax(dim=-1)
+        return self.model.compute_logits(
+            hidden_states, spec_step_idx=spec_step_idx
+        ).argmax(dim=-1)
 
     def propose(
         self,
@@ -481,7 +491,9 @@ class SpecDecodeBaseProposer:
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
-            draft_token_ids = self._greedy_sample(sample_hidden_states)
+            draft_token_ids = self._greedy_sample(
+                sample_hidden_states, spec_step_idx=0
+            )
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.uses_mrope:
@@ -492,7 +504,9 @@ class SpecDecodeBaseProposer:
 
         if any(isinstance(md, TreeAttentionMetadata) for md in per_group_attn_metadata):
             # Draft using tree attention - requires full logits for top-k
-            logits = self.model.compute_logits(sample_hidden_states)
+            logits = self.model.compute_logits(
+                sample_hidden_states, spec_step_idx=0
+            )
             draft_token_ids_list = self.propose_tree(
                 batch_size=batch_size,
                 logits=logits,
@@ -504,7 +518,7 @@ class SpecDecodeBaseProposer:
             # [batch_size, num_tree_tokens]
             return torch.cat(draft_token_ids_list, dim=1)
 
-        draft_token_ids = self._greedy_sample(sample_hidden_states)
+        draft_token_ids = self._greedy_sample(sample_hidden_states, spec_step_idx=0)
 
         if self.allowed_attn_types is not None:
             for group_md in per_group_attn_metadata:
@@ -618,6 +632,7 @@ class SpecDecodeBaseProposer:
                 "input_ids": input_ids,
                 "positions": self._get_positions(input_batch_size),
                 "inputs_embeds": inputs_embeds,
+                "spec_step_idx": token_index + 1,
             }
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
@@ -638,7 +653,9 @@ class SpecDecodeBaseProposer:
                     last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states[:batch_size]
-            draft_token_ids = self._greedy_sample(last_hidden_states[:batch_size])
+            draft_token_ids = self._greedy_sample(
+                last_hidden_states[:batch_size], spec_step_idx=token_index + 1
+            )
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]
@@ -1120,6 +1137,7 @@ class SpecDecodeBaseProposer:
                     positions=self.positions[:num_input_tokens],
                     hidden_states=self.hidden_states[:num_input_tokens],
                     inputs_embeds=None,
+                    spec_step_idx=level + 1,
                 )
 
             # Get the output hidden states for the draft tokens.
@@ -1132,7 +1150,8 @@ class SpecDecodeBaseProposer:
 
             # Get the output logits for the draft tokens.
             logits = self.model.compute_logits(
-                draft_last_hidden_states.reshape(batch_size * level_num_drafts, -1)
+                draft_last_hidden_states.reshape(batch_size * level_num_drafts, -1),
+                spec_step_idx=level + 1,
             )
 
             # Sample a draft token for each child at the next tree level.

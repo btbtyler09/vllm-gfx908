@@ -725,6 +725,22 @@ def gptq_gemm(
     )
 
 
+def gptq_w8a16_repacked_gemm(
+    a: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_gptq_qzeros: torch.Tensor,
+    b_gptq_scales: torch.Tensor,
+    use_v2_format: bool,
+) -> torch.Tensor:
+    return torch.ops._C.gptq_w8a16_repacked_gemm(
+        a,
+        b_q_weight,
+        b_gptq_qzeros,
+        b_gptq_scales,
+        use_v2_format,
+    )
+
+
 if hasattr(torch.ops._C, "gptq_gemm"):
 
     @register_fake("_C::gptq_gemm")
@@ -740,6 +756,21 @@ if hasattr(torch.ops._C, "gptq_gemm"):
     ) -> torch.Tensor:
         return torch.empty(
             (a.size(0), b_q_weight.size(1)), dtype=a.dtype, device=a.device
+        )
+
+
+if hasattr(torch.ops._C, "gptq_w8a16_repacked_gemm"):
+
+    @register_fake("_C::gptq_w8a16_repacked_gemm")
+    def _gptq_w8a16_repacked_gemm_fake(
+        a: torch.Tensor,
+        b_q_weight: torch.Tensor,
+        b_gptq_qzeros: torch.Tensor,
+        b_gptq_scales: torch.Tensor,
+        use_v2_format: bool,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (a.size(0), b_q_weight.size(1) * 4), dtype=a.dtype, device=a.device
         )
 
 
