@@ -532,6 +532,34 @@ class RocmPlatform(Platform):
         device_capability = cls.get_device_capability()
         assert device_capability is not None
 
+        if (
+            isinstance(attn_selector_config.kv_cache_dtype, str)
+            and attn_selector_config.kv_cache_dtype.startswith("turboquant_")
+        ):
+            tq_backend = AttentionBackendEnum.TURBOQUANT
+            if selected_backend is not None and selected_backend != tq_backend:
+                raise ValueError(
+                    f"TurboQuant KV cache requires the {tq_backend.name} "
+                    f"attention backend, but {selected_backend.name} was "
+                    f"selected."
+                )
+            backend_class = tq_backend.get_class()
+            invalid_reasons = backend_class.validate_configuration(
+                device_capability=device_capability,
+                **attn_selector_config._asdict(),
+            )
+            if invalid_reasons:
+                raise ValueError(
+                    f"TurboQuant KV cache requires the {tq_backend.name} "
+                    f"attention backend, but it is not valid for this "
+                    f"configuration. Reason: {invalid_reasons}"
+                )
+            logger.info_once(
+                "Using %s backend for TurboQuant KV cache.",
+                tq_backend.name,
+            )
+            return tq_backend.get_path()
+
         # First try checking just the selected backend, if there is one.
         if selected_backend is not None:
             try:
