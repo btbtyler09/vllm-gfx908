@@ -232,10 +232,14 @@ class SpecDecodeBaseProposer:
                 ROCMAiterMLASparseMetadata,
             )
             from vllm.v1.attention.backends.rocm_attn import RocmAttentionMetadata
+            from vllm.v1.attention.backends.turboquant_attn import (
+                TurboQuantMetadata,
+            )
 
             rocm_types = [
                 TritonAttentionMetadata,
                 RocmAttentionMetadata,
+                TurboQuantMetadata,
                 ROCMAiterMLASparseMetadata,
                 DeepseekV32IndexerMetadata,
             ]
