@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -24,7 +25,10 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
     method_has_implemented_embedding,
 )
-from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
+from vllm.model_executor.layers.utils import (
+    bind_rocm_unquantized_gemm_gfx908,
+    dispatch_unquantized_gemm,
+)
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
@@ -63,6 +67,13 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
             dispatch_cpu_unquantized_gemm(layer, remove_weight=False)
+        elif current_platform.is_rocm():
+            from vllm.platforms.rocm import on_gfx908
+
+            # TEST lever: pre-bind only when opted in; default off keeps the
+            # baseline runtime-dispatch path (VLLM_GFX908_PREBIND_GEMM=1).
+            if on_gfx908() and os.environ.get("VLLM_GFX908_PREBIND_GEMM", "0") == "1":
+                bind_rocm_unquantized_gemm_gfx908(layer)
 
     def apply(
         self,
@@ -72,6 +83,8 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     ) -> torch.Tensor:
         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
+        if (op := getattr(layer, "_vllm_unquantized_gemm", None)) is not None:
+            return op(layer, x, layer.weight, bias)
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:

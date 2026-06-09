@@ -436,6 +436,44 @@ def rocm_unquantized_gemm_gfx908(
     return torch.ops.vllm.rocm_unquantized_gemm_gfx908(x, weight, bias)
 
 
+def _gfx908_weight_can_use_custom_gemm(weight: torch.Tensor) -> bool:
+    if weight.is_meta or weight.dim() != 2:
+        return True
+
+    m = weight.shape[0]
+    k = weight.shape[1]
+    dtype = weight.dtype
+
+    if dtype not in (torch.float16, torch.bfloat16):
+        return False
+    if k % 8 != 0 or not weight.is_contiguous():
+        return False
+
+    # LLMM1 can fire for n==1 with no bias. wvSplitK can fire for n<=4.
+    # Keep these potentially-fast shapes on the opaque custom op so compiled
+    # decode forwards still reach the runtime skinny-kernel dispatch.
+    if (m % 4 == 0 and k <= 8192) or m > 8:
+        return True
+
+    # AITER eligibility still depends on runtime n for the large-GEMM cutoff,
+    # but if n==1 can use it then this layer is a possible fast path.
+    return use_aiter_triton_gemm(1, m, k, dtype)
+
+
+def bind_rocm_unquantized_gemm_gfx908(layer: torch.nn.Module) -> None:
+    """Pre-bind the gfx908 unquantized GEMM route for a loaded layer.
+
+    The dynamic n>4 wrapper hoist regressed because it put shape conditionals
+    in the traced forward path. This binding keeps the decision static: layers
+    with no possible LLMM1/wvSplitK/AITER route use direct F.linear, while
+    possible fast-kernel layers keep the existing opaque custom op.
+    """
+    if _gfx908_weight_can_use_custom_gemm(layer.weight):
+        layer._vllm_unquantized_gemm = rocm_unquantized_gemm_gfx908
+    else:
+        layer._vllm_unquantized_gemm = default_unquantized_gemm
+
+
 direct_register_custom_op(
     op_name="rocm_unquantized_gemm_gfx908",
     op_func=rocm_unquantized_gemm_gfx908_impl,

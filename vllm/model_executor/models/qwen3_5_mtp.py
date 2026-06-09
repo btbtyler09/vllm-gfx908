@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3_5 MTP model."""
 
+import copy
 import typing
 from collections.abc import Callable, Iterable
 
@@ -62,6 +63,21 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
 
         model_config = vllm_config.model_config
         quant_config = vllm_config.quant_config
+
+        # The MTP draft layer is stored UNQUANTIZED in Qwen3.5/3.6 PTQ
+        # checkpoints (GPTQ/AWQ/NVFP4): quantizers skip the small draft layer to
+        # preserve acceptance, and do not reliably record the exclusion — e.g.
+        # the 35B-A3B GPTQ `dynamic` map omits `mtp.*`, so vLLM would otherwise
+        # build the MTP experts/linears quantized and fail to load the plain
+        # `mtp...experts.*.weight` tensors (KeyError: experts.w2_weight). Build
+        # the entire MTP layer unquantized to match the checkpoint. Generalizes
+        # the prior fc-only NVFP4 workaround (vllm-project/vllm#38650) to all PTQ
+        # formats and to the MoE (FusedMoE experts) path. The dense path already
+        # relies on these weights being unquantized; this just makes it explicit.
+        if quant_config is not None:
+            vllm_config = copy.copy(vllm_config)
+            vllm_config.quant_config = None
+            quant_config = None
 
         config: Qwen3_5TextConfig | Qwen3_5MoeTextConfig = model_config.hf_text_config
 
@@ -434,6 +450,13 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Vocab-parallel argmax without gathering full logits."""
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names(weights):

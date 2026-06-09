@@ -860,6 +860,54 @@ class RocmPlatform(Platform):
                     )
                     compilation_config.mode = CompilationMode.NONE
 
+        # MI100 (gfx908): MTP speculative decode needs two adjustments to run
+        # under CUDA graphs:
+        #   1. TORCH_NCCL_BLOCKING_WAIT=1 — PyTorch's NCCL watchdog queries HIP
+        #      events recorded in a capturing stream and can abort capture with
+        #      hipErrorCapturedEvent. Blocking-wait avoids the async query.
+        #   2. At num_speculative_tokens>=3 the deeper draft batch + a 27B-class
+        #      prefill overflow the cudagraph-captured token buffer at the
+        #      default budget and fault with an illegal memory access mid-serve.
+        #      Raising max_num_batched_tokens to >=8192 sizes the buffer for the
+        #      draft slots. n=1/2 are unaffected and left untouched. This runs
+        #      before the spec-decode budget derivation in VllmConfig, so the
+        #      bumped value propagates into max_num_scheduled_tokens.
+        if _ON_GFX908:
+            speculative_config = vllm_config.speculative_config
+            if (
+                speculative_config is not None
+                and getattr(speculative_config, "method", None) == "mtp"
+            ):
+                blocking_wait = os.environ.get("TORCH_NCCL_BLOCKING_WAIT")
+                if blocking_wait is None:
+                    os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"
+                    logger.info_once(
+                        "gfx908 (MI100): setting TORCH_NCCL_BLOCKING_WAIT=1 for "
+                        "MTP CUDA graph capture (avoids ProcessGroupNCCL "
+                        "watchdog HIP-event queries during capture)."
+                    )
+                elif blocking_wait != "1":
+                    logger.warning_once(
+                        "gfx908 (MI100): MTP CUDA graph capture may fail "
+                        "because TORCH_NCCL_BLOCKING_WAIT=%r. Set it to 1.",
+                        blocking_wait,
+                    )
+
+                n_spec = (
+                    getattr(speculative_config, "num_speculative_tokens", 0) or 0
+                )
+                scheduler_config = vllm_config.scheduler_config
+                if n_spec >= 3 and scheduler_config.max_num_batched_tokens < 8192:
+                    logger.info_once(
+                        "gfx908 (MI100): raising max_num_batched_tokens "
+                        "%d -> 8192 for MTP num_speculative_tokens=%d (deeper "
+                        "draft batch overflows the cudagraph-captured token "
+                        "buffer at the default budget and faults).",
+                        scheduler_config.max_num_batched_tokens,
+                        n_spec,
+                    )
+                    scheduler_config.max_num_batched_tokens = 8192
+
         if compilation_config.cudagraph_mode.has_full_cudagraphs():
             # decode context parallel does not support full cudagraphs
             if parallel_config.decode_context_parallel_size > 1:
