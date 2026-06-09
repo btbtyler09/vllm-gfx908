@@ -1,4 +1,8 @@
 # default base image
+# BASE_IMAGE (aiter-mi100:latest) is built from aiter/Dockerfile.mi100, whose
+# AITER source is published at https://github.com/btbtyler09/aiter-gfx908
+# (branch mi100-optimized). Build that base reproducibly with
+# `--build-arg AITER_FROM_GIT=1` before building this image.
 ARG REMOTE_VLLM="0"
 ARG COMMON_WORKDIR=/app
 ARG BASE_IMAGE=aiter-mi100:latest
