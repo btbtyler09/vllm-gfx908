@@ -139,9 +139,14 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
 
     if current_platform.is_rocm():
         from vllm._aiter_ops import rocm_aiter_ops
+        from vllm.platforms.rocm import on_gfx908
 
+        # gfx908: AITER's fused allreduce+rmsnorm CK kernels are gfx90a+ and
+        # the module never builds, so the fused op crashes at first dispatch.
         return (
-            rocm_aiter_ops.is_enabled() and cfg.parallel_config.tensor_parallel_size > 1
+            rocm_aiter_ops.is_enabled()
+            and cfg.parallel_config.tensor_parallel_size > 1
+            and not on_gfx908()
         )
 
     return (

@@ -11,8 +11,8 @@ ARG PYTORCH_AUDIO_REPO="https://github.com/pytorch/audio.git"
 # Upstream Dao-AILab FA does not support gfx908 (MI200+ only), so keep our fork.
 ARG FA_BRANCH="main"
 ARG FA_REPO="https://github.com/btbtyler09/flash-attention-gfx908.git"
-ARG AITER_BRANCH="59bd8ff2"
-ARG AITER_REPO="https://github.com/ROCm/aiter.git"
+ARG AITER_BRANCH="mi100-optimized"
+ARG AITER_REPO="https://github.com/btbtyler09/aiter-gfx908.git"
 
 FROM ${BASE_IMAGE} AS base
 
@@ -113,19 +113,10 @@ RUN cd flash-attention \
     && GPU_ARCHS=${PYTORCH_ROCM_ARCH} python3 setup.py bdist_wheel --dist-dir=dist
 RUN mkdir -p /app/install && cp /app/flash-attention/dist/*.whl /app/install
 
-# AITER does not support gfx908/MI100 - skipping for now
-# FROM base AS build_aiter
-# ARG AITER_BRANCH
-# ARG AITER_REPO
-# RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
-#     pip install /install/*.whl
-# RUN git clone --recursive ${AITER_REPO}
-# RUN cd aiter \
-#     && git checkout ${AITER_BRANCH} \
-#     && git submodule update --init --recursive \
-#     && pip install -r requirements.txt
-# RUN pip install pyyaml && cd aiter && PREBUILD_KERNELS=1 GPU_ARCHS=${AITER_ROCM_ARCH} python3 setup.py bdist_wheel --dist-dir=dist && ls /app/aiter/dist/*.whl
-# RUN mkdir -p /app/install && cp /app/aiter/dist/*.whl /app/install
+# AITER: gfx908 fork (https://github.com/btbtyler09/aiter-gfx908). No wheel
+# stage — CK kernels don't compile on gfx908, so we install editable with
+# PREBUILD_KERNELS=0 and rely on the Triton paths (JIT on first use). The
+# editable checkout must live in the final image for JIT to work.
 
 FROM base AS debs
 RUN mkdir /app/debs
@@ -137,13 +128,20 @@ RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
-# AITER skipped - not supported on gfx908
-# RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
-#     cp /install/*.whl /app/debs
 
 FROM base AS final
 RUN --mount=type=bind,from=debs,src=/app/debs,target=/install \
     pip install /install/*.whl
+
+# AITER gfx908 fork — editable install, CK JIT on first use (PREBUILD_KERNELS=0)
+ARG AITER_BRANCH
+ARG AITER_REPO
+ENV PREBUILD_KERNELS=0
+ENV GPU_ARCHS=gfx908
+RUN git clone --recursive "${AITER_REPO}" /workspace/aiter \
+    && cd /workspace/aiter && git checkout "${AITER_BRANCH}" \
+    && git submodule update --init --recursive \
+    && MAX_JOBS=8 pip install -e .
 
 ARG BASE_IMAGE
 ARG TRITON_BRANCH
@@ -156,8 +154,6 @@ ARG PYTORCH_VISION_REPO
 ARG PYTORCH_AUDIO_REPO
 ARG FA_BRANCH
 ARG FA_REPO
-# ARG AITER_BRANCH
-# ARG AITER_REPO
 RUN echo "BASE_IMAGE: ${BASE_IMAGE}" > /app/versions.txt \
     && echo "TRITON_BRANCH: ${TRITON_BRANCH}" >> /app/versions.txt \
     && echo "TRITON_REPO: ${TRITON_REPO}" >> /app/versions.txt \
@@ -169,4 +165,5 @@ RUN echo "BASE_IMAGE: ${BASE_IMAGE}" > /app/versions.txt \
     && echo "PYTORCH_AUDIO_REPO: ${PYTORCH_AUDIO_REPO}" >> /app/versions.txt \
     && echo "FA_BRANCH: ${FA_BRANCH}" >> /app/versions.txt \
     && echo "FA_REPO: ${FA_REPO}" >> /app/versions.txt \
-    && echo "AITER: SKIPPED (not supported on gfx908)" >> /app/versions.txt
+    && echo "AITER_BRANCH: ${AITER_BRANCH}" >> /app/versions.txt \
+    && echo "AITER_REPO: ${AITER_REPO}" >> /app/versions.txt
