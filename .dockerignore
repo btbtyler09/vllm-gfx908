@@ -2,6 +2,7 @@
 /build
 dist
 vllm/*.so
+vllm/vllm-rs
 
 # mi100-ops build artifacts (must be rebuilt inside container)
 mi100-ops/build/
@@ -37,3 +38,4 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+rust/target/

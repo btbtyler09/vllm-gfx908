@@ -26,6 +26,9 @@ __pycache__/
 # C extensions
 *.so
 
+# Rust binaries
+vllm/vllm-rs
+
 # Distribution / packaging
 .Python
 build/
@@ -242,6 +245,7 @@ ep_kernels_workspace/
 
 # Allow tracked library source folders under submodules (e.g., benchmarks/lib)
 !vllm/benchmarks/lib/
+!.buildkite/scripts/lib/
 
 # Separate project - has its own git repo
 mi100-ops/
