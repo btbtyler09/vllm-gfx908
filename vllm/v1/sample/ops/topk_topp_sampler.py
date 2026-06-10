@@ -12,6 +12,14 @@ from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.triton_utils import HAS_TRITON
 
+
+def _on_gfx908() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx908
+
+    return on_gfx908()
+
 if HAS_TRITON:
     from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
 
@@ -110,7 +118,12 @@ class TopKTopPSampler(nn.Module):
         elif (
             logprobs_mode not in ("processed_logits", "processed_logprobs")
             and rocm_aiter_ops.is_enabled()
+            and not _on_gfx908()
         ):
+            # gfx908: the CK sampling kernels fail to JIT (and even hand-built,
+            # the chunked online-softmax runs ~50% slower than torch at
+            # vocab=152k). The import below succeeds lazily, so the failure
+            # would only surface mid-decode — gate the arch out up front.
             try:
                 import aiter.ops.sampling  # noqa: F401
 

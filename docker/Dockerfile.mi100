@@ -150,6 +150,12 @@ RUN --mount=type=bind,from=export_vllm,src=/,target=/install \
     && pip uninstall -y vllm \
     && uv pip install --system *.whl
 
+# tilelang's bundled TVM throws a C++ exception at ctypes load on this ROCm
+# stack, aborting the API server ("Rust cannot catch foreign exceptions") as
+# soon as the model registry imports the DeepSeek-V4 MHC kernels. Only the
+# DeepSeek-V4 tilelang path needs it — has_tilelang() degrades gracefully.
+RUN uv pip uninstall --system tilelang || true
+
 # Upgrade transformers for Mistral3/Devstral model support
 # Without this, Devstral falls back to PixtralForConditionalGeneration incorrectly
 RUN uv pip install --system --upgrade "transformers>=5.2.0"
