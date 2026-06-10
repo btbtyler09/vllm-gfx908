@@ -2,17 +2,140 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
+
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     pack_quantized_values_into_int32,
 )
 from vllm.model_executor.parameter import BasevLLMParameter, permute_param_layout_
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
+from .triton_w8a16 import triton_w8a16_gemm
+
+logger = init_logger(__name__)
+
+
+# gfx908 (MI100) GPTQ8 "dual" graph-safe M-dispatch.
+# The dispatch (native exllama for small M, Triton W8A16 MFMA for large M) MUST
+# live inside an opaque custom op: a Python `if M > thresh` in apply() is a
+# torch.compile graph break that drops the GPTQ8 layers out of the gfx908
+# FULL_AND_PIECEWISE cudagraph (~3.6x decode regression). Registered as a custom
+# op, dynamo sees one atomic node and cudagraphs capture it per-batch-size
+# deterministically (M is constant within each captured graph). The native
+# K-packed exllama kernel handles M<=MTHRESH (decode, zero regression); the
+# repacked [K, N//4] Triton MFMA kernel handles M>MTHRESH (prefill/high-batch).
+# Originally prototyped by curvedinf; adapted here to be cudagraph-safe.
+# See docs/mi100_decode_opt/mtp_depth_sweep_gfx908.md.
+def _gptq_dual_gemm_gfx908_impl(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    qweight_repacked: torch.Tensor,
+    qzeros: torch.Tensor,
+    scales: torch.Tensor,
+    g_idx: torch.Tensor,
+    mthresh: int,
+    group_size: int,
+    zero_offset: int,
+    exllama_ready: bool,
+    use_v2: bool,
+    bit: int,
+) -> torch.Tensor:
+    if x.shape[0] > mthresh:
+        return triton_w8a16_gemm(
+            a=x,
+            b_q=qweight_repacked,
+            scales=scales,
+            qzeros=qzeros,
+            group_size=group_size,
+            zp_bias=0,
+            zero_offset=zero_offset,
+        )
+    return ops.gptq_gemm(x, qweight, qzeros, scales, g_idx, exllama_ready, use_v2, bit)
+
+
+def _gptq_dual_gemm_gfx908_fake(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    qweight_repacked: torch.Tensor,
+    qzeros: torch.Tensor,
+    scales: torch.Tensor,
+    g_idx: torch.Tensor,
+    mthresh: int,
+    group_size: int,
+    zero_offset: int,
+    exllama_ready: bool,
+    use_v2: bool,
+    bit: int,
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], scales.shape[-1]))
+
+
+direct_register_custom_op(
+    op_name="gptq_dual_gemm_gfx908",
+    op_func=_gptq_dual_gemm_gfx908_impl,
+    mutates_args=[],
+    fake_impl=_gptq_dual_gemm_gfx908_fake,
+)
+
+
+def _repack_gptq8_qweight_for_triton_w8a16(qweight: torch.Tensor) -> torch.Tensor:
+    """Convert a GPTQ8 K-packed qweight [K//4, N] to the [K, N//4] layout the
+    Triton W8A16 MFMA kernel consumes. Requires N divisible by 4; callers must
+    fall back to the native path when it is not."""
+    k4, output_size = qweight.shape
+    if output_size % 4 != 0:
+        raise ValueError(
+            "Triton W8A16 GPTQ path requires output features divisible by 4, "
+            f"got {output_size}."
+        )
+    shifts = torch.arange(4, device=qweight.device, dtype=torch.int32) * 8
+    qweight_by_output = qweight.t().contiguous()
+    unpacked = ((qweight_by_output.unsqueeze(-1) >> shifts) & 0xFF).reshape(
+        output_size, k4 * 4
+    )
+    unpacked = unpacked.t().contiguous()
+    repacked = torch.sum(
+        (unpacked.view(k4 * 4, output_size // 4, 4) & 0xFF) << shifts,
+        dim=2,
+        dtype=torch.int32,
+    )
+    return repacked.contiguous()
+
+
+def _gfx908_gptq8_dual_enabled(c: MPLinearLayerConfig) -> bool:
+    """gfx908 GPTQ8 dual-layout dispatch (default ON for W8, no act reorder).
+
+    VLLM_GFX908_GPTQ8 = "dual" (default) keeps BOTH weight layouts resident:
+    native K-packed exllama for M<=MTHRESH (decode, zero regression,
+    cudagraph'd) + repacked [K, N//4] Triton W8A16 MFMA for M>MTHRESH
+    (prefill/high-batch, ~halves TTFT). Net: +12..84% concurrency, neutral
+    c=1. Costs one extra qweight copy in VRAM. "native" opts out -> baseline
+    exllama for all M (use for max-density long-context serving).
+    """
+    if c.weight_type != scalar_types.uint8b128 or c.has_g_idx:
+        return False
+    try:
+        from vllm.platforms.rocm import on_gfx908
+
+        if not (current_platform.is_rocm() and on_gfx908()):
+            return False
+    except Exception:
+        return False
+    return os.environ.get("VLLM_GFX908_GPTQ8", "dual").strip().lower() != "native"
+
+
+def _gfx908_gptq8_mthresh() -> int:
+    try:
+        return int(os.environ.get("VLLM_GFX908_GPTQ8_MTHRESH", "16"))
+    except ValueError:
+        return 16
 
 
 class ExllamaLinearKernel(MPLinearKernel):
@@ -133,6 +256,26 @@ class ExllamaLinearKernel(MPLinearKernel):
 
             permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
             x_cont = x.data.contiguous()
+            if _gfx908_gptq8_dual_enabled(c):
+                # dual: materialize a SEPARATE repacked qweight copy for the
+                # high-M Triton MFMA path BEFORE gptq_shuffle reorders the
+                # K-packed layout the repack expects. scales/qzeros are shared.
+                # Any layer whose repack is unsupported (e.g. N % 4 != 0) or
+                # OOMs degrades to the native path rather than crashing load.
+                try:
+                    layer.gptq_qweight_repacked = torch.nn.Parameter(
+                        _repack_gptq8_qweight_for_triton_w8a16(x_cont),
+                        requires_grad=False,
+                    )
+                    layer.gptq_dual_ready = True
+                except Exception as e:
+                    if not getattr(ExllamaLinearKernel, "_dual_fallback_warned", False):
+                        logger.warning(
+                            "gfx908 GPTQ8 dual repack unavailable (%s); falling "
+                            "back to native exllama for affected layers.",
+                            e,
+                        )
+                        ExllamaLinearKernel._dual_fallback_warned = True
             ops.gptq_shuffle(x_cont, g_idx, c.weight_type.size_bits)
             return x_cont
 
@@ -166,6 +309,30 @@ class ExllamaLinearKernel(MPLinearKernel):
 
         assert w_zp is not None, "Zero points are required by Exllama"
         assert w_g_idx is not None, "Group index is required by Exllama"
+
+        if getattr(layer, "gptq_dual_ready", False):
+            # gfx908 dual: graph-safe M-dispatch via opaque custom op (keeps
+            # cudagraphs). Inside the op: M>thresh -> Triton W8A16 MFMA on the
+            # repacked copy; M<=thresh -> native exllama gptq_gemm.
+            zero_offset = 0 if use_v2_format else 1
+            output = torch.ops.vllm.gptq_dual_gemm_gfx908(
+                x_2d.contiguous(),
+                w_q,
+                layer.gptq_qweight_repacked,
+                w_zp,
+                w_s,
+                w_g_idx,
+                _gfx908_gptq8_mthresh(),
+                c.group_size,
+                zero_offset,
+                True,
+                use_v2_format,
+                c.weight_type.size_bits,
+            )
+            if bias is not None:
+                output.add_(bias)
+            return output.reshape(out_shape)
+
         output = ops.gptq_gemm(
             x_2d, w_q, w_zp, w_s, w_g_idx, True, use_v2_format, c.weight_type.size_bits
         )

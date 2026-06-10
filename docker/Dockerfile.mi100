@@ -1,11 +1,15 @@
-# default base image
-# BASE_IMAGE (aiter-mi100:latest) is built from aiter/Dockerfile.mi100, whose
-# AITER source is published at https://github.com/btbtyler09/aiter-gfx908
-# (branch mi100-optimized). Build that base reproducibly with
-# `--build-arg AITER_FROM_GIT=1` before building this image.
+# Self-contained gfx908 (MI100) build from public sources:
+#   ROCm dev base (btbtyler09/vllm-dev-mi100)
+#     -> AITER fork built in-image from https://github.com/btbtyler09/aiter-gfx908
+#     -> vLLM wheel from this repo
+# Override AITER_GIT_REF to pin a commit; BASE_IMAGE can still point at a
+# prebuilt aiter-mi100 image (set AITER_FROM_GIT=0 to skip the in-image build).
 ARG REMOTE_VLLM="0"
 ARG COMMON_WORKDIR=/app
-ARG BASE_IMAGE=aiter-mi100:latest
+ARG BASE_IMAGE=btbtyler09/vllm-dev-mi100:2026.04.18
+ARG AITER_GIT_REPO=https://github.com/btbtyler09/aiter-gfx908.git
+ARG AITER_GIT_REF=mi100-optimized
+ARG AITER_FROM_GIT=1
 
 FROM ${BASE_IMAGE} AS base
 
@@ -13,6 +17,20 @@ ARG ARG_PYTORCH_ROCM_ARCH
 ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
 ENV RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES=1
 ENV RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1
+
+# AITER (gfx908 fork). PREBUILD_KERNELS=0: CK kernels JIT on first use.
+# WORKDIR must stay the repo root so `import aiter` finds the real package.
+ARG AITER_GIT_REPO
+ARG AITER_GIT_REF
+ARG AITER_FROM_GIT
+ENV GPU_ARCHS=gfx908
+ENV PREBUILD_KERNELS=0
+RUN if [ "$AITER_FROM_GIT" = "1" ]; then \
+        git clone --recursive "$AITER_GIT_REPO" /workspace/aiter && \
+        cd /workspace/aiter && git checkout "$AITER_GIT_REF" && \
+        git submodule update --init --recursive && \
+        MAX_JOBS=8 pip install -e . ; \
+    else echo "Using AITER from base image"; fi
 
 ARG PYTHON_VERSION=3.12
 ENV PYTHON_VERSION=${PYTHON_VERSION}
@@ -149,6 +167,12 @@ RUN --mount=type=bind,from=export_vllm,src=/,target=/install \
     && uv pip install --system -r requirements/rocm.txt \
     && pip uninstall -y vllm \
     && uv pip install --system *.whl
+
+# tilelang's bundled TVM throws a C++ exception at ctypes load on this ROCm
+# stack, aborting the API server ("Rust cannot catch foreign exceptions") as
+# soon as the model registry imports the DeepSeek-V4 MHC kernels. Only the
+# DeepSeek-V4 tilelang path needs it — has_tilelang() degrades gracefully.
+RUN uv pip uninstall --system tilelang || true
 
 # Upgrade transformers for Mistral3/Devstral model support
 # Without this, Devstral falls back to PixtralForConditionalGeneration incorrectly
