@@ -8,7 +8,10 @@ ARG REMOTE_VLLM="0"
 ARG COMMON_WORKDIR=/app
 ARG BASE_IMAGE=btbtyler09/vllm-dev-mi100:2026.04.18
 ARG AITER_GIT_REPO=https://github.com/btbtyler09/aiter-gfx908.git
-ARG AITER_GIT_REF=mi100-optimized
+# Pinned to the 439-commit upstream-AITER sync (mi100-optimized HEAD as of this
+# release). The sync restructured Unified Attention and fixes the long-standing
+# gfx908 UA state-corruption bug; see docs/mi100_decode_opt/ua_eval_dense27b_gfx908.md.
+ARG AITER_GIT_REF=395f84533c74067a83bcf3eaebd730071dcebe02
 ARG AITER_FROM_GIT=1
 
 FROM ${BASE_IMAGE} AS base

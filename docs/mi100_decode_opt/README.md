@@ -9,6 +9,10 @@ Decode-throughput investigation for Qwen3.6 models on vLLM, targeting 4× AMD In
 | Qwen3.6-35B-A3B-GPTQ-8bit | shipped (3 rounds, branch `mi100-optimized`) | TPOT 19.5 → 11.00 ms (**+76% throughput**) at c=1 | [qwen3_6_35b.md](qwen3_6_35b.md) |
 | Qwen3.6-27B-GPTQ-8bit | investigated, no ship | baseline 20.43 ms TPOT @ c=1; round-3 levers don't transfer to a fully-GPTQ workload | [qwen3_6_27b.md](qwen3_6_27b.md) |
 
+## Attention backend (gfx908)
+
+Default is `TRITON_ATTN`. As of the 439-commit AITER sync (pinned in `Dockerfile.mi100`), **Aiter Unified Attention (UA) is fixed** — the historical gfx908 UA state-corruption bug is gone — and on **dense GPTQ-8 models running MTP**, UA is the *faster* backend: **+15% throughput on long-output dataset-generation (4k in / 6k out), +6–8% interactive (c=1), +29% long-context (16K)**. The advantage is MTP-specific (UA ≈ TRITON without MTP) and architecture-specific (MoE shows the opposite). Keep `TRITON_ATTN` for short-context high-throughput serving (it's ~10% better there). Enable UA with `VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1` (drop `--attention-backend`). Full data: [ua_eval_dense27b_gfx908.md](ua_eval_dense27b_gfx908.md).
+
 ## The tuning playbook
 
 This is the sequence we re-use per model. Each step either ships a patch or rules out a lever cheaply.
@@ -57,4 +61,4 @@ This is the sequence we re-use per model. Each step either ships a patch or rule
 - **Cluster:** 4× AMD Instinct MI100 (gfx908) with XGMI peer-to-peer
 - **Workflow:** Docker — `vllm-rocm-gfx908:latest` with patched `vllm/` mounted as overlays
 - **Branch:** `mi100-optimized`
-- **Stack:** vLLM v0.19.2rc1+mi100 + AITER, `VLLM_MI100_TORCH_COMPILE=1`, mode-3 + FULL_AND_PIECEWISE cudagraph, TRITON_ATTN backend, dtype=half, TP=4
+- **Stack:** vLLM v0.21.0rc1+mi100 + AITER (439-commit sync, pinned `395f84533`), `VLLM_MI100_TORCH_COMPILE=1`, mode-3 + FULL_AND_PIECEWISE cudagraph, TRITON_ATTN backend (UA optional — see [Attention backend](#attention-backend-gfx908)), dtype=half, TP=4
