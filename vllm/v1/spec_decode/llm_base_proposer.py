@@ -1198,11 +1198,17 @@ class SpecDecodeBaseProposer:
         # Note (matt): Never inherit the attention backend from base, because there are
         # many opportunities for incompatibility, so we always independently autoselect
         # unless explicitly specified in the speculative config.
+        # MTP draft layers live inside the target model family, so a forced target
+        # backend must carry over unless the speculative config overrides it.
+        draft_attention_backend = spec_cfg.attention_backend
+        if draft_attention_backend is None and self.method == "mtp":
+            draft_attention_backend = base.attention_config.backend
+
         base = replace(
             base,
             attention_config=replace(
                 base.attention_config,
-                backend=spec_cfg.attention_backend,
+                backend=draft_attention_backend,
             ),
         )
 

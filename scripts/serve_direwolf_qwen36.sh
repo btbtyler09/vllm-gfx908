@@ -39,6 +39,7 @@ COMMON_ENV=(
   VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="1800"
   VLLM_ROCM_USE_AITER="1"
   VLLM_ROCM_USE_AITER_TRITON_GEMM="1"
+  VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION="0"
   NCCL_ALGO="Ring"
   NCCL_PROTO="Simple"
   NCCL_P2P_DISABLE="0"
@@ -55,7 +56,7 @@ ARGS=(
   --tensor-parallel-size 4
   --dtype half
   --max-model-len 65536
-  --max-num-seqs 8
+  --max-num-seqs 32
   --max-num-batched-tokens 4096
   --gpu-memory-utilization 0.95
   --attention-backend TRITON_ATTN
@@ -70,10 +71,7 @@ ARGS=(
   --default-chat-template-kwargs '{"enable_thinking":false}'
   --override-generation-config '{"temperature":0.6,"top_p":0.95,"top_k":20,"min_p":0.0,"presence_penalty":0.0,"repetition_penalty":1.0}'
   --kv-cache-dtype fp8
-  --enable-prefix-caching
-  --mamba-cache-mode align
-  --prefix-caching-hash-algo xxhash
-  --speculative-config '{"method":"mtp","num_speculative_tokens":1,"rejection_sample_method":"standard"}'
+  --speculative-config '{"method":"mtp","num_speculative_tokens":2,"rejection_sample_method":"standard"}'
 )
 
 usage() {

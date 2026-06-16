@@ -470,9 +470,13 @@ class SpeculativeConfig:
             is_moe = hf_config.model_type == "qwen3_5_moe"
             hf_config.model_type = "qwen3_5_mtp"
             n_predict = getattr(hf_config, "mtp_num_hidden_layers", None)
+            if n_predict is None:
+                text_config = getattr(hf_config, "text_config", None)
+                n_predict = getattr(text_config, "mtp_num_hidden_layers", None)
             hf_config.update(
                 {
                     "n_predict": n_predict,
+                    "mtp_num_hidden_layers": n_predict,
                     "architectures": ["Qwen3_5MoeMTP" if is_moe else "Qwen3_5MTP"],
                 }
             )
@@ -484,6 +488,7 @@ class SpeculativeConfig:
             hf_config.update(
                 {
                     "n_predict": n_predict,
+                    "mtp_num_hidden_layers": n_predict,
                     "architectures": ["Qwen3_5MoeMTP" if is_moe else "Qwen3_5MTP"],
                 }
             )
