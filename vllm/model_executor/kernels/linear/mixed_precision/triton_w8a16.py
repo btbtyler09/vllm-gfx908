@@ -41,6 +41,16 @@ TRITON_W8A16_SUPPORTED_QUANT_TYPES = [
 ]
 
 
+def _use_native_repacked_gemm() -> bool:
+    if not current_platform.is_rocm():
+        return True
+    try:
+        from vllm.platforms.rocm import on_gfx908
+    except ImportError:
+        return True
+    return not on_gfx908()
+
+
 @triton.jit
 def triton_w8a16_decode_kernel(
     # M=1 decode-specialized W8A16 kernel for gfx908.
@@ -523,12 +533,13 @@ class TritonW8A16LinearKernel(MPLinearKernel):
         if self.w_zp_name is not None:
             zp = getattr(layer, self.w_zp_name, None)
             if zp is not None:
-                # Checkpoint zeros: [N//4, K//G] int32 (N packed at dim 0)
-                # Kernel needs: [K//G, N//4] — transpose
+                # The vLLM loader leaves GPTQ zero points in kernel layout:
+                # [K//G, N//4]. Keep that layout; transposing breaks TP-sharded
+                # merged projections such as Qwen GDN in_proj_qkvz.
                 replace_parameter(
                     layer,
                     self.w_zp_name,
-                    torch.nn.Parameter(zp.data.t().contiguous(), requires_grad=False),
+                    torch.nn.Parameter(zp.data.contiguous(), requires_grad=False),
                 )
 
     def apply_weights(
@@ -551,6 +562,7 @@ class TritonW8A16LinearKernel(MPLinearKernel):
             and c.weight_type == scalar_types.uint8b128
             and w_zp is not None
             and hasattr(torch.ops._C, "gptq_w8a16_repacked_gemm")
+            and _use_native_repacked_gemm()
         ):
             output = ops.gptq_w8a16_repacked_gemm(
                 x_2d,

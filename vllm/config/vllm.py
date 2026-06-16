@@ -139,6 +139,9 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
     from vllm.platforms import current_platform
     from vllm.utils.flashinfer import has_flashinfer
 
+    if cfg.parallel_config.disable_custom_all_reduce:
+        return False
+
     if current_platform.is_rocm():
         from vllm._aiter_ops import rocm_aiter_ops
 

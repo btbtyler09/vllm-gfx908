@@ -977,7 +977,7 @@ void gemm_half_q_half_repacked_w8_cuda(
   gridDim.y = 1;
   gridDim.z = DIVIDE(size_k, BLOCK_KN_SIZE);
 
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const cudaStream_t stream = get_current_cuda_stream();
 #define LAUNCH_REPACKED_W8(M_COUNT)                                         \
   if (size_m == M_COUNT) {                                                  \
     gemm_half_q_half_gptq_8bit_repacked_kernel<M_COUNT>                     \

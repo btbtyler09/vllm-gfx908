@@ -18,6 +18,24 @@ if HAS_TRITON:
 logger = init_logger(__name__)
 
 
+def _aiter_sampler_supported() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    try:
+        from vllm.platforms.rocm import on_gfx908
+    except ImportError:
+        return True
+    if on_gfx908():
+        logger.warning_once(
+            "AITER top-k/top-p sampler is not enabled on gfx908 because it "
+            "returns invalid token ids for Qwen3.6 vocab-sized sampling; "
+            "falling back to PyTorch-native sampling while keeping other "
+            "AITER ROCm kernels enabled."
+        )
+        return False
+    return True
+
+
 def flashinfer_sampler_supported() -> bool:
     """Decide whether FlashInfer's top-p/top-k sampler can be used.
 
@@ -110,6 +128,7 @@ class TopKTopPSampler(nn.Module):
         elif (
             logprobs_mode not in ("processed_logits", "processed_logprobs")
             and rocm_aiter_ops.is_enabled()
+            and _aiter_sampler_supported()
         ):
             self.aiter_ops = None
             self._aiter_ops_import_failed = False
