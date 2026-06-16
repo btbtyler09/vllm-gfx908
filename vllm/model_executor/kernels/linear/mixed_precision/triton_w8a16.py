@@ -26,6 +26,7 @@ Checkpoint layout from GPTQ create_weights (PackedvLLMParameter):
 
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.parameter import BasevLLMParameter, permute_param_layout_
 from vllm.platforms import current_platform
@@ -429,6 +430,7 @@ class TritonW8A16LinearKernel(MPLinearKernel):
     """Triton W8A16 GEMM kernel for ROCm (gfx908 / gfx942)."""
 
     SUPPORTED_QUANT_TYPES = TRITON_W8A16_SUPPORTED_QUANT_TYPES
+    use_v2_format: bool = False
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -543,15 +545,30 @@ class TritonW8A16LinearKernel(MPLinearKernel):
 
         zp_bias = c.weight_type.bias if c.weight_type.has_bias() else 0
 
-        output = triton_w8a16_gemm(
-            a=x_2d,
-            b_q=w_q,
-            scales=w_s,
-            qzeros=w_zp,
-            group_size=group_size,
-            zp_bias=zp_bias,
-            zero_offset=0,
-        )
+        if (
+            x_2d.shape[0] <= 8
+            and x_2d.dtype == torch.float16
+            and c.weight_type == scalar_types.uint8b128
+            and w_zp is not None
+            and hasattr(torch.ops._C, "gptq_w8a16_repacked_gemm")
+        ):
+            output = ops.gptq_w8a16_repacked_gemm(
+                x_2d,
+                w_q,
+                w_zp,
+                w_s,
+                self.use_v2_format,
+            )
+        else:
+            output = triton_w8a16_gemm(
+                a=x_2d,
+                b_q=w_q,
+                scales=w_s,
+                qzeros=w_zp,
+                group_size=group_size,
+                zp_bias=zp_bias,
+                zero_offset=0,
+            )
 
         if bias is not None:
             output.add_(bias)
