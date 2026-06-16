@@ -57,7 +57,6 @@ ARGS=(
   --dtype half
   --max-model-len 65536
   --max-num-seqs 32
-  --max-num-batched-tokens 4096
   --gpu-memory-utilization 0.95
   --attention-backend TRITON_ATTN
   --compilation-config '{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE"}'
