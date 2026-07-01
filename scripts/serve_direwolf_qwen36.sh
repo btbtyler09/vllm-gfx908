@@ -56,7 +56,7 @@ ARGS=(
   --tensor-parallel-size 4
   --dtype half
   --max-model-len 65536
-  --max-num-seqs 32
+  --max-num-seqs 8
   --gpu-memory-utilization 0.95
   --attention-backend TRITON_ATTN
   --compilation-config '{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE"}'
@@ -70,6 +70,7 @@ ARGS=(
   --default-chat-template-kwargs '{"enable_thinking":false}'
   --override-generation-config '{"temperature":0.6,"top_p":0.95,"top_k":20,"min_p":0.0,"presence_penalty":0.0,"repetition_penalty":1.0}'
   --kv-cache-dtype int8
+  --block-size 32
 )
 
 # MTP helps decode-heavy workloads but hurts the current 20:1 PP:TG scoring
