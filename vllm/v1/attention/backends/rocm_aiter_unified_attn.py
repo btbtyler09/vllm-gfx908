@@ -2,16 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with PagedAttention and Triton prefix prefill."""
 
+from typing import ClassVar
+
 import torch
 
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8StaticTensorSym,
 )
-from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.utils.torch_utils import get_dtype_size, is_quantized_kv_cache
 from vllm.v1.attention.backend import AttentionLayer, AttentionType, MultipleOf
 from vllm.v1.attention.backends.rocm_attn import (
     RocmAttentionBackend,
@@ -19,11 +22,29 @@ from vllm.v1.attention.backends.rocm_attn import (
     RocmAttentionMetadata,
     RocmAttentionMetadataBuilder,
 )
+from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+    triton_reshape_and_cache_flash_per_token_head_quant,
+)
+from vllm.v1.kv_cache_interface import (
+    get_kv_quant_mode,
+    kv_cache_uses_per_token_head_scales,
+)
 
 logger = init_logger(__name__)
 
 
 class RocmAiterUnifiedAttentionBackend(RocmAttentionBackend):
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "float16",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+        "fp8_e5m2",
+        "int8",
+        "int8_per_token_head",
+    ]
+
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [MultipleOf(16)]
@@ -74,6 +95,12 @@ class RocmAiterUnifiedAttentionBackend(RocmAttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
+        if kv_cache_uses_per_token_head_scales(cache_dtype_str):
+            from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+
+            cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype_str]
+            scale_pad = get_dtype_size(torch.float32) // get_dtype_size(cache_dtype)
+            return (num_blocks, 2, block_size, num_kv_heads, head_size + scale_pad)
         return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @staticmethod
@@ -96,8 +123,63 @@ class RocmAiterUnifiedAttentionBackend(RocmAttentionBackend):
 
 
 class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
+    # Per-token-head quant: scale views carved from inline head padding.
+    _k_scale_cache: torch.Tensor | None = None
+    _v_scale_cache: torch.Tensor | None = None
+    _k_data_cache: torch.Tensor | None = None
+    _v_data_cache: torch.Tensor | None = None
+
     def fused_output_quant_supported(self, quant_key: QuantKey):
         return quant_key == kFp8StaticTensorSym
+
+    def _ensure_scale_caches(self, kv_cache: torch.Tensor) -> None:
+        """Extract per-head scale views from the padded head dimension.
+
+        The KV cache shape is ``(num_blocks, 2, block_size, nkv, hs+pad)``
+        where ``pad = sizeof(float32) / sizeof(cache_dtype)``.  The last
+        ``pad`` elements of each head hold one float32 scale.  We create
+        strided float32 views over those bytes and int8/bf16 data views over
+        the first ``hs`` elements.
+        """
+        if self._k_scale_cache is not None:
+            return
+
+        num_blocks, _, block_size, nkv, padded_hs = kv_cache.shape
+        dtype_sz = kv_cache.element_size()
+        scale_pad = get_dtype_size(torch.float32) // dtype_sz
+        hs = padded_hs - scale_pad
+
+        raw = kv_cache.untyped_storage()
+        base_f32 = torch.tensor([], dtype=torch.float32, device=kv_cache.device).set_(
+            raw
+        )
+
+        kv_half_bytes = block_size * nkv * padded_hs * dtype_sz
+        full_block_f32 = 2 * kv_half_bytes // 4
+        slot_f32 = nkv * padded_hs * dtype_sz // 4
+        head_f32 = padded_hs * dtype_sz // 4
+        scale_off_f32 = hs * dtype_sz // 4
+
+        self._k_scale_cache = torch.as_strided(
+            base_f32,
+            size=(num_blocks, block_size, nkv),
+            stride=(full_block_f32, slot_f32, head_f32),
+            storage_offset=scale_off_f32,
+        )
+        self._k_scale_cache.fill_(1.0)
+
+        v_base_f32 = kv_half_bytes // 4
+        self._v_scale_cache = torch.as_strided(
+            base_f32,
+            size=(num_blocks, block_size, nkv),
+            stride=(full_block_f32, slot_f32, head_f32),
+            storage_offset=v_base_f32 + scale_off_f32,
+        )
+        self._v_scale_cache.fill_(1.0)
+
+        key_cache, value_cache = kv_cache.unbind(1)
+        self._k_data_cache = key_cache[..., :hs]
+        self._v_data_cache = value_cache[..., :hs]
 
     def __init__(
         self,
@@ -133,6 +215,9 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
 
         self.unified_attention = unified_attention
         self.supports_quant_query_input = True
+
+        self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
+        self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
 
     def _split_kv_cache(
         self, kv_cache: torch.Tensor
@@ -221,9 +306,29 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         key_cache, value_cache = self._split_kv_cache(kv_cache)
 
         softmax_scale = self.scale
-        if is_quantized_kv_cache(self.kv_cache_dtype):
+        if self._is_per_token_head_quant:
+            self._ensure_scale_caches(kv_cache)
+            key_cache = self._k_data_cache
+            value_cache = self._v_data_cache
+            q_descale = None
+            k_descale = None
+            v_descale = None
+            k_scale_cache = self._k_scale_cache
+            v_scale_cache = self._v_scale_cache
+        elif is_quantized_kv_cache(self.kv_cache_dtype):
             key_cache = key_cache.view(self.fp8_dtype)
             value_cache = value_cache.view(self.fp8_dtype)
+            q_descale = layer._q_scale if query.dtype == self.fp8_dtype else None
+            k_descale = layer._k_scale
+            v_descale = layer._v_scale
+            k_scale_cache = None
+            v_scale_cache = None
+        else:
+            q_descale = None
+            k_descale = None
+            v_descale = None
+            k_scale_cache = None
+            v_scale_cache = None
 
         cu_seqlens_q = attn_metadata.query_start_loc
         seqused_k = attn_metadata.seq_lens
@@ -246,11 +351,13 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
             window_size=self.sliding_window,
             block_table=block_table,
             softcap=self.logits_soft_cap,
-            q_descale=layer._q_scale if query.dtype == self.fp8_dtype else None,
-            k_descale=layer._k_scale,
-            v_descale=layer._v_scale,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             sinks=self.sinks,
             output_scale=output_scale,
+            k_scale_cache=k_scale_cache,
+            v_scale_cache=v_scale_cache,
         )
 
         return output
@@ -269,6 +376,19 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
             return
         key_cache, value_cache = self._split_kv_cache(kv_cache)
 
+        if self._is_per_token_head_quant:
+            self._ensure_scale_caches(kv_cache)
+            triton_reshape_and_cache_flash_per_token_head_quant(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                self._k_scale_cache,
+                self._v_scale_cache,
+                slot_mapping,
+            )
+            return
+
         # Reshape the input keys and values and store them in the cache.
         ops.reshape_and_cache_flash(
             key,
@@ -282,6 +402,8 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         )
 
     def fused_rope_kvcache_supported(self):
+        if self._is_per_token_head_quant:
+            return False
         return rocm_aiter_ops.is_enabled()
 
     def do_rope_and_kv_cache_update(
