@@ -66,7 +66,7 @@ def parse_bench_output(stdout: str) -> dict:
         m = re.match(r"\s*(Mean|Median|P90|P95|P99)\s+(TTFT|TPOT|ITL|Latency)\s*\(ms\):\s*([0-9.]+)", line)
         if m:
             metrics[f"{m.group(1).lower()}_{m.group(2).lower()}_ms"] = float(m.group(3))
-        m = re.match(r"\s*(Throughput|Request throughput|Output throughput|Total token throughput)\s*\(tok/s\):\s*([0-9.]+)", line)
+        m = re.match(r"\s*(Request throughput|Output token throughput|Total token throughput)\s*\(tok/s\):\s*([0-9.]+)", line)
         if m:
             key = m.group(1).lower().replace(" ", "_")
             metrics[f"{key}_tok_per_s"] = float(m.group(2))
