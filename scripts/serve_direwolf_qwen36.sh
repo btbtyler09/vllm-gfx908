@@ -73,10 +73,9 @@ ARGS=(
   --block-size 32
 )
 
-# MTP helps decode-heavy workloads but hurts the current 20:1 PP:TG scoring
-# target.  Enable it explicitly with QWEN36_MTP=1 when serving chat-style
-# (decode-heavy) traffic.
-if [[ "${QWEN36_MTP:-0}" == "1" ]]; then
+# MTP is on by default because it improves decode-heavy throughput once the
+# stack is properly optimized.  Set QWEN36_MTP=0 to disable it.
+if [[ "${QWEN36_MTP:-1}" != "0" ]]; then
   ARGS+=(
     --speculative-config '{"method":"mtp","num_speculative_tokens":2,"rejection_sample_method":"standard"}'
   )
