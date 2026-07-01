@@ -70,8 +70,16 @@ ARGS=(
   --default-chat-template-kwargs '{"enable_thinking":false}'
   --override-generation-config '{"temperature":0.6,"top_p":0.95,"top_k":20,"min_p":0.0,"presence_penalty":0.0,"repetition_penalty":1.0}'
   --kv-cache-dtype int8
-  --speculative-config '{"method":"mtp","num_speculative_tokens":2,"rejection_sample_method":"standard"}'
 )
+
+# MTP helps decode-heavy workloads but hurts the current 20:1 PP:TG scoring
+# target.  Enable it explicitly with QWEN36_MTP=1 when serving chat-style
+# (decode-heavy) traffic.
+if [[ "${QWEN36_MTP:-0}" == "1" ]]; then
+  ARGS+=(
+    --speculative-config '{"method":"mtp","num_speculative_tokens":2,"rejection_sample_method":"standard"}'
+  )
+fi
 
 usage() {
   printf 'usage: %s {start|stop|restart|status|supervise}\n' "$0"
