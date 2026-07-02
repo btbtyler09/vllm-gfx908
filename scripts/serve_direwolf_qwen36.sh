@@ -40,6 +40,9 @@ COMMON_ENV=(
   VLLM_ROCM_USE_AITER="1"
   VLLM_ROCM_USE_AITER_TRITON_GEMM="1"
   VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION="0"
+  # AITER a16w8_blockscale/a8w8_blockscale for GPTQ 8-bit on gfx908 produces
+  # garbled / truncated outputs. Force the Triton W8A16 (A16W8) kernel instead.
+  VLLM_DISABLED_KERNELS="AiterW8A16LinearKernel"
   NCCL_ALGO="Ring"
   NCCL_PROTO="Simple"
   NCCL_P2P_DISABLE="0"
@@ -56,7 +59,7 @@ ARGS=(
   --tensor-parallel-size 4
   --dtype half
   --max-model-len 65536
-  --max-num-seqs 32
+  --max-num-seqs 8
   --gpu-memory-utilization 0.95
   --attention-backend TRITON_ATTN
   --compilation-config '{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["+gemma_rms_norm","+silu_and_mul","+rms_norm_gated","+rotary_embedding","+apply_rotary_emb","none"]}'
