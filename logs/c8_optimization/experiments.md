@@ -1188,4 +1188,37 @@ enabled in config (C++ kernel is better than native PyTorch).
 from AITER Triton vs the existing C++ kernel. Focus int8 conversion efforts
 on compute-bound or bandwidth-critical paths (GEMM activations, attention).
 
+---
+
+## 2026-07-02 — Experiment: enable rms_norm_gated + rotary_embedding + apply_rotary_emb custom ops
+
+**Hypothesis:** Three more CustomOps with `forward_hip` implementations were
+disabled by default on gfx908: `rms_norm_gated` (48/64 linear-attn layers),
+`rotary_embedding` (16/64 full-attn layers), and `apply_rotary_emb`. Enabling
+them should route to faster kernels (FLA rmsnorm_fn, AITER Triton RoPE,
+flash_attn rotary).
+
+**Change:** Added `+rms_norm_gated`, `+rotary_embedding`, `+apply_rotary_emb`
+to `custom_ops` in bench_c8.py and serve_direwolf_qwen36.sh.
+
+**Benchmark (20:1 PP:TG, MTP-2, int8 KV, ROCM_AITER_UNIFIED_ATTN):**
+- Previous baseline (`gemma_rmsnorm_aiter_enabled_warm`): output 46.87,
+  total 984.25 tok/s, TTFT 17994ms, TPOT 90.11ms.
+- Warm run: output **49.34**, total **1036.22** tok/s, TTFT **17499ms**,
+  TPOT **88.77ms**.
+- Warm vs baseline: **+5.3% output throughput**, **-2.8% TTFT**,
+  **-1.5% TPOT**.
+
+**Decision: Commit.** Clear win across all metrics. Cumulative improvement
+since `aiter_w8a8_dispatch`: 43.97 -> 49.34 (+12.2%).
+
+**Commit:** `85db3536e` on `mi100-optimized`.
+
+**New best baseline:** `custom_ops_batch1_warm`.
+
+**Learning:** Systematic enabling of disabled CustomOps is a high-yield
+strategy on gfx908. Every CustomOp with forward_hip that the model uses
+should be explicitly enabled in the compilation config.
+
+
 
