@@ -129,6 +129,7 @@ def main():
             "VLLM_TARGET_DEVICE": "rocm",
             "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": "1800",
             "VLLM_ROCM_USE_AITER": "1",
+            "VLLM_ROCM_USE_AITER_LINEAR": "1",
             "VLLM_ROCM_USE_AITER_TRITON_GEMM": "1",
             "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": "0",
             "NCCL_ALGO": "Ring",
