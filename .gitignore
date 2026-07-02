@@ -265,3 +265,4 @@ csrc/cpu/cpu_attn_dispatch_generated.h
 docs/mi100_decode_opt/stage5k_inductor_trace/
 
 logs/
+.uv/
