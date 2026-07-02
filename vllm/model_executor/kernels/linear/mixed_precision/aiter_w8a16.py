@@ -52,6 +52,9 @@ class AiterW8A16LinearKernel(MPLinearKernel):
 
     SUPPORTED_QUANT_TYPES = _AITER_W8A16_SUPPORTED_QUANT_TYPES
 
+    # Per-process cache so we only JIT-compile each (M, N, K, group_size) once.
+    _WARMUP_CACHE: set[tuple[int, int, int, int]] = set()
+
     @classmethod
     def get_min_capability(cls) -> int:
         return 0
@@ -135,6 +138,51 @@ class AiterW8A16LinearKernel(MPLinearKernel):
 
         self._transform_param(layer, self.w_q_name, repack_w_q)
         self._transform_param(layer, self.w_s_name, repack_w_s)
+
+        # Pre-compile the Triton kernels for the shapes this layer will see so
+        # the first real inference does not pay JIT compilation latency.
+        self._warmup(layer)
+
+    def _warmup(self, layer: torch.nn.Module) -> None:
+        """JIT-compile AITER a16w8_blockscale configs used by this layer."""
+
+        w_q, w_s, _, _ = self._get_weight_params(layer)
+        N, K = w_q.shape
+        gs = self.config.group_size
+        device = w_q.device
+        dtype = self.config.act_type
+
+        # Cover all BLOCK_SIZE_M branches in _get_aiter_w8a16_config:
+        # M <= 16 -> 16, <= 32 -> 32, <= 64 -> 64, > 64 -> 128.
+        for M in (1, 17, 33, 65):
+            key = (M, N, K, gs)
+            if key in self._WARMUP_CACHE:
+                continue
+            self._WARMUP_CACHE.add(key)
+
+            x = torch.empty((M, K), dtype=dtype, device=device)
+            cfg = _get_aiter_w8a16_config(M, N, K, gs)
+
+            from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import (
+                gemm_a16w8_blockscale,
+            )
+
+            try:
+                gemm_a16w8_blockscale(
+                    x,
+                    w_q,
+                    w_s,
+                    dtype=dtype,
+                    config=cfg,
+                )
+            except Exception as e:
+                # Warmup failures must not block model loading; the first real
+                # call will simply pay the JIT cost or surface the error then.
+                import warnings
+
+                warnings.warn(
+                    f"AITER W8A16 warmup failed for (M={M}, N={N}, K={K}, gs={gs}): {e}"
+                )
 
     def apply_weights(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
