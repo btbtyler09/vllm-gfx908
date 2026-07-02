@@ -24,22 +24,24 @@ def _get_aiter_w8a16_config(M: int, N: int, K: int, group_size: int):
     divisible by 128 and the GPTQ group_size is 128.
     """
     if M <= 16:
-        block_m = 16
+        block_m, block_n, num_warps, num_stages, waves_per_eu = 16, 64, 4, 2, 2
     elif M <= 32:
-        block_m = 32
+        block_m, block_n, num_warps, num_stages, waves_per_eu = 32, 64, 4, 2, 2
     elif M <= 64:
-        block_m = 64
+        block_m, block_n, num_warps, num_stages, waves_per_eu = 64, 64, 4, 2, 2
     else:
-        block_m = 128
+        # Large-M prefill: microbench shows BLOCK_SIZE_N=128 and waves_per_eu=1
+        # wins substantially on the Qwen3.6-27B TP4 projection shapes.
+        block_m, block_n, num_warps, num_stages, waves_per_eu = 128, 128, 8, 1, 1
 
     return {
         "BLOCK_SIZE_M": block_m,
-        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_N": block_n,
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
-        "num_warps": 4,
-        "num_stages": 2,
-        "waves_per_eu": 2,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+        "waves_per_eu": waves_per_eu,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg",
         "NUM_KSPLIT": 1,
