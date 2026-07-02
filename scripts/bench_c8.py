@@ -131,7 +131,7 @@ def main():
             "VLLM_ROCM_USE_AITER": "1",
             "VLLM_ROCM_USE_AITER_LINEAR": "1",
             "VLLM_ROCM_USE_AITER_TRITON_GEMM": "1",
-            "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": "0",
+            "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": "1",
             "NCCL_ALGO": "Ring",
             "NCCL_PROTO": "Simple",
             "NCCL_P2P_DISABLE": "0",
