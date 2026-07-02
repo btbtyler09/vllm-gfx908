@@ -1094,3 +1094,66 @@ Rolled back:
 - New best baseline: `aiter_w8a8_dispatch`.
 - Next: profile the new stack to find the next bottleneck (attention scheduler,
   MTP overhead, or remaining linear layers).
+
+---
+
+## 2026-07-02 — Experiment: AITER Triton RMSNorm for GemmaRMSNorm (the actual Qwen3.5 norm)
+
+**Hypothesis:** Qwen3.5 uses `GemmaRMSNorm` (computes `x * (1 + w)`) for all
+layer norms, not the regular `RMSNorm`. `GemmaRMSNorm` lacked a `forward_hip`
+method, so on ROCm it dispatched to `forward_native` (`ir.ops.rms_norm`). The
+AITER Triton RMSNorm optimization committed earlier (`8bae23d39`) only patched
+`RMSNorm.forward_hip` — which Qwen3.5 never uses — so it was effectively dead
+code. Furthermore, the `gemma_rms_norm` custom op was disabled by default
+(`custom_ops: ['+sparse_attn_indexer', 'none']` → `default_on() == False`), so
+the CustomOp dispatch went to `forward_native` regardless. Adding `forward_hip`
+to `GemmaRMSNorm` and enabling the custom op should yield a large prefill win
+(microbench: 3.57x faster at M=2048).
+
+**Investigation confirming the gap:**
+- `GemmaRMSNorm.enabled()` returned `False` with default config.
+- `_forward_method` was `forward_native`, not `forward_hip`.
+- The model has GPTQ `group_size=32`, so the W8A8 dispatch
+  (`c.group_size == 128`) is dead code — all linear layers use W8A16.
+
+**Changes:**
+- `vllm/model_executor/layers/layernorm.py`: Added `forward_hip` to
+  `GemmaRMSNorm`, mirroring `RMSNorm.forward_hip` but computing
+  `weight = (self.weight.float() + 1.0).to(x.dtype)` before calling AITER
+  `rms_norm` / `rmsnorm2d_fwd_with_add`. Falls back to native for M < 256.
+- `scripts/bench_c8.py` and `scripts/serve_direwolf_qwen36.sh`: Added
+  `"+gemma_rms_norm"` to `custom_ops` in compilation config to enable the
+  custom op dispatch.
+
+**Correctness:** `microbench_gemma_rmsnorm.py` PASS (rel error < 1e-3 for
+non-residual and residual paths at M=8/256/2048/5000). `test_int8_kv_micro.py`
+PASS.
+
+**Microbench (gfx908, fp16, hidden=5120):**
+- M=2048: native 0.859ms -> AITER 0.241ms (3.57x)
+- M=5000: native 2.121ms -> AITER 0.268ms (7.92x)
+- M=8: falls back to native (m < 256 threshold).
+
+**Benchmark (20:1 PP:TG, MTP-2, int8 KV, ROCM_AITER_UNIFIED_ATTN):**
+- Baseline (`aiter_w8a8_dispatch` warm): output 43.97, total 923.36 tok/s,
+  TTFT 20199ms, TPOT 94.26ms.
+- Cold run: output 45.35, total 952.32 tok/s, TTFT 19403ms, TPOT 91.56ms.
+- Warm run: output **46.87**, total **984.25** tok/s, TTFT **17994ms**,
+  TPOT **90.11ms**.
+- Warm vs baseline: **+6.6% output throughput**, **-10.9% TTFT**,
+  **-4.4% TPOT**.
+
+**Decision: Commit.** Clear win across all metrics. The AITER Triton RMSNorm
+was never actually used before because (a) GemmaRMSNorm had no forward_hip and
+(b) the custom op was disabled by default on gfx908.
+
+**Commit:** `74b760253` on `mi100-optimized`, pushed to `curvedinf/vllm-gfx908`.
+
+**New best baseline:** `gemma_rmsnorm_aiter_enabled_warm`.
+
+**Key learning:** On gfx908, `custom_ops` defaults to `['+sparse_attn_indexer',
+'none']`, meaning ALL custom ops are disabled unless explicitly enabled with
+`+name`. The previous `RMSNorm.forward_hip` commit was dead code. Any future
+CustomOp-based dispatch (e.g. SiluAndMul, RMSNormGated) must also be explicitly
+enabled in the compilation config.
+
