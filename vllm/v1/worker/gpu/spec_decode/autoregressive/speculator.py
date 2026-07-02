@@ -79,8 +79,13 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.num_speculative_steps + 1,
         )
 
-        # PIECEWISE cudagraphs are not supported for draft decodes.
-        if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
+        # PIECEWISE cudagraphs are not supported for draft decodes; fall back
+        # to FULL_DECODE_ONLY so the draft decode path still benefits from
+        # CUDA graphs instead of running eager.
+        if cudagraph_mode.decode_mode() in (
+            CUDAGraphMode.FULL,
+            CUDAGraphMode.FULL_AND_PIECEWISE,
+        ):
             cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
         else:
             cudagraph_mode = CUDAGraphMode.NONE
