@@ -109,7 +109,7 @@ class FatreluAndMul(CustomOp):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        self.op(out, x, self.threshold)
+        self.op(out, x)
         return out
 
 

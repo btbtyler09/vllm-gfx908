@@ -59,7 +59,7 @@ ARGS=(
   --max-num-seqs 8
   --gpu-memory-utilization 0.95
   --attention-backend TRITON_ATTN
-  --compilation-config '{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["+gemma_rms_norm","none"]}'
+  --compilation-config '{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["+gemma_rms_norm","+silu_and_mul","none"]}'
   --language-model-only
   --skip-mm-profiling
   --disable-custom-all-reduce

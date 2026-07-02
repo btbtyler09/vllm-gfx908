@@ -87,7 +87,7 @@ def main():
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--skip-server", action="store_true", help="assume server already running")
     parser.add_argument("--extra-vllm-args", default="", help="extra args passed to vllm serve")
-    parser.add_argument("--compilation-config", default='{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["+gemma_rms_norm","none"]}')
+    parser.add_argument("--compilation-config", default='{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["+gemma_rms_norm","+silu_and_mul","none"]}')
     parser.add_argument("--endpoint", default="/v1/completions", help="benchmark endpoint")
     args = parser.parse_args()
 

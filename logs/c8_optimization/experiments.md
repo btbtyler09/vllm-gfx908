@@ -1157,3 +1157,35 @@ was never actually used before because (a) GemmaRMSNorm had no forward_hip and
 CustomOp-based dispatch (e.g. SiluAndMul, RMSNormGated) must also be explicitly
 enabled in the compilation config.
 
+**Note on hardware:** MI100 int8 and fp16 have equal ops/s; int8 halves memory
+pressure. fp8/bf16/fp32 are 2x slower. fp16 elementwise/GEMM ops are targets
+for int8 conversion trials.
+
+---
+
+## 2026-07-02 — Experiment: AITER fused_silu_mul for SiluAndMul (ROLLED BACK)
+
+**Hypothesis:** Enabling `+silu_and_mul` custom op and adding `forward_hip`
+using AITER Triton `fused_silu_mul` would speed up the MLP activation in all 64
+layers. Previous attempt showed "no improvement" but that was dead code (custom
+op disabled). Re-evaluate with the op enabled.
+
+**Changes:**
+- Added `forward_hip` to `SiluAndMul` using AITER `fused_silu_mul` for M>=256.
+- Enabled `+silu_and_mul` in compilation config.
+
+**Benchmark (20:1 PP:TG, MTP-2, int8 KV, ROCM_AITER_UNIFIED_ATTN):**
+- Baseline (`gemma_rmsnorm_aiter_enabled_warm`): output 46.87, TTFT 17994ms.
+- Cold run: output 39.79, TTFT 26381ms — severe JIT penalty.
+- Warm run: output 46.24, TTFT 18543ms — within noise of baseline.
+
+**Decision: Revert AITER forward_hip.** SiluAndMul is memory-bandwidth-bound;
+both the C++ kernel and AITER Triton are equally fast in steady state. The
+AITER path adds JIT cold-start penalty without benefit. Keep `+silu_and_mul`
+enabled in config (C++ kernel is better than native PyTorch).
+
+**Learning:** Memory-bound elementwise ops (SiluAndMul, etc.) don't benefit
+from AITER Triton vs the existing C++ kernel. Focus int8 conversion efforts
+on compute-bound or bandwidth-critical paths (GEMM activations, attention).
+
+
