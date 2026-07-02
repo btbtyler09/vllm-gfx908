@@ -1220,5 +1220,68 @@ since `aiter_w8a8_dispatch`: 43.97 -> 49.34 (+12.2%).
 strategy on gfx908. Every CustomOp with forward_hip that the model uses
 should be explicitly enabled in the compilation config.
 
+---
+
+## 2026-07-02 — Experiment: waves_per_eu=1 for gfx908 2D prefill attention
+
+**Hypothesis:** The int8 attention microbench sweep (correct Qwen3.5-27B TP4
+shapes: hs=256, 6 query heads, 1 KV head) showed waves_per_eu=1 is 4.69x
+faster than the default waves_per_eu=2 for single-sequence 5000-token prefill.
+The previous waves_per_eu=1 attempt used num_warps=2 (which regressed); with
+num_warps=4 it should be a clear win.
+
+**Change:** In `aiter/ops/triton/attention/unified_attention.py`, set
+`waves_per_eu = 1` for gfx908 in `select_2d_config`.
+
+**Correctness:** `test_int8_kv_micro.py` PASS.
+
+**Benchmark (20:1 PP:TG, MTP-2, int8 KV, ROCM_AITER_UNIFIED_ATTN):**
+- Previous baseline: 49.96 out tok/s, TTFT 17012ms, TPOT 84.94ms.
+- Warm run: output **54.32**, total **1140.77** tok/s, TTFT **15772ms**,
+  TPOT **80.69ms**.
+- Warm vs baseline: **+8.7% output throughput**, **-7.3% TTFT**, **-5.0% TPOT**.
+
+**Decision: Commit.** Massive win from int8 attention config tuning.
+
+**Commit:** aiter `8260e88cc`; vllm `46e9f2ec2`.
+
+**New best baseline:** `int8_attn_wpeu1_prefill_warm`.
+
+**Cumulative since aiter_w8a8_dispatch:** 43.97 -> 54.32 (+23.5%).
+
+---
+
+## 2026-07-02 — Verification: decoder GEMM dtype audit + W8A8 sub-dot trial
+
+**Question:** Are the main decoder GEMMs using int8?
+
+**Finding:** GEMMs use **W8A16** (int8 weights, fp16 activations). The W8A8
+path (int8 activations) requires `group_size == 128` but the model has
+`group_size=32`, so it's dead code. All linear layers route through
+`gemm_a16w8_blockscale`.
+
+**Attempted fix:** Modified the a8w8 kernel to support `GROUP_K < BLOCK_SIZE_K`
+via 4 sub-dots of GROUP_K=32 within a BLOCK_SIZE_K=128 tile, enabling W8A8 for
+group_size=32.
+
+**Result:** Sub-dot W8A8 is **~2x slower** than W8A16 (0.47x-0.59x speedup).
+The int8 activation bandwidth savings (half the data per element) cannot
+overcome the 4x sub-dot overhead. MI100 int8 MFMA K=32 matches natively, but
+per-dot pipeline/register overhead dominates at this tile size.
+
+**Decision: Reverted.** W8A16 remains optimal for group_size=32 on MI100.
+Converting activations to int8 would require re-quantizing the model with
+group_size=128 to enable native BLOCK_SIZE_K=128 W8A8.
+
+**Summary table — current int8 status:**
+| Component | dtype | Notes |
+|---|---|---|
+| KV cache | int8 ✓ | per-token-head quantized |
+| Attention Q@K dot | int8 ✓ | Q quantized per-row, K from int8 cache |
+| GEMM weights | int8 ✓ | GPTQ 8-bit |
+| GEMM activations | fp16 | W8A8 not viable for gs=32 |
+| Attention P@V | fp16 | V dequantized int8→fp32→fp16 |
+
+
 
 
