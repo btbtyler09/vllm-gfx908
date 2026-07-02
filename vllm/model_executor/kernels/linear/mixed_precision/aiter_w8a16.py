@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""AITER Triton W8A16 (A16W8 blockscale) kernel for ROCm gfx908."""
+"""AITER Triton W8A16/W8A8 dynamic blockscale kernel for ROCm gfx908."""
 
 import torch
 
@@ -11,8 +11,65 @@ from vllm.scalar_type import scalar_types
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
+# AITER Triton kernels. Keep at module level to avoid repeated import overhead
+# inside the hot apply_weights path.
+from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import (
+    gemm_a16w8_blockscale,
+)
+from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
+    gemm_a8w8_blockscale,
+)
+
 _AITER_W8A16_SUPPORTED_QUANT_TYPES = [scalar_types.uint8b128]
 _AITER_W8A16_SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128, 256]
+
+# Dynamic dispatch threshold: microbenchmarks show AITER W8A8 is ~2.5x faster
+# than W8A16 for large-M prefill, while W8A16 is better for small-M decode.
+_W8A8_DISPATCH_MIN_M = 256
+
+
+def _get_aiter_w8a8_config(M: int, N: int, K: int, group_size: int):
+    """Select a gfx908-suitable AITER a8w8_blockscale config.
+
+    For W8A8 the activation and weight scales are block-wise along K with
+    BLOCK_SIZE_K=128, matching the GPTQ group_size. Microbench shows the same
+    large-M config as W8A16 works well.
+    """
+    if M <= 16:
+        block_m, block_n, num_warps, num_stages = 16, 64, 4, 2
+    elif M <= 32:
+        block_m, block_n, num_warps, num_stages = 32, 64, 4, 2
+    elif M <= 64:
+        block_m, block_n, num_warps, num_stages = 64, 64, 4, 2
+    else:
+        block_m, block_n, num_warps, num_stages = 128, 128, 8, 1
+
+    return {
+        "BLOCK_SIZE_M": block_m,
+        "BLOCK_SIZE_N": block_n,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 1,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+        "cache_modifier": ".cg",
+        "NUM_KSPLIT": 1,
+        "SPLITK_BLOCK_SIZE": 2048,
+    }
+
+
+def _quantize_activation_per_block(x: torch.Tensor, block_k: int = 128):
+    """Quantize FP16/BF16 activation to int8 with per-block K scales.
+
+    Returns (x_q, x_scale) where x_scale shape is [M, K//block_k].
+    """
+    M, K = x.shape
+    assert K % block_k == 0, f"K={K} not divisible by block_k={block_k}"
+    x_blocks = x.reshape(M, K // block_k, block_k)
+    absmax = x_blocks.abs().amax(dim=-1, keepdim=True)
+    scale = torch.where(absmax > 0, absmax / 127.0, torch.ones_like(absmax)).to(
+        x.dtype)
+    x_q = (x_blocks / scale).clamp(-128, 127).round().to(torch.int8)
+    return x_q.reshape(M, K), scale.squeeze(-1)
 
 
 def _get_aiter_w8a16_config(M: int, N: int, K: int, group_size: int):
@@ -54,8 +111,8 @@ class AiterW8A16LinearKernel(MPLinearKernel):
 
     SUPPORTED_QUANT_TYPES = _AITER_W8A16_SUPPORTED_QUANT_TYPES
 
-    # Per-process cache so we only JIT-compile each (M, N, K, group_size) once.
-    _WARMUP_CACHE: set[tuple[int, int, int, int]] = set()
+    # Per-process cache so we only JIT-compile each (kernel, M, N, K, gs) once.
+    _WARMUP_CACHE: set[tuple[str, int, int, int, int]] = set()
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -146,7 +203,7 @@ class AiterW8A16LinearKernel(MPLinearKernel):
         self._warmup(layer)
 
     def _warmup(self, layer: torch.nn.Module) -> None:
-        """JIT-compile AITER a16w8_blockscale configs used by this layer."""
+        """JIT-compile AITER a16w8_blockscale and a8w8_blockscale configs."""
 
         w_q, w_s, _, _ = self._get_weight_params(layer)
         N, K = w_q.shape
@@ -154,20 +211,15 @@ class AiterW8A16LinearKernel(MPLinearKernel):
         device = w_q.device
         dtype = self.config.act_type
 
-        # Cover all BLOCK_SIZE_M branches in _get_aiter_w8a16_config:
-        # M <= 16 -> 16, <= 32 -> 32, <= 64 -> 64, > 64 -> 128.
+        # Decode / small-M path: a16w8_blockscale.
         for M in (1, 17, 33, 65):
-            key = (M, N, K, gs)
+            key = ("a16w8", M, N, K, gs)
             if key in self._WARMUP_CACHE:
                 continue
             self._WARMUP_CACHE.add(key)
 
             x = torch.empty((M, K), dtype=dtype, device=device)
             cfg = _get_aiter_w8a16_config(M, N, K, gs)
-
-            from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import (
-                gemm_a16w8_blockscale,
-            )
 
             try:
                 gemm_a16w8_blockscale(
@@ -178,12 +230,40 @@ class AiterW8A16LinearKernel(MPLinearKernel):
                     config=cfg,
                 )
             except Exception as e:
-                # Warmup failures must not block model loading; the first real
-                # call will simply pay the JIT cost or surface the error then.
                 import warnings
 
                 warnings.warn(
                     f"AITER W8A16 warmup failed for (M={M}, N={N}, K={K}, gs={gs}): {e}"
+                )
+
+        # Large-M prefill path: a8w8_blockscale (only valid for 128-block scales).
+        if gs != 128:
+            return
+
+        for M in (256, 1024, 4096):
+            key = ("a8w8", M, N, K, gs)
+            if key in self._WARMUP_CACHE:
+                continue
+            self._WARMUP_CACHE.add(key)
+
+            x = torch.empty((M, K), dtype=dtype, device=device)
+            cfg = _get_aiter_w8a8_config(M, N, K, gs)
+
+            try:
+                x_q, x_s = _quantize_activation_per_block(x, block_k=128)
+                gemm_a8w8_blockscale(
+                    x_q,
+                    w_q,
+                    x_s,
+                    w_s,
+                    dtype=dtype,
+                    config=cfg,
+                )
+            except Exception as e:
+                import warnings
+
+                warnings.warn(
+                    f"AITER W8A8 warmup failed for (M={M}, N={N}, K={K}, gs={gs}): {e}"
                 )
 
     def apply_weights(
@@ -195,20 +275,32 @@ class AiterW8A16LinearKernel(MPLinearKernel):
         x_2d = x.reshape(-1, x.shape[-1]).contiguous()
         out_shape = x.shape[:-1] + (c.partition_weight_shape[1],)
 
-        from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import (
-            gemm_a16w8_blockscale,
-        )
-
         M, K = x_2d.shape
         N = w_q.shape[0]
-        cfg = _get_aiter_w8a16_config(M, N, K, c.group_size)
-        output = gemm_a16w8_blockscale(
-            x_2d,
-            w_q,
-            w_s,
-            dtype=x_2d.dtype,
-            config=cfg,
-        )
+
+        # Large-M prefill uses true INT8 compute (A8W8); decode stays on A16W8
+        # because microbenchmarks show W8A8 is no faster and sometimes slower
+        # for small M, while W8A16 avoids the activation quantization overhead.
+        if M >= _W8A8_DISPATCH_MIN_M and c.group_size == 128:
+            x_q, x_s = _quantize_activation_per_block(x_2d, block_k=128)
+            cfg = _get_aiter_w8a8_config(M, N, K, c.group_size)
+            output = gemm_a8w8_blockscale(
+                x_q,
+                w_q,
+                x_s,
+                w_s,
+                dtype=x_2d.dtype,
+                config=cfg,
+            )
+        else:
+            cfg = _get_aiter_w8a16_config(M, N, K, c.group_size)
+            output = gemm_a16w8_blockscale(
+                x_2d,
+                w_q,
+                w_s,
+                dtype=x_2d.dtype,
+                config=cfg,
+            )
 
         if bias is not None:
             output.add_(bias)
