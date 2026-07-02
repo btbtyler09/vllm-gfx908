@@ -126,6 +126,53 @@ class RMSNorm(CustomOp):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         return self.forward_cuda(x, residual)
 
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """ROCm path: use AITER Triton RMSNorm for large-M tensors.
+
+        Microbenchmark shows AITER Triton RMSNorm is ~4x faster than the
+        inductor-native path for prefill-sized inputs (M>=~512) and only
+        slightly slower for tiny decode inputs. We dispatch on M to avoid any
+        decode regression.
+        """
+        from aiter.ops.triton.normalization.rmsnorm import (
+            rms_norm as aiter_rms_norm,
+            rmsnorm2d_fwd_with_add as aiter_rmsnorm_add,
+        )
+
+        # AITER kernels expect 2D input.
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, orig_shape[-1]).contiguous()
+        m = x_2d.shape[0]
+
+        # Crossover where AITER wins on gfx908 (microbench: ~M=512).
+        if m < 256:
+            return self.forward_native(x, residual)
+
+        weight = self.weight.data
+        eps = self.variance_epsilon
+
+        if residual is None:
+            out_2d = aiter_rms_norm(x_2d, weight, eps)
+            return out_2d.reshape(orig_shape)
+
+        # fused add + rmsnorm
+        residual_2d = residual.reshape(-1, orig_shape[-1]).contiguous()
+        out_2d = torch.empty_like(x_2d)
+        res_out_2d = torch.empty_like(residual_2d)
+        aiter_rmsnorm_add(
+            out_2d,
+            x_2d,
+            residual_2d,
+            res_out_2d,
+            weight,
+            eps,
+        )
+        return out_2d.reshape(orig_shape), res_out_2d.reshape(residual.shape)
+
     def extra_repr(self) -> str:
         s = f"hidden_size={self.weight.data.size(0)}"
         s += f", eps={self.variance_epsilon}"
