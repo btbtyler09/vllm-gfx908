@@ -38,7 +38,6 @@ COMMON_ENV=(
   VLLM_TARGET_DEVICE="rocm"
   VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="1800"
   VLLM_ROCM_USE_AITER="1"
-  VLLM_ROCM_USE_AITER_LINEAR="1"
   VLLM_ROCM_USE_AITER_TRITON_GEMM="1"
   VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION="0"
   NCCL_ALGO="Ring"
@@ -52,13 +51,12 @@ COMMON_ENV=(
 ARGS=(
   serve "${MODEL_DIR}"
   --served-model-name "${SERVED_MODEL_NAME}"
-  --chat-template /home/curved/vllm-gfx908/chat-templates/qwen3.6-enhanced.jinja
   --host "${HOST}"
   --port "${PORT}"
   --tensor-parallel-size 4
   --dtype half
   --max-model-len 65536
-  --max-num-seqs 8
+  --max-num-seqs 32
   --gpu-memory-utilization 0.95
   --attention-backend TRITON_ATTN
   --compilation-config '{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["+gemma_rms_norm","+silu_and_mul","+rms_norm_gated","+rotary_embedding","+apply_rotary_emb","none"]}'
@@ -67,21 +65,13 @@ ARGS=(
   --disable-custom-all-reduce
   --disable-log-stats
   --disable-uvicorn-access-log
-  # Tool-call parser: testing qwen3_xml for this Qwen3.5 model.
   --enable-auto-tool-choice
-  --tool-call-parser qwen3_xml
-  --override-generation-config '{"temperature":0.7,"top_p":0.80,"top_k":20,"min_p":0.0,"presence_penalty":1.5,"repetition_penalty":1.0}'
+  --tool-call-parser qwen3_coder
+  --default-chat-template-kwargs '{"enable_thinking":false}'
+  --override-generation-config '{"temperature":0.6,"top_p":0.95,"top_k":20,"min_p":0.0,"presence_penalty":0.0,"repetition_penalty":1.0}'
   --kv-cache-dtype int8
-  --block-size 32
+  --speculative-config '{"method":"mtp","num_speculative_tokens":2,"rejection_sample_method":"standard"}'
 )
-
-# MTP is on by default because it improves decode-heavy throughput once the
-# stack is properly optimized.  Set QWEN36_MTP=0 to disable it.
-if [[ "${QWEN36_MTP:-1}" != "0" ]]; then
-  ARGS+=(
-    --speculative-config '{"method":"mtp","num_speculative_tokens":4,"rejection_sample_method":"standard"}'
-  )
-fi
 
 usage() {
   printf 'usage: %s {start|stop|restart|status|supervise}\n' "$0"
