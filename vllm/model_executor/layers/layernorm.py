@@ -218,6 +218,48 @@ class GemmaRMSNorm(CustomOp):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         return self.forward_native(x, residual)
 
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """ROCm path: use AITER Triton RMSNorm for large-M tensors.
+
+        Mirrors RMSNorm.forward_hip but applies the Gemma (1 + w) weight
+        adjustment before dispatching to AITER.
+        """
+        from aiter.ops.triton.normalization.rmsnorm import (
+            rms_norm as aiter_rms_norm,
+            rmsnorm2d_fwd_with_add as aiter_rmsnorm_add,
+        )
+
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, orig_shape[-1]).contiguous()
+        m = x_2d.shape[0]
+
+        if m < 256:
+            return self.forward_native(x, residual)
+
+        weight = (self.weight.float() + 1.0).to(x_2d.dtype)
+        eps = self.variance_epsilon
+
+        if residual is None:
+            out_2d = aiter_rms_norm(x_2d, weight, eps)
+            return out_2d.reshape(orig_shape)
+
+        residual_2d = residual.reshape(-1, orig_shape[-1]).contiguous()
+        out_2d = torch.empty_like(x_2d)
+        res_out_2d = torch.empty_like(residual_2d)
+        aiter_rmsnorm_add(
+            out_2d,
+            x_2d,
+            residual_2d,
+            res_out_2d,
+            weight,
+            eps,
+        )
+        return out_2d.reshape(orig_shape), res_out_2d.reshape(residual.shape)
+
 
 # --8<-- [start:rms_norm_gated]
 @CustomOp.register("rms_norm_gated")
