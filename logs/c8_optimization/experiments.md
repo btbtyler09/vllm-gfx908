@@ -1282,6 +1282,31 @@ group_size=128 to enable native BLOCK_SIZE_K=128 W8A8.
 | GEMM activations | fp16 | W8A8 not viable for gs=32 |
 | Attention P@V | fp16 | V dequantized int8→fp32→fp16 |
 
+---
+
+## 2026-07-02 — Experiment: tune gfx908 3D decode attention (num_warps=4, num_stages=1)
+
+**Hypothesis:** Decode attention microbench sweep (8seq × 5000ctx, int8 KV,
+6/1 heads, hs=256) showed num_warps=4 + num_stages=1 is 1.29x faster than the
+default num_warps=2 + num_stages=2.
+
+**Change:** In `select_3d_config` gfx908 branch, set `attn_warps=4,
+attn_stages=1`.
+
+**Benchmark (20:1 PP:TG, MTP-2, int8 KV):**
+- Previous baseline: 54.32 out tok/s, TTFT 15772ms, TPOT 80.69ms.
+- Warm: 54.81 out tok/s (+0.9%), TTFT 15595ms (-1.1%), **TPOT 75.68ms (-6.2%)**.
+
+**Decision: Commit.** Clear decode win.
+
+**Commit:** aiter `bda2a132d`.
+
+**New best baseline:** `int8_decode_w4s1_warm`.
+
+**Cumulative since aiter_w8a8_dispatch:** 43.97 -> 54.81 (+24.7%), TPOT
+94.26 -> 75.68 (-19.7%).
+
+
 
 
 
