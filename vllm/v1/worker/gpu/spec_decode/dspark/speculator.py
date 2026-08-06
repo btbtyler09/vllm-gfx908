@@ -137,8 +137,8 @@ class DSparkSpeculator(DFlashSpeculator):
                     self.seeds,
                     sample_pos[:, i] - 1,
                     apply_temperature=True,
-                    output_processed_logits=self.draft_logits,
-                    output_processed_logits_col=self._step_cols[i],
+                    logits_cache=self.draft_logits,
+                    logits_cache_col=self._step_cols[i],
                     use_fp64=self.use_fp64_gumbel,
                 )
             else:
