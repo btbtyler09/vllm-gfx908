@@ -6,7 +6,7 @@
 # prebuilt aiter-mi100 image (set AITER_FROM_GIT=0 to skip the in-image build).
 ARG REMOTE_VLLM="0"
 ARG COMMON_WORKDIR=/app
-ARG BASE_IMAGE=btbtyler09/vllm-dev-mi100:2026.04.18
+ARG BASE_IMAGE=btbtyler09/vllm-dev-mi100:2026.04.19
 ARG AITER_GIT_REPO=https://github.com/btbtyler09/aiter-gfx908.git
 # Pinned to the 2026-08 upstream-AITER sync (577 commits on top of the June
 # sync; flydsl 0.3.0, upstream arch-map gate for is_flydsl_available).
