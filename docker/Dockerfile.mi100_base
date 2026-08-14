@@ -1,8 +1,8 @@
-ARG BASE_IMAGE=rocm/dev-ubuntu-22.04:7.2.1-complete
-ARG TRITON_BRANCH="ba5c1517"
+ARG BASE_IMAGE=rocm/dev-ubuntu-22.04:7.2.4-complete
+ARG TRITON_BRANCH="0f380657"
 ARG TRITON_REPO="https://github.com/ROCm/triton.git"
 # ROCm/pytorch release/2.10 tip as of 2026-03-17 (matches AMD's vLLM ROCm base pins).
-ARG PYTORCH_BRANCH="8514f051"
+ARG PYTORCH_BRANCH="d0c8b1f3"
 ARG PYTORCH_REPO="https://github.com/ROCm/pytorch.git"
 ARG PYTORCH_VISION_BRANCH="v0.24.1"
 ARG PYTORCH_VISION_REPO="https://github.com/pytorch/vision.git"
@@ -11,7 +11,7 @@ ARG PYTORCH_AUDIO_REPO="https://github.com/pytorch/audio.git"
 # Upstream Dao-AILab FA does not support gfx908 (MI200+ only), so keep our fork.
 ARG FA_BRANCH="main"
 ARG FA_REPO="https://github.com/btbtyler09/flash-attention-gfx908.git"
-ARG AITER_BRANCH="mi100-optimized"
+ARG AITER_BRANCH="mi100-aiter-sync-2026-08"
 ARG AITER_REPO="https://github.com/btbtyler09/aiter-gfx908.git"
 
 FROM ${BASE_IMAGE} AS base
