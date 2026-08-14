@@ -234,6 +234,11 @@ if _ON_GFX908:
         "VLLM_ROCM_USE_AITER_MHA": "0",
         "VLLM_ROCM_USE_AITER_MLA": "0",
         "VLLM_ROCM_USE_AITER_RMSNORM": "0",
+        # AITER custom allreduce (2026-08 rewrite: fp8 quant + fused AR+RMSNorm)
+        # compiles on gfx908 with the opus.hpp guards but computes garbage —
+        # A/B on Qwen3.8-27B TP4: CAR on = degenerate '!!!' output, CAR off =
+        # coherent. Default off until the CDNA1 numerics are debugged.
+        "VLLM_ROCM_USE_AITER_CUSTOM_AR": "0",
         # Disable FP8/FP4 (no hardware support)
         "VLLM_ROCM_USE_AITER_FP8BMM": "0",
         "VLLM_ROCM_USE_AITER_FP4BMM": "0",
