@@ -28,6 +28,7 @@ ARG AITER_FROM_GIT
 ENV GPU_ARCHS=gfx908
 ENV PREBUILD_KERNELS=0
 RUN if [ "$AITER_FROM_GIT" = "1" ]; then \
+        cd / && rm -rf /workspace/aiter && \
         git clone --recursive "$AITER_GIT_REPO" /workspace/aiter && \
         cd /workspace/aiter && git checkout "$AITER_GIT_REF" && \
         git submodule update --init --recursive && \
