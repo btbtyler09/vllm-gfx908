@@ -1315,6 +1315,11 @@ class MambaManager(SingleTypeKVCacheManager):
             max_num_partial_units = min(
                 max_length // hash_block_size, len(block_hashes)
             )
+            if drop_eagle_block and max_num_partial_units > 0:
+                # Spec decode: the final block's mamba state includes
+                # partially-accepted tokens (upstream #43559/#43650) — never
+                # match within the last full block.
+                max_num_partial_units = max(max_num_partial_units - scale_factor, 0)
             for fine_idx in range(max_num_partial_units - 1, -1, -1):
                 num_tokens = (fine_idx + 1) * hash_block_size
                 block_hash = block_hashes[fine_idx]
@@ -1330,6 +1335,12 @@ class MambaManager(SingleTypeKVCacheManager):
             return computed_blocks, hit_length
 
         max_num_blocks = max_length // block_size
+        if drop_eagle_block and max_num_blocks > 0:
+            # Full-attention lookup matches one extra block then drops it as
+            # only partially accepted. Mamba state blocks are [null, ..., state]
+            # so popping after a match would remove the state — instead search
+            # only up to the boundary (upstream #43650).
+            max_num_blocks -= 1
         # Search from right to left and early stop when a match is found.
         for i in range(max_num_blocks - 1, -1, -1):
             if cached_block := block_pool.get_cached_block(
