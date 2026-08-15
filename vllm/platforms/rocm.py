@@ -277,6 +277,12 @@ if _ON_GFX908:
         # per-step all-reduces decode produces.
         "NCCL_ALGO": "Tree",
         "NCCL_PROTO": "LL",
+        # ROCm 7.2.4 hipBLASLt grew gfx908 addmm coverage with untuned
+        # heuristics: MTP verify GEMMs pick slow kernels (+15% TPOT on
+        # long-prompt spec decode). rocBLAS fallback restores the pre-7.2.4
+        # behavior, which was tuned on this fabric. A/B 2026-08-15:
+        # LT 15.2-17ms vs rocBLAS 14.7ms TPOT (old base 14.3).
+        "DISABLE_ADDMM_HIP_LT": "1",
     }
     for _var, _val in _GFX908_DEFAULTS.items():
         if _var not in os.environ:
@@ -1010,15 +1016,25 @@ class RocmPlatform(Platform):
                 speculative_config is not None
                 and getattr(speculative_config, "method", None) == "mtp"
             ):
+                # torch >= 2.11 no longer queries HIP events from the
+                # ProcessGroupNCCL watchdog during capture; the blocking-wait
+                # workaround costs ~1 ms/step under MTP, so only apply it on
+                # older torch (verified 2026-08-15: capture succeeds on 2.11
+                # without it).
+                import torch as _torch
+
+                _needs_blocking_wait = tuple(
+                    int(x) for x in _torch.__version__.split(".")[:2]
+                ) < (2, 11)
                 blocking_wait = os.environ.get("TORCH_NCCL_BLOCKING_WAIT")
-                if blocking_wait is None:
+                if blocking_wait is None and _needs_blocking_wait:
                     os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"
                     logger.info_once(
                         "gfx908 (MI100): setting TORCH_NCCL_BLOCKING_WAIT=1 for "
                         "MTP CUDA graph capture (avoids ProcessGroupNCCL "
                         "watchdog HIP-event queries during capture)."
                     )
-                elif blocking_wait != "1":
+                elif _needs_blocking_wait and blocking_wait != "1":
                     logger.warning_once(
                         "gfx908 (MI100): MTP CUDA graph capture may fail "
                         "because TORCH_NCCL_BLOCKING_WAIT=%r. Set it to 1.",
