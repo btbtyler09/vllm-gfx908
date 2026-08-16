@@ -241,6 +241,112 @@ def triton_w8a16_gemm_kernel(
     tl.store(c_ptrs, c, mask=mask_c)
 
 
+@triton.jit
+def triton_w8a16_dequant_kernel(
+    b_ptr,           # [K, N//4] int32 packed weights
+    scales_ptr,      # [K//G, N] fp16/bf16
+    zeros_ptr,       # [K//G, N//4] int32 (unused when HAS_ZP=False)
+    out_ptr,         # [K, N] fp16 output
+    N, K,
+    stride_bk, stride_bn,
+    group_size,
+    HAS_ZP: tl.constexpr,
+    ZP_BIAS: tl.constexpr,
+    ZERO_OFFSET: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_N4: tl.constexpr,
+):
+    """Dequantize a [K, N//4]-packed GPTQ8 weight to dense fp16 [K, N].
+
+    Same dequant math as triton_w8a16_gemm_kernel (weights materialize in
+    a.dtype before the multiply there; here they materialize in out dtype),
+    so the dequant+hgemm route sees the same weight values as the fused
+    MFMA route.
+    """
+    pid_k = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    offs_n4 = pid_n * BLOCK_N4 + tl.arange(0, BLOCK_N4)
+    mask_k = offs_k < K
+    mask_n4 = offs_n4 < (N // 4)
+
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n4[None, :] * stride_bn
+    b_packed = tl.load(b_ptrs, mask=mask_k[:, None] & mask_n4[None, :], other=0)
+
+    # Unpack int8: 2 interleaves expand last dim by 4
+    b = tl.interleave(b_packed, b_packed)
+    b = tl.interleave(b, b)
+    shifts_row = tl.arange(0, 4) * 8
+    shifts_1d = tl.reshape(
+        tl.broadcast_to(shifts_row[None, :], (BLOCK_N4, 4)), (BLOCK_N4 * 4,)
+    )
+    b = (b >> shifts_1d[None, :]) & 0xFF  # [BLOCK_K, BLOCK_N]
+
+    offs_n = pid_n * BLOCK_N4 * 4 + tl.arange(0, BLOCK_N4 * 4)
+    mask_n = offs_n < N
+    g_idx = offs_k // group_size
+    scales = tl.load(
+        scales_ptr + g_idx[:, None] * N + offs_n[None, :],
+        mask=mask_k[:, None] & mask_n[None, :],
+        other=1.0,
+    )
+
+    if HAS_ZP:
+        z_packed = tl.load(
+            zeros_ptr + g_idx[:, None] * (N // 4) + offs_n4[None, :],
+            mask=mask_k[:, None] & mask_n4[None, :],
+            other=0,
+        )
+        z = tl.interleave(z_packed, z_packed)
+        z = tl.interleave(z, z)
+        z = (z >> shifts_1d[None, :]) & 0xFF
+        z += ZERO_OFFSET
+    else:
+        z = tl.full((BLOCK_K, BLOCK_N4 * 4), ZP_BIAS, dtype=tl.int32)
+
+    w = (b - z).to(out_ptr.type.element_ty) * scales
+
+    out_ptrs = out_ptr + offs_k[:, None] * N + offs_n[None, :]
+    tl.store(out_ptrs, w, mask=mask_k[:, None] & mask_n[None, :])
+
+
+def triton_w8a16_dequant(
+    b_q: torch.Tensor,         # [K, N//4] int32
+    scales: torch.Tensor,      # [K//G, N] fp16/bf16
+    qzeros: torch.Tensor | None,
+    group_size: int,
+    zp_bias: int = 128,
+    zero_offset: int = 0,
+) -> torch.Tensor:
+    """Dequantize GPTQ8 packed weights to a dense [K, N] tensor.
+
+    Used by the gfx908 dual dispatch for M > dequant threshold: at high M
+    (prefill chunks) dequant-once + rocBLAS hgemm beats the fused Triton
+    MFMA kernel ~1.4x (the fused kernel is stuck at BLOCK_K=group_size).
+    """
+    K = b_q.shape[0]
+    N = b_q.shape[1] * 4
+    out = torch.empty((K, N), dtype=scales.dtype, device=b_q.device)
+    has_zp = qzeros is not None
+    zeros_ptr = qzeros if has_zp else b_q  # dummy ptr when unused
+    BLOCK_K, BLOCK_N4 = 32, 64
+    grid = (triton.cdiv(K, BLOCK_K), triton.cdiv(N // 4, BLOCK_N4))
+    triton_w8a16_dequant_kernel[grid](
+        b_q, scales, zeros_ptr, out,
+        N, K,
+        b_q.stride(0), b_q.stride(1),
+        group_size=group_size,
+        HAS_ZP=has_zp,
+        ZP_BIAS=zp_bias,
+        ZERO_OFFSET=zero_offset,
+        BLOCK_K=BLOCK_K,
+        BLOCK_N4=BLOCK_N4,
+        num_warps=4,
+    )
+    return out
+
+
 def _pick_block_sizes(M: int, N: int, K: int, group_size: int):
     """Per-arch block-size heuristics for W8A16 decode.
 

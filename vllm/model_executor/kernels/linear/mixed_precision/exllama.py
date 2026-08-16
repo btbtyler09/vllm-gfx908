@@ -17,7 +17,7 @@ from vllm.scalar_type import scalar_types
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
-from .triton_w8a16 import triton_w8a16_gemm
+from .triton_w8a16 import triton_w8a16_dequant, triton_w8a16_gemm
 
 logger = init_logger(__name__)
 
@@ -41,12 +41,26 @@ def _gptq_dual_gemm_gfx908_impl(
     scales: torch.Tensor,
     g_idx: torch.Tensor,
     mthresh: int,
+    dequant_mthresh: int,
     group_size: int,
     zero_offset: int,
     exllama_ready: bool,
     use_v2: bool,
     bit: int,
 ) -> torch.Tensor:
+    if x.shape[0] > dequant_mthresh:
+        # Prefill/high-batch: dequant-once + rocBLAS hgemm. The fused Triton
+        # MFMA kernel is capped at BLOCK_K=group_size (=32 for our
+        # checkpoints), which costs ~1.4x vs hgemm at M>=~512.
+        w = triton_w8a16_dequant(
+            b_q=qweight_repacked,
+            scales=scales,
+            qzeros=qzeros,
+            group_size=group_size,
+            zp_bias=0,
+            zero_offset=zero_offset,
+        )
+        return torch.mm(x, w)
     if x.shape[0] > mthresh:
         return triton_w8a16_gemm(
             a=x,
@@ -68,6 +82,7 @@ def _gptq_dual_gemm_gfx908_fake(
     scales: torch.Tensor,
     g_idx: torch.Tensor,
     mthresh: int,
+    dequant_mthresh: int,
     group_size: int,
     zero_offset: int,
     exllama_ready: bool,
@@ -136,6 +151,16 @@ def _gfx908_gptq8_mthresh() -> int:
         return int(os.environ.get("VLLM_GFX908_GPTQ8_MTHRESH", "16"))
     except ValueError:
         return 16
+
+
+def _gfx908_gptq8_dequant_mthresh() -> int:
+    """M above which the dual op dequantizes + uses rocBLAS hgemm instead of
+    the fused Triton MFMA kernel. Crossover measured ~512 on granite-4B
+    shapes (wash at M=256, 1.4x win at M=2048). Set very large to disable."""
+    try:
+        return int(os.environ.get("VLLM_GFX908_GPTQ8_DEQUANT_MTHRESH", "512"))
+    except ValueError:
+        return 512
 
 
 class ExllamaLinearKernel(MPLinearKernel):
@@ -323,6 +348,7 @@ class ExllamaLinearKernel(MPLinearKernel):
                 w_s,
                 w_g_idx,
                 _gfx908_gptq8_mthresh(),
+                _gfx908_gptq8_dequant_mthresh(),
                 c.group_size,
                 zero_offset,
                 True,

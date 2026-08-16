@@ -966,6 +966,33 @@ def unified_attention(
         launch_num_warps = 8
         launch_num_stages = 2
 
+    # gfx908 (MI100) prefill-shaped launches with small num_queries_per_kv
+    # (e.g. GQA 40/8 -> BLOCK_Q=3) under-tile the same way the large-head
+    # B200 case above does: few query rows per program, narrow KV tile.
+    # Opt-in experiment gate; decode-only launches (max_seqlen_q == 1,
+    # captured in FULL cudagraphs) are unaffected.
+    # Modes: "block32" = BLOCK_M 32 + 8 warps (measured -15% on granite-4B
+    # GQA40/8 head64 -- occupancy loss); "tile64" = widen the prefill KV
+    # tile only. Default off.
+    tuned_gfx908_prefill_mode = ""
+    if not tuned_large_head and max_seqlen_q > 1 and num_queries_per_kv <= 16:
+        import os as _os
+
+        try:
+            from vllm.platforms.rocm import on_gfx908 as _on_gfx908_fn
+
+            if _on_gfx908_fn():
+                tuned_gfx908_prefill_mode = _os.environ.get(
+                    "VLLM_GFX908_ATTN_PREFILL_TUNE", ""
+                ).strip()
+        except Exception:
+            tuned_gfx908_prefill_mode = ""
+    if tuned_gfx908_prefill_mode in ("1", "block32"):
+        BLOCK_M = 32
+        BLOCK_Q = BLOCK_M // num_queries_per_kv
+        launch_num_warps = 8
+        launch_num_stages = 2
+
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
     # However, it is slow to realize the query_lens on cpu.
@@ -998,6 +1025,8 @@ def unified_attention(
     # path (used when max_seqlen_q > 1) reads TILE_SIZE_PREFILL.
     if tuned_large_head:
         TILE_SIZE_PREFILL = 128
+    elif tuned_gfx908_prefill_mode == "tile64":
+        TILE_SIZE_PREFILL = 64
 
     # USE_TD requires BLOCK_SIZE % TILE_SIZE == 0 (enforced by a
     # ``tl.static_assert`` in the kernel).  The default prefill tile
