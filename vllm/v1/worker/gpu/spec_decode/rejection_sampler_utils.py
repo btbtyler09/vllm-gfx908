@@ -799,7 +799,8 @@ def _resample_kernel(
         seed_ptr,
         pos_ptr,
         None,  # logits_cache_ptr
-        0,  # logits_cache_stride
+        0,  # logits_cache_stride_0
+        0,  # logits_cache_stride_1
         None,  # logits_cache_col_ptr
         vocab_size,
         APPLY_TEMPERATURE=False,
