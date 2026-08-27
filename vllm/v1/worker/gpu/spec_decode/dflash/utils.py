@@ -28,6 +28,18 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         draft_model_config.hf_config.is_neox_style = is_neox_style
     # Select an attention backend that supports the drafter's attention: mixing
     # a non-causal layer onto a causal-only backend would fail.
+    draft_cache_dtype = speculative_config.kv_cache_dtype
+    if (
+        draft_cache_dtype is None
+        and vllm_config.cache_config.cache_dtype == "auto"
+        and draft_model_config.dtype != vllm_config.model_config.dtype
+    ):
+        # The drafter may run in a different dtype than the target (bf16 draft
+        # under an fp16 target — see the SpeculativeConfig draft dtype note).
+        # "auto" would resolve the draft's KV cache against the TARGET model
+        # dtype, and attention kernels reject a Q/KV-cache dtype mix, so pin
+        # the draft cache to the draft dtype instead.
+        draft_cache_dtype = str(draft_model_config.dtype).removeprefix("torch.")
     draft_vllm_config = replace(
         vllm_config,
         attention_config=replace(
@@ -38,9 +50,9 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         cache_config=(
             replace(
                 vllm_config.cache_config,
-                cache_dtype=speculative_config.kv_cache_dtype,
+                cache_dtype=draft_cache_dtype,
             )
-            if speculative_config.kv_cache_dtype is not None
+            if draft_cache_dtype is not None
             else vllm_config.cache_config
         ),
     )
