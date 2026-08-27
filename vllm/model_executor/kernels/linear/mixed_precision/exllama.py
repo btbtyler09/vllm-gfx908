@@ -17,6 +17,7 @@ from vllm.scalar_type import scalar_types
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
+from .triton_w4a16 import triton_w4a16_dequant, triton_w4a16_gemm
 from .triton_w8a16 import triton_w8a16_dequant, triton_w8a16_gemm
 
 logger = init_logger(__name__)
@@ -48,6 +49,30 @@ def _gptq_dual_gemm_gfx908_impl(
     use_v2: bool,
     bit: int,
 ) -> torch.Tensor:
+    if bit == 4:
+        # GPTQ4 (uint4b8, symmetric): the fused/dequant Triton W4A16 paths
+        # take qzeros=None + zp_bias=8; the stored qzeros (constant 7) are
+        # only consumed by the native exllama path below.
+        if x.shape[0] > dequant_mthresh:
+            w = triton_w4a16_dequant(
+                b_q=qweight_repacked,
+                scales=scales,
+                group_size=group_size,
+                zp_bias=8,
+            )
+            return torch.mm(x, w)
+        if x.shape[0] > mthresh:
+            return triton_w4a16_gemm(
+                a=x,
+                b_q=qweight_repacked,
+                scales=scales,
+                qzeros=None,
+                group_size=group_size,
+                zp_bias=8,
+            )
+        return ops.gptq_gemm(
+            x, qweight, qzeros, scales, g_idx, exllama_ready, use_v2, bit
+        )
     if x.shape[0] > dequant_mthresh:
         # Prefill/high-batch: dequant-once + rocBLAS hgemm. The fused Triton
         # MFMA kernel is capped at BLOCK_K=group_size (=32 for our
@@ -122,6 +147,52 @@ def _repack_gptq8_qweight_for_triton_w8a16(qweight: torch.Tensor) -> torch.Tenso
         dtype=torch.int32,
     )
     return repacked.contiguous()
+
+
+def _repack_gptq4_qweight_for_triton_w4a16(qweight: torch.Tensor) -> torch.Tensor:
+    """Convert a GPTQ4 K-packed qweight [K//8, N] to the [K, N//8] layout the
+    Triton W4A16 MFMA kernel consumes. Requires N divisible by 8; callers must
+    fall back to the native path when it is not."""
+    k8, output_size = qweight.shape
+    if output_size % 8 != 0:
+        raise ValueError(
+            "Triton W4A16 GPTQ path requires output features divisible by 8, "
+            f"got {output_size}."
+        )
+    shifts = torch.arange(8, device=qweight.device, dtype=torch.int32) * 4
+    qweight_by_output = qweight.t().contiguous()
+    unpacked = ((qweight_by_output.unsqueeze(-1) >> shifts) & 0xF).reshape(
+        output_size, k8 * 8
+    )
+    unpacked = unpacked.t().contiguous()
+    repacked = torch.sum(
+        (unpacked.view(k8 * 8, output_size // 8, 8) & 0xF) << shifts,
+        dim=2,
+        dtype=torch.int32,
+    )
+    return repacked.contiguous()
+
+
+def _gfx908_gptq4_dual_enabled(c: MPLinearLayerConfig) -> bool:
+    """gfx908 GPTQ4 dual-layout dispatch (default OFF until suite-validated).
+
+    VLLM_GFX908_GPTQ4 = "dual" keeps BOTH weight layouts resident: native
+    K-packed exllama for M<=MTHRESH (decode, zero regression, cudagraph'd) +
+    repacked [K, N//8] Triton W4A16 MFMA / dequant+hgemm for M>MTHRESH
+    (prefill/high-batch). Symmetric uint4b8 only — the Triton path assumes
+    the constant zp=8. Costs half a qweight copy in VRAM. Default "native"
+    per the env-gated-until-validated rule; flip after a full-suite win.
+    """
+    if c.weight_type != scalar_types.uint4b8 or c.has_g_idx:
+        return False
+    try:
+        from vllm.platforms.rocm import on_gfx908
+
+        if not (current_platform.is_rocm() and on_gfx908()):
+            return False
+    except Exception:
+        return False
+    return os.environ.get("VLLM_GFX908_GPTQ4", "native").strip().lower() == "dual"
 
 
 def _gfx908_gptq8_dual_enabled(c: MPLinearLayerConfig) -> bool:
@@ -281,22 +352,28 @@ class ExllamaLinearKernel(MPLinearKernel):
 
             permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
             x_cont = x.data.contiguous()
+            dual_repack = None
             if _gfx908_gptq8_dual_enabled(c):
+                dual_repack = _repack_gptq8_qweight_for_triton_w8a16
+            elif _gfx908_gptq4_dual_enabled(c):
+                dual_repack = _repack_gptq4_qweight_for_triton_w4a16
+            if dual_repack is not None:
                 # dual: materialize a SEPARATE repacked qweight copy for the
                 # high-M Triton MFMA path BEFORE gptq_shuffle reorders the
                 # K-packed layout the repack expects. scales/qzeros are shared.
-                # Any layer whose repack is unsupported (e.g. N % 4 != 0) or
-                # OOMs degrades to the native path rather than crashing load.
+                # Any layer whose repack is unsupported (e.g. N not divisible
+                # by the pack factor) or OOMs degrades to the native path
+                # rather than crashing load.
                 try:
                     layer.gptq_qweight_repacked = torch.nn.Parameter(
-                        _repack_gptq8_qweight_for_triton_w8a16(x_cont),
+                        dual_repack(x_cont),
                         requires_grad=False,
                     )
                     layer.gptq_dual_ready = True
                 except Exception as e:
                     if not getattr(ExllamaLinearKernel, "_dual_fallback_warned", False):
                         logger.warning(
-                            "gfx908 GPTQ8 dual repack unavailable (%s); falling "
+                            "gfx908 GPTQ dual repack unavailable (%s); falling "
                             "back to native exllama for affected layers.",
                             e,
                         )

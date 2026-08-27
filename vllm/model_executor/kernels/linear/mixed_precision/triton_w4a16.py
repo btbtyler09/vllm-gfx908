@@ -211,6 +211,12 @@ def triton_w4a16_gemm(
     if current_platform.is_rocm():
         from vllm.platforms.rocm import on_gfx1x
 
+        try:
+            from vllm.platforms.rocm import on_gfx908
+            is_gfx908 = on_gfx908()
+        except Exception:
+            is_gfx908 = False
+
         if on_gfx1x():
             # Tuned for RDNA 3.5 (gfx1151, 40 CUs, 32-wide wavefronts).
             if M <= 32:
@@ -219,6 +225,18 @@ def triton_w4a16_gemm(
                 BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
             else:
                 BLOCK_M, BLOCK_N, BLOCK_K = 128, 32, 64
+        elif is_gfx908:
+            # gfx908: 120 CUs, 64-wide wavefronts, ~1.2 TB/s HBM2. Mirrors
+            # the W8A16 gfx908 tiles: favor more N-tiles to saturate CUs at
+            # low M (used by the GPTQ4 dual dispatch for prefill M).
+            if M <= 16:
+                BLOCK_M, BLOCK_N, BLOCK_K = 16, 64, 32
+            elif M <= 32:
+                BLOCK_M, BLOCK_N, BLOCK_K = 32, 64, 32
+            elif M <= 64:
+                BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+            else:
+                BLOCK_M, BLOCK_N, BLOCK_K = 128, 64, 32
         else:
             # Tuned for MI300 (gfx942, 304 CUs, 64-wide wavefronts).
             if M <= 32:
@@ -268,6 +286,88 @@ def triton_w4a16_gemm(
         BLOCK_K=BLOCK_K,
     )
     return c
+
+
+@triton.jit
+def triton_w4a16_dequant_kernel(
+    b_ptr,           # [K, N//8] int32 packed weights (8 nibbles per int32)
+    scales_ptr,      # [K//G, N] fp16/bf16
+    out_ptr,         # [K, N] fp16 output
+    N, K,
+    stride_bk, stride_bn,
+    group_size,
+    ZP_BIAS: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_N8: tl.constexpr,
+):
+    """Dequantize a [K, N//8]-packed GPTQ4 weight to dense fp16 [K, N].
+
+    Symmetric-only (uint4b8): w_fp = (nibble - ZP_BIAS) * scale. Same
+    dequant math as triton_w4a16_gemm_kernel so the dequant+hgemm route
+    sees the same weight values as the fused MFMA route.
+    """
+    pid_k = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    offs_n8 = pid_n * BLOCK_N8 + tl.arange(0, BLOCK_N8)
+    mask_k = offs_k < K
+    mask_n8 = offs_n8 < (N // 8)
+
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n8[None, :] * stride_bn
+    b_packed = tl.load(b_ptrs, mask=mask_k[:, None] & mask_n8[None, :], other=0)
+
+    # Unpack nibbles: 3 interleaves expand the last dim by 8
+    b = tl.interleave(b_packed, b_packed)
+    b = tl.interleave(b, b)
+    b = tl.interleave(b, b)
+    shifts_row = tl.arange(0, 8) * 4
+    shifts_1d = tl.reshape(
+        tl.broadcast_to(shifts_row[None, :], (BLOCK_N8, 8)), (BLOCK_N8 * 8,)
+    )
+    b = (b >> shifts_1d[None, :]) & 0xF  # [BLOCK_K, BLOCK_N]
+
+    offs_n = pid_n * BLOCK_N8 * 8 + tl.arange(0, BLOCK_N8 * 8)
+    mask_n = offs_n < N
+    g_idx = offs_k // group_size
+    scales = tl.load(
+        scales_ptr + g_idx[:, None] * N + offs_n[None, :],
+        mask=mask_k[:, None] & mask_n[None, :],
+        other=1.0,
+    )
+
+    w = (b - ZP_BIAS).to(scales.dtype) * scales
+    out_ptrs = out_ptr + offs_k[:, None] * N + offs_n[None, :]
+    tl.store(out_ptrs, w, mask=mask_k[:, None] & mask_n[None, :])
+
+
+def triton_w4a16_dequant(
+    b_q: torch.Tensor,       # [K, N//8] int32
+    scales: torch.Tensor,    # [K//G, N] fp16/bf16
+    group_size: int,
+    zp_bias: int = 8,
+) -> torch.Tensor:
+    """Dequantize the repacked GPTQ4 weight to dense [K, N] in scales.dtype.
+
+    Used by the gfx908 GPTQ4 dual dispatch for M > dequant threshold: at
+    high M, dequant-once + rocBLAS hgemm beats the fused MFMA kernel whose
+    BLOCK_K is clamped to group_size (=32 for GS32 checkpoints)."""
+    assert b_q.is_contiguous() and scales.is_contiguous()
+    K = b_q.shape[0]
+    N = b_q.shape[1] * 8
+    out = torch.empty((K, N), dtype=scales.dtype, device=b_q.device)
+    BLOCK_K, BLOCK_N8 = 32, 16
+    grid = (triton.cdiv(K, BLOCK_K), triton.cdiv(N // 8, BLOCK_N8))
+    triton_w4a16_dequant_kernel[grid](
+        b_q, scales, out,
+        N, K,
+        b_q.stride(0), b_q.stride(1),
+        group_size=group_size,
+        ZP_BIAS=zp_bias,
+        BLOCK_K=BLOCK_K,
+        BLOCK_N8=BLOCK_N8,
+    )
+    return out
 
 
 class TritonW4A16LinearKernel(MPLinearKernel):
