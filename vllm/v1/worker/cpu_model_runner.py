@@ -74,7 +74,7 @@ class CPUModelRunner(GPUModelRunner):
 
         import vllm.v1.worker.block_table
 
-        vllm.v1.worker.block_table._compute_slot_mapping_kernel = (
+        vllm.v1.worker.block_table._COMPUTE_SLOT_MAPPING_KERNEL.kernel = (
             cpu_tl.compute_slot_mapping_kernel
         )
 
@@ -240,5 +240,10 @@ def _set_torch_accelerator_to_noop() -> None:
     def noop(*args: Any, **kwargs: Any) -> None:
         pass
 
+    # Distinct no-op so empty_cache does not alias synchronize: Dynamo's
+    # handle_synchronize is keyed on that object and asserts on CPU-only hosts.
+    def empty_cache_noop(*args: Any, **kwargs: Any) -> None:
+        pass
+
     torch.accelerator.synchronize = noop
-    torch.accelerator.empty_cache = noop
+    torch.accelerator.empty_cache = empty_cache_noop

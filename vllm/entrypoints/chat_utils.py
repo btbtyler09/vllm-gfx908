@@ -1944,9 +1944,43 @@ def _postprocess_messages(messages: list[ConversationMessage]) -> None:
 
                 # if arguments is None or empty string, set to {}
                 if content := function.get("arguments"):
-                    if not isinstance(content, (dict, list)):
-                        parsed = json.loads(content)
-                        function["arguments"] = parsed if parsed is not None else {}
+                    if isinstance(content, dict):
+                        parsed = content
+                    else:
+                        if isinstance(content, str):
+                            try:
+                                parsed = json.loads(content)
+                            except json.JSONDecodeError:
+                                # A malformed `arguments` string lives in
+                                # conversation history, so failing the request
+                                # here would fail every subsequent turn too and
+                                # leave the conversation unrecoverable. Coerce
+                                # to an empty object so the turn can proceed.
+                                logger.warning(
+                                    "Tool call %r has arguments that are not valid "
+                                    "JSON (%d chars); coercing to an empty object "
+                                    "so the conversation can continue.",
+                                    function.get("name"),
+                                    len(content),
+                                )
+                                parsed = None
+                        else:
+                            parsed = content
+
+                        if not isinstance(parsed, dict):
+                            if parsed is not None:
+                                # Valid JSON, but not an object (e.g. "[]",
+                                # "42", "true").
+                                # Chat templates require a mapping.
+                                logger.warning(
+                                    "Tool call %r arguments decoded to %s, not a "
+                                    "JSON object; coercing to an empty object.",
+                                    function.get("name"),
+                                    type(parsed).__name__,
+                                )
+                            parsed = {}
+
+                    function["arguments"] = parsed
                 else:
                     function["arguments"] = {}
 
@@ -2027,15 +2061,6 @@ async def parse_chat_messages_async(
     mm_data, mm_uuids = await mm_tracker.resolve_items()
 
     return conversation, mm_data, mm_uuids
-
-
-def get_history_tool_calls_cnt(conversation: list[ConversationMessage]):
-    idx = 0
-    for msg in conversation:
-        if msg["role"] == "assistant":
-            tool_calls = msg.get("tool_calls")
-            idx += len(list(tool_calls)) if tool_calls is not None else 0  # noqa
-    return idx
 
 
 _KIMI_MODEL_TYPES = ("kimi_k2", "kimi_k25", "kimi_k3")
