@@ -754,16 +754,6 @@ class RocmPlatform(Platform):
             logger.info("Using Aiter Flash Attention backend.")
             return AttentionBackendEnum.ROCM_AITER_FA.get_path()
 
-        from vllm.config import get_current_vllm_config_or_none
-
-        vllm_config = get_current_vllm_config_or_none()
-        if (
-            vllm_config is not None
-            and vllm_config.attention_config.use_prefill_decode_attention
-        ):
-            logger.info("Using Rocm Attention backend.")
-            return AttentionBackendEnum.ROCM_ATTN.get_path()
-
         if (
             envs.VLLM_ROCM_USE_AITER
             and (on_gfx9() or on_gfx908())
