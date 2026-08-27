@@ -188,7 +188,10 @@ def _score_edges(
     )
 
 
-@support_torch_compile
+# NOT @support_torch_compile: the edge-scoring einsum/gather miscompiles under
+# inductor on gfx908 — drafts silently diverge and acceptance collapses to 0%
+# while output stays coherent (verify rejects everything). DFlash-v1 without
+# this module compiles fine; run the selector eagerly.
 class CandidateSelector(nn.Module):
     def __init__(
         self,
