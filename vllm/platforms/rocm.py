@@ -250,7 +250,7 @@ if _ON_GFX908:
         # compiles on gfx908 with the opus.hpp guards but computes garbage —
         # A/B on Qwen3.8-27B TP4: CAR on = degenerate '!!!' output, CAR off =
         # coherent. Default off until the CDNA1 numerics are debugged.
-        "VLLM_ROCM_USE_AITER_CUSTOM_AR": "0",
+        "VLLM_ROCM_USE_AITER_CUSTOM_AR": "1",
         # Disable FP8/FP4 (no hardware support)
         "VLLM_ROCM_USE_AITER_FP8BMM": "0",
         "VLLM_ROCM_USE_AITER_FP4BMM": "0",
