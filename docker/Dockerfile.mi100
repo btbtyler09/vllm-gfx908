@@ -8,9 +8,8 @@ ARG REMOTE_VLLM="0"
 ARG COMMON_WORKDIR=/app
 ARG BASE_IMAGE=btbtyler09/vllm-dev-mi100:2026.04.19
 ARG AITER_GIT_REPO=https://github.com/btbtyler09/aiter-gfx908.git
-# Pinned to the 2026-08 upstream-AITER sync (577 commits on top of the June
-# sync; flydsl 0.3.0, upstream arch-map gate for is_flydsl_available).
-ARG AITER_GIT_REF=05c551d7f22d61f964e1e71ddcbaf1b3faeb1bc7
+# Pinned to the 2026-08-27 aiter sync (ROCm/aiter main + gfx908 CAR fixes).
+ARG AITER_GIT_REF=a454235de7100387b81f1bd56620c7744307f735
 ARG AITER_FROM_GIT=1
 
 FROM ${BASE_IMAGE} AS base
