@@ -83,7 +83,9 @@ RUN git clone ${PYTORCH_REPO} pytorch
 RUN cd pytorch && git checkout ${PYTORCH_BRANCH} \
     && pip install -r requirements.txt && git submodule update --init --recursive \
     && python3 tools/amd_build/build_amd.py \
-    && USE_FLASH_ATTENTION=0 USE_MEM_EFF_ATTENTION=0 \
+    && RT=$(find /opt/rocm/llvm/lib/clang -name 'libclang_rt.builtins-x86_64.a' | head -1) \
+    && USE_FLASH_ATTENTION=0 USE_MEM_EFF_ATTENTION=0 BUILD_TEST=0 \
+       LDFLAGS="$RT" \
        CMAKE_PREFIX_PATH=$(python3 -c 'import sys; print(sys.prefix)') \
        python3 setup.py bdist_wheel --dist-dir=dist \
     && pip install dist/*.whl
