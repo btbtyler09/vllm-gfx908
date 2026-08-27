@@ -66,6 +66,9 @@ from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (
 from vllm.model_executor.kernels.linear.mixed_precision.triton_w8a16 import (
     TritonW8A16LinearKernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.aiter_w8a16 import (
+    AiterW8A16LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.xpu import (
     XPUW4A8IntLinearKernel,
     XPUwNa16LinearKernel,
@@ -489,6 +492,7 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
         RDNA3W4A16LinearKernel,
         RDNAHybridW4A16LinearKernel,
         TritonW4A16LinearKernel,
+        AiterW8A16LinearKernel,
         TritonW8A16LinearKernel,
         ConchLinearKernel,
         ExllamaLinearKernel,
@@ -1203,6 +1207,7 @@ __all__ = [
     "MarlinLinearKernel",
     "TritonW4A16LinearKernel",
     "TritonW8A16LinearKernel",
+    "AiterW8A16LinearKernel",
     "XPUW4A8IntLinearKernel",
     "XPUwNa16LinearKernel",
     "init_mxfp8_linear_kernel",
