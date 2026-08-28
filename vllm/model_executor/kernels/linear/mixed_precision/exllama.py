@@ -180,8 +180,10 @@ def _gfx908_gptq4_dual_enabled(c: MPLinearLayerConfig) -> bool:
     K-packed exllama for M<=MTHRESH (decode, zero regression, cudagraph'd) +
     repacked [K, N//8] Triton W4A16 MFMA / dequant+hgemm for M>MTHRESH
     (prefill/high-batch). Symmetric uint4b8 only — the Triton path assumes
-    the constant zp=8. Costs half a qweight copy in VRAM. Default "native"
-    per the env-gated-until-validated rule; flip after a full-suite win.
+    the constant zp=8. Costs half a qweight copy in VRAM. Default "dual"
+    since the 2026-08-28 full-suite validation (27B-GS32: TTFT 1632->772,
+    c=128 198->398 with spec / 619 no-spec, GSM8K unchanged); "native"
+    opts out for max-density serving.
     """
     if c.weight_type != scalar_types.uint4b8 or c.has_g_idx:
         return False
@@ -192,7 +194,7 @@ def _gfx908_gptq4_dual_enabled(c: MPLinearLayerConfig) -> bool:
             return False
     except Exception:
         return False
-    return os.environ.get("VLLM_GFX908_GPTQ4", "native").strip().lower() == "dual"
+    return os.environ.get("VLLM_GFX908_GPTQ4", "dual").strip().lower() == "dual"
 
 
 def _gfx908_gptq8_dual_enabled(c: MPLinearLayerConfig) -> bool:
