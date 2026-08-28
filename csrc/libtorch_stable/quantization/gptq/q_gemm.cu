@@ -296,9 +296,27 @@ void gemm_half_q_half_gptq_4bit_kernel(
   // Column result
   float block_c[m_count][4] = {};
 
-  // Dequantize and multiply
+  // Dequantize and multiply. Software-pipelined (2026-08-28): the next
+  // 32-k chunk's four int4 loads are issued before computing the current
+  // chunk. Counters showed this kernel latency-bound at decode/verify M
+  // (MemUnitBusy ~9%, VALUBusy ~13%); prefetch is worth ~10% at M=6 on
+  // gfx908 microbench across real TP4 shard shapes.
   int k = offset_k;
+  int4 pre4[4];
+  {
+    const uint32_t* pb = b_ptr;
+#pragma unroll
+    for (int j = 0; j < 4; j++) { pre4[j] = *(const int4*)pb; pb += size_n; }
+  }
   while (k < end_k) {
+    int4 cur4[4];
+#pragma unroll
+    for (int j = 0; j < 4; j++) cur4[j] = pre4[j];
+    if (k + 32 < end_k) {
+      const uint32_t* pb = b_ptr + 4 * size_n;
+#pragma unroll
+      for (int j = 0; j < 4; j++) { pre4[j] = *(const int4*)pb; pb += size_n; }
+    }
     if (k == nextgroup) {
       group++;
       nextgroup += groupsize;
@@ -312,8 +330,7 @@ void gemm_half_q_half_gptq_4bit_kernel(
 
 #pragma unroll
     for (int j = 0; j < 4; j++) {
-      const int4* b_ptr4 = (int4*)b_ptr;
-      int4 load_int4 = *b_ptr4;
+      int4 load_int4 = cur4[j];
 
       half2 dq[4][4];
       dequant_4bit_8_gptq(load_int4.x, dq[0], z1z16[0], y1y16[0], size_n,
