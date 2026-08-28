@@ -1044,11 +1044,17 @@ class RocmPlatform(Platform):
             # Validated 2026-08-28 (full 12-tier + GSM8K on the 27B W4 arm):
             # decode-stress +4%, c=8-64 +2-4%, accuracy unchanged. Opt out
             # with VLLM_GFX908_FUSE_AR_RMS=0.
+            # NOTE: mutually exclusive with AITER custom allreduce — the
+            # fused AR+RMS op combined with CAR produces corrupted output on
+            # gfx908 (repetition garbage, observed 2026-08-28). Batch/CAR
+            # deployments keep plain AR + CAR; fusion covers the CAR-off
+            # (interactive) configs where it was validated.
             if (
                 not mi100_override_compile
                 and compilation_config.mode != CompilationMode.NONE
                 and not compilation_config.pass_config.fuse_allreduce_rms
                 and os.environ.get("VLLM_GFX908_FUSE_AR_RMS", "1") == "1"
+                and os.environ.get("VLLM_ROCM_USE_AITER_CUSTOM_AR", "0") != "1"
             ):
                 logger.info_once(
                     "gfx908 (MI100): enabling AITER allreduce+rmsnorm fusion "
