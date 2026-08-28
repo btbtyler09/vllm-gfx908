@@ -293,6 +293,16 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
     def compute_candidates(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # The drafter ties the TARGET's lm_head. When that head is quantized
+        # (e.g. an 8-bit GPTQ lm_head), its kernels take the target dtype and
+        # the LogitsProcessor rejects a head_dtype mismatch — so cast the
+        # drafter's (possibly bf16) hidden states to the head's input dtype
+        # at the boundary. Bounded post-norm values; lossless in practice.
+        head_dtype = getattr(
+            self.candidate_logits_processor, "head_dtype", None
+        )
+        if head_dtype is not None and hidden_states.dtype != head_dtype:
+            hidden_states = hidden_states.to(head_dtype)
         return self.candidate_logits_processor.get_top_k_tokens(
             self.lm_head, hidden_states, self.model.candidate_selector.top_k
         )
