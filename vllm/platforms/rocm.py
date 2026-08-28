@@ -1040,6 +1040,22 @@ class RocmPlatform(Platform):
                     )
                     compilation_config.mode = CompilationMode.NONE
 
+            # gfx908 + compile: default the AITER AR+RMSNorm fusion pass ON.
+            # Validated 2026-08-28 (full 12-tier + GSM8K on the 27B W4 arm):
+            # decode-stress +4%, c=8-64 +2-4%, accuracy unchanged. Opt out
+            # with VLLM_GFX908_FUSE_AR_RMS=0.
+            if (
+                not mi100_override_compile
+                and compilation_config.mode != CompilationMode.NONE
+                and compilation_config.pass_config.fuse_allreduce_rms is None
+                and os.environ.get("VLLM_GFX908_FUSE_AR_RMS", "1") == "1"
+            ):
+                logger.info_once(
+                    "gfx908 (MI100): enabling AITER allreduce+rmsnorm fusion "
+                    "(VLLM_GFX908_FUSE_AR_RMS=0 to disable)."
+                )
+                compilation_config.pass_config.fuse_allreduce_rms = True
+
         # MI100 (gfx908): MTP speculative decode needs two adjustments to run
         # under CUDA graphs:
         #   1. TORCH_NCCL_BLOCKING_WAIT=1 — PyTorch's NCCL watchdog queries HIP
