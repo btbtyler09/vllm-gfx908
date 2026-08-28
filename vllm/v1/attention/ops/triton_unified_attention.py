@@ -1087,8 +1087,19 @@ def unified_attention(
     # decode-only) pending full-suite validation on gfx908, where serial
     # KV walks dominate verify attention at long context.
     import os as _os
+    # gfx908 default: verify blocks (q_len <= 8) take split-KV above the
+    # context floor — validated by two full suites (Long-16K +26-28%, other
+    # tiers guarded by the floor). Other platforms keep the classic
+    # decode-only behavior unless the env overrides.
+    _default_3d_qlen = "1"
     try:
-        _max_3d_qlen = int(_os.environ.get("VLLM_ATTN_3D_MAX_QLEN", "1"))
+        from vllm.platforms.rocm import on_gfx908 as _g908
+        if _g908():
+            _default_3d_qlen = "8"
+    except Exception:
+        pass
+    try:
+        _max_3d_qlen = int(_os.environ.get("VLLM_ATTN_3D_MAX_QLEN", _default_3d_qlen))
     except ValueError:
         _max_3d_qlen = 1
     if _max_3d_qlen > 1 and max_seqlen_q > 1:
@@ -1096,9 +1107,9 @@ def unified_attention(
         # enough: measured on gfx908, 3D is 0.6x at 512 ctx but 1.5x at 2k
         # and 7x at 8k (flat wall vs linear). Below the floor, stay 2D.
         try:
-            _min_ctx = int(_os.environ.get("VLLM_ATTN_3D_QLEN_MIN_CTX", "1024"))
+            _min_ctx = int(_os.environ.get("VLLM_ATTN_3D_QLEN_MIN_CTX", "4096"))
         except ValueError:
-            _min_ctx = 1024
+            _min_ctx = 4096
         if max_seqlen_k < _min_ctx:
             _max_3d_qlen = 1
     use_3d = not (
