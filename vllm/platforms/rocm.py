@@ -1047,7 +1047,7 @@ class RocmPlatform(Platform):
             if (
                 not mi100_override_compile
                 and compilation_config.mode != CompilationMode.NONE
-                and compilation_config.pass_config.fuse_allreduce_rms is None
+                and not compilation_config.pass_config.fuse_allreduce_rms
                 and os.environ.get("VLLM_GFX908_FUSE_AR_RMS", "1") == "1"
             ):
                 logger.info_once(
