@@ -53,7 +53,14 @@ def _gptq_dual_gemm_gfx908_impl(
         # GPTQ4 (uint4b8, symmetric): the fused/dequant Triton W4A16 paths
         # take qzeros=None + zp_bias=8; the stored qzeros (constant 7) are
         # only consumed by the native exllama path below.
-        if x.shape[0] > dequant_mthresh:
+        # Mid-M band (microbenched on gfx908 TP4 shard shapes): the fused
+        # kernel's tiles lose to dequant-once+hgemm below M~160 (e.g. -16%
+        # at M=64) and win at M=256-512, so the dequant route serves BOTH
+        # the low band (mthresh < M < GPTQ4_FUSED_LOWM) and the high band
+        # (M > dequant_mthresh).
+        if x.shape[0] > dequant_mthresh or (
+            mthresh < x.shape[0] < _gfx908_gptq4_fused_lowm()
+        ):
             w = triton_w4a16_dequant(
                 b_q=qweight_repacked,
                 scales=scales,
@@ -171,6 +178,15 @@ def _repack_gptq4_qweight_for_triton_w4a16(qweight: torch.Tensor) -> torch.Tenso
         dtype=torch.int32,
     )
     return repacked.contiguous()
+
+
+def _gfx908_gptq4_fused_lowm() -> int:
+    """Lower M bound of the fused Triton W4A16 band; below it (and above
+    MTHRESH) the dequant+hgemm route wins on gfx908. 0 disables the band."""
+    try:
+        return int(os.environ.get("VLLM_GFX908_GPTQ4_FUSED_LOWM", "160"))
+    except ValueError:
+        return 160
 
 
 def _gfx908_gptq4_dual_enabled(c: MPLinearLayerConfig) -> bool:
