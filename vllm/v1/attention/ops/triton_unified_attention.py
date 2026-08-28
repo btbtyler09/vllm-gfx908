@@ -1079,14 +1079,36 @@ def unified_attention(
     # 2. The batch includes at least one prefill request, or
     # 3. The number of sequences exceeds the configured threshold, or
     # 4. Batch invariance is enabled
+    # Small uniform query blocks (spec-decode verify, q_len <= ~8) may also
+    # take the 3D split-KV path: the kernel body, tile-loop bounds and
+    # reduce_segments are all q_len-general (causally-empty segments store
+    # neutral partials), and per-token segment-buffer rows are bounded by
+    # q.shape[0] instead of num_seqs. Env-gated (default 1 = classic
+    # decode-only) pending full-suite validation on gfx908, where serial
+    # KV walks dominate verify attention at long context.
+    import os as _os
+    try:
+        _max_3d_qlen = int(_os.environ.get("VLLM_ATTN_3D_MAX_QLEN", "1"))
+    except ValueError:
+        _max_3d_qlen = 1
+    if _max_3d_qlen > 1 and max_seqlen_q > 1:
+        # Verify blocks only pay for split-KV once the serial walk is long
+        # enough: measured on gfx908, 3D is 0.6x at 512 ctx but 1.5x at 2k
+        # and 7x at 8k (flat wall vs linear). Below the floor, stay 2D.
+        try:
+            _min_ctx = int(_os.environ.get("VLLM_ATTN_3D_QLEN_MIN_CTX", "1024"))
+        except ValueError:
+            _min_ctx = 1024
+        if max_seqlen_k < _min_ctx:
+            _max_3d_qlen = 1
     use_3d = not (
         seq_threshold_3D is None
         or num_par_softmax_segments is None
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
-        or num_seqs > seq_threshold_3D
+        or max_seqlen_q > _max_3d_qlen
+        or q.shape[0] > seq_threshold_3D
         or is_batch_invariant
     )
 
