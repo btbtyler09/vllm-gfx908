@@ -174,7 +174,7 @@ def _repack_gptq4_qweight_for_triton_w4a16(qweight: torch.Tensor) -> torch.Tenso
 
 
 def _gfx908_gptq4_dual_enabled(c: MPLinearLayerConfig) -> bool:
-    """gfx908 GPTQ4 dual-layout dispatch (default OFF until suite-validated).
+    """gfx908 GPTQ4 dual-layout dispatch (default ON, symmetric uint4b8).
 
     VLLM_GFX908_GPTQ4 = "dual" keeps BOTH weight layouts resident: native
     K-packed exllama for M<=MTHRESH (decode, zero regression, cudagraph'd) +
