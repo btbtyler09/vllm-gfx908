@@ -220,8 +220,8 @@ typedef void (*fp_gemm_half_q_half_gptq_kernel)(const half*, const uint32_t*,
                                                 const int, const int,
                                                 const bool, const int*);
 
-template <bool first_block, int m_count>
-__global__ __launch_bounds__(BLOCK_KN_SIZE, 1)
+template <bool first_block, int m_count, int BKN = BLOCK_KN_SIZE>
+__global__ __launch_bounds__(BKN, 1)
 void gemm_half_q_half_gptq_4bit_kernel(
     const half* __restrict__ a, const uint32_t* __restrict__ b_q_weight,
     const uint32_t* __restrict__ b_gptq_qzeros,
@@ -239,16 +239,16 @@ void gemm_half_q_half_gptq_4bit_kernel(
   auto t = threadIdx.x;
 
   // Block
-  auto offset_n = blockIdx.x * BLOCK_KN_SIZE * 4;
+  auto offset_n = blockIdx.x * BKN * 4;
   auto offset_m = blockIdx.y * m_count;
-  auto offset_k = blockIdx.z * BLOCK_KN_SIZE;
+  auto offset_k = blockIdx.z * BKN;
 
-  int end_k = min(offset_k + BLOCK_KN_SIZE, size_k);
+  int end_k = min(offset_k + BKN, size_k);
 
   int n = offset_n + t * 4;
 
   // Preload block_a
-  __shared__ half block_a[m_count][BLOCK_KN_SIZE];
+  __shared__ half block_a[m_count][BKN];
 
   if (offset_k + t < end_k) {
     for (int m = 0; m < m_count; ++m) {
@@ -279,7 +279,7 @@ void gemm_half_q_half_gptq_4bit_kernel(
 
   const uint32_t* b_ptr = b_q_weight + qk * size_n + n;
   const half* a_ptr = &block_a[0][0];
-  int a_stride = BLOCK_KN_SIZE;
+  int a_stride = BKN;
 
   // Initial group
   int zeros[4];
@@ -798,12 +798,54 @@ fp_gemm_half_q_half_gptq_kernel pick_gemm_half_q_half_gptq_kernel(
   return NULL;
 }
 
+// gfx908: small TP-shard shapes underfill the GPU at BKN=256 (e.g. a
+// 1536x5120 o_proj shard launches 30 blocks for 120 CUs) and the kernel is
+// latency-bound; a BKN=128 instantiation quadruples the grid for those
+// shapes (+11-36% measured at M<=6). Selected when the 256-grid would run
+// fewer than GPTQ4_BKN128_BLOCK_CUTOFF blocks.
+#define GPTQ4_BKN128_BLOCK_CUTOFF 100
+
+template <int m_count>
+void launch_gptq4_bkn128(const half* a, const uint32_t* b_q_weight,
+                         const uint32_t* b_gptq_qzeros,
+                         const half* b_gptq_scales, const int* b_q_perm,
+                         half* c, int size_m, int size_n, int size_k,
+                         int groups, bool use_v2_format,
+                         const cudaStream_t stream) {
+  dim3 blockDim(128, 1, 1);
+  dim3 gridDim(DIVIDE(size_n, 128 * 4), DIVIDE(size_m, m_count),
+               DIVIDE(size_k, 128));
+  gemm_half_q_half_gptq_4bit_kernel<true, m_count, 128>
+      <<<gridDim, blockDim, 0, stream>>>(a, b_q_weight, b_gptq_qzeros,
+                                         b_gptq_scales, c, size_m, size_n,
+                                         size_k, groups, use_v2_format,
+                                         b_q_perm);
+}
+
 void gemm_half_q_half_cuda_part(const half* a, const uint32_t* b_q_weight,
                                 const uint32_t* b_gptq_qzeros,
                                 const half* b_gptq_scales, const int* b_q_perm,
                                 half* c, int size_m, int size_n, int size_k,
                                 int m_count, int groups, bool use_v2_format,
                                 int bit) {
+  if (bit == 4) {
+    int blocks_256 =
+        DIVIDE(size_n, BLOCK_KN_SIZE * 4) * DIVIDE(size_k, BLOCK_KN_SIZE);
+    if (blocks_256 < GPTQ4_BKN128_BLOCK_CUTOFF) {
+      const cudaStream_t stream = get_current_cuda_stream();
+      switch (m_count) {
+        case 1: launch_gptq4_bkn128<1>(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_q_perm, c, size_m, size_n, size_k, groups, use_v2_format, stream); return;
+        case 2: launch_gptq4_bkn128<2>(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_q_perm, c, size_m, size_n, size_k, groups, use_v2_format, stream); return;
+        case 3: launch_gptq4_bkn128<3>(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_q_perm, c, size_m, size_n, size_k, groups, use_v2_format, stream); return;
+        case 4: launch_gptq4_bkn128<4>(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_q_perm, c, size_m, size_n, size_k, groups, use_v2_format, stream); return;
+        case 5: launch_gptq4_bkn128<5>(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_q_perm, c, size_m, size_n, size_k, groups, use_v2_format, stream); return;
+        case 6: launch_gptq4_bkn128<6>(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_q_perm, c, size_m, size_n, size_k, groups, use_v2_format, stream); return;
+        case 7: launch_gptq4_bkn128<7>(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_q_perm, c, size_m, size_n, size_k, groups, use_v2_format, stream); return;
+        case 8: launch_gptq4_bkn128<8>(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_q_perm, c, size_m, size_n, size_k, groups, use_v2_format, stream); return;
+        default: break;  // fall through to the BKN=256 path
+      }
+    }
+  }
   dim3 blockDim, gridDim;
   blockDim.x = BLOCK_KN_SIZE;
   blockDim.y = 1;
