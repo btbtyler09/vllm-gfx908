@@ -1044,6 +1044,26 @@ class RocmPlatform(Platform):
             # Validated 2026-08-28 (full 12-tier + GSM8K on the 27B W4 arm):
             # decode-stress +4%, c=8-64 +2-4%, accuracy unchanged. Opt out
             # with VLLM_GFX908_FUSE_AR_RMS=0.
+            # Quantized-lm_head checkpoints (GPTQ lm_head=true) can't run
+            # the fp32-head logits path; default head_dtype to the model
+            # dtype so they boot without --hf-overrides. An explicit
+            # head_dtype in the HF config or overrides still wins.
+            try:
+                qcfg = getattr(vllm_config.model_config, "hf_config", None)
+                qq = getattr(qcfg, "quantization_config", None) or {}
+                if (
+                    isinstance(qq, dict)
+                    and qq.get("lm_head")
+                    and getattr(qcfg, "head_dtype", None) is None
+                ):
+                    qcfg.head_dtype = "model"
+                    logger.info_once(
+                        "gfx908 (MI100): quantized lm_head detected — "
+                        "defaulting head_dtype to the model dtype."
+                    )
+            except Exception:
+                pass
+
             # gfx908: the DFlash drafter's auto-selected attention backend
             # scans the full context per draft step (its sliding window is
             # not honored on that path) — 4.1x slower at 16K ctx (51.2 vs
