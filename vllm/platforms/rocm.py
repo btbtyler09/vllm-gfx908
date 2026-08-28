@@ -1044,6 +1044,28 @@ class RocmPlatform(Platform):
             # Validated 2026-08-28 (full 12-tier + GSM8K on the 27B W4 arm):
             # decode-stress +4%, c=8-64 +2-4%, accuracy unchanged. Opt out
             # with VLLM_GFX908_FUSE_AR_RMS=0.
+            # gfx908: the DFlash drafter's auto-selected attention backend
+            # scans the full context per draft step (its sliding window is
+            # not honored on that path) — 4.1x slower at 16K ctx (51.2 vs
+            # 12.5 ms/tok measured c=1). Default the draft backend to
+            # TRITON_ATTN, where unified attention (with the 3D split-KV
+            # verify path) handles it context-flat.
+            spec_cfg = vllm_config.speculative_config
+            if (
+                spec_cfg is not None
+                and getattr(spec_cfg, "method", None) == "dflash"
+                and getattr(spec_cfg, "attention_backend", None) is None
+            ):
+                try:
+                    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+                    spec_cfg.attention_backend = AttentionBackendEnum.TRITON_ATTN
+                    logger.info_once(
+                        "gfx908 (MI100): defaulting DFlash draft attention "
+                        "backend to TRITON_ATTN."
+                    )
+                except Exception:
+                    pass
+
             # NOTE: mutually exclusive with AITER custom allreduce — the
             # fused AR+RMS op combined with CAR produces corrupted output on
             # gfx908 (repetition garbage, observed 2026-08-28). Batch/CAR
