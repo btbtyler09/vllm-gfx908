@@ -183,10 +183,14 @@ def _repack_gptq4_qweight_for_triton_w4a16(qweight: torch.Tensor) -> torch.Tenso
 def _gfx908_gptq4_fused_lowm() -> int:
     """Lower M bound of the fused Triton W4A16 band; below it (and above
     MTHRESH) the dequant+hgemm route wins on gfx908. 0 disables the band."""
+    # Default 0 (band disabled): the microbench win at M=64-128 did NOT
+    # survive serving — the per-step dequant traffic regressed the c=64
+    # no-spec tier -25% (suite-attributed 2026-08-28). Env kept for
+    # experiments.
     try:
-        return int(os.environ.get("VLLM_GFX908_GPTQ4_FUSED_LOWM", "160"))
+        return int(os.environ.get("VLLM_GFX908_GPTQ4_FUSED_LOWM", "0"))
     except ValueError:
-        return 160
+        return 0
 
 
 def _gfx908_gptq4_dual_enabled(c: MPLinearLayerConfig) -> bool:
