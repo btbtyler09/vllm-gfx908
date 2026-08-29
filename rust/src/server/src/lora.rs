@@ -1,9 +1,13 @@
-use std::collections::BTreeMap;
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use indexmap::IndexMap;
+use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 use vllm_engine_core_client::EngineCoreClient;
-use vllm_engine_core_client::protocol::lora::LoraRequest;
+use vllm_engine_core_client::protocol::lora::{LoraRequest, LoraRequestError};
 
 /// Snapshot of the currently served model names plus the requested LoRA, if
 /// the model name resolves to a dynamic adapter.
@@ -15,54 +19,74 @@ pub(crate) struct LoraModelResolution {
 
 /// Runtime registry for dynamically loaded LoRA adapters.
 pub(crate) struct LoraManager {
-    /// Dynamically loaded LoRA adapters keyed by public model name.
-    requests: RwLock<BTreeMap<String, LoraRequest>>,
+    /// Dynamically loaded LoRA adapters keyed by public model name, in load order.
+    requests: RwLock<IndexMap<String, LoraRequest>>,
     /// Monotonic adapter id allocator. LoRA ids are one-indexed.
     id_counter: AtomicU64,
     /// Serialize dynamic LoRA registry updates around engine utility calls.
     update_lock: Mutex<()>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
+#[error("engine was not started with LoRA enabled")]
+pub(crate) struct LoraDisabledError;
+
+#[derive(Debug, Error)]
 pub(crate) enum LoadLoraError {
+    #[error(transparent)]
+    Disabled(#[from] LoraDisabledError),
+    #[error(transparent)]
+    InvalidRequest(#[from] LoraRequestError),
+    #[error("LoRA adapter `{lora_name}` is already loaded")]
     AlreadyLoaded { lora_name: String },
+    #[error("LoRA adapter `{lora_name}` conflicts with a served base model")]
     BaseModelName { lora_name: String },
-    Engine(vllm_engine_core_client::Error),
+    #[error("failed to load LoRA adapter `{lora_name}`")]
+    Engine {
+        lora_name: String,
+        #[source]
+        source: vllm_engine_core_client::Error,
+    },
+    #[error("one or more engine ranks rejected LoRA adapter `{lora_name}`")]
     NotLoaded { lora_name: String },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub(crate) enum UnloadLoraError {
-    NotFound {
-        lora_name: String,
-    },
+    #[error(transparent)]
+    Disabled(#[from] LoraDisabledError),
+    #[error("LoRA adapter `{lora_name}` is not loaded")]
+    NotFound { lora_name: String },
+    #[error(
+        "requested lora_int_id {actual} does not match loaded adapter `{lora_name}` with id {expected}"
+    )]
     IntIdMismatch {
         lora_name: String,
         expected: u64,
         actual: u64,
     },
-    Engine(vllm_engine_core_client::Error),
-    NotRemoved {
+    #[error("failed to unload LoRA adapter `{lora_name}`")]
+    Engine {
         lora_name: String,
-        lora_int_id: u64,
+        #[source]
+        source: vllm_engine_core_client::Error,
     },
+    #[error("engine rejected removal of LoRA adapter `{lora_name}` with id {lora_int_id}")]
+    NotRemoved { lora_name: String, lora_int_id: u64 },
 }
 
 impl LoraManager {
     pub fn new() -> Self {
         Self {
-            requests: RwLock::new(BTreeMap::new()),
+            requests: RwLock::new(IndexMap::new()),
             id_counter: AtomicU64::new(0),
             update_lock: Mutex::new(()),
         }
     }
 
-    /// Return base served model names plus dynamically loaded LoRA adapter
-    /// names.
-    pub async fn served_model_names(&self, base_model_names: &[String]) -> Vec<String> {
-        let mut names = base_model_names.to_vec();
-        names.extend(self.requests.read().await.keys().cloned());
-        names
+    /// Snapshot loaded LoRA adapters in load order.
+    pub async fn served_lora_requests(&self) -> Vec<LoraRequest> {
+        self.requests.read().await.values().cloned().collect()
     }
 
     /// Resolve the requested model against one consistent LoRA registry
@@ -97,16 +121,13 @@ impl LoraManager {
         if base_model_names.iter().any(|name| name == &lora_name) {
             return Err(LoadLoraError::BaseModelName { lora_name });
         }
-        if !load_inplace && self.requests.read().await.contains_key(&lora_name) {
+        let requests = self.requests.read().await;
+        let existing_lora_int_id = requests.get(&lora_name).map(|request| request.lora_int_id);
+        if !load_inplace && existing_lora_int_id.is_some() {
             return Err(LoadLoraError::AlreadyLoaded { lora_name });
         }
 
-        let lora_int_id = self
-            .requests
-            .read()
-            .await
-            .get(&lora_name)
-            .map(|request| request.lora_int_id)
+        let lora_int_id = existing_lora_int_id
             .unwrap_or_else(|| self.id_counter.fetch_add(1, Ordering::Relaxed) + 1);
         let lora_request = LoraRequest::new(
             lora_name.clone(),
@@ -114,12 +135,16 @@ impl LoraManager {
             lora_path,
             load_inplace,
             is_3d_lora_weight,
-        );
+        )
+        .map_err(LoadLoraError::InvalidRequest)?;
+        drop(requests);
 
-        let loaded = engine_core_client
-            .add_lora(&lora_request)
-            .await
-            .map_err(LoadLoraError::Engine)?;
+        let loaded = engine_core_client.add_lora(&lora_request).await.map_err(|source| {
+            LoadLoraError::Engine {
+                lora_name: lora_name.clone(),
+                source,
+            }
+        })?;
         if !loaded {
             return Err(LoadLoraError::NotLoaded { lora_name });
         }
@@ -152,10 +177,14 @@ impl LoraManager {
             });
         }
 
-        let removed = engine_core_client
-            .remove_lora(lora_request.lora_int_id)
-            .await
-            .map_err(UnloadLoraError::Engine)?;
+        let removed =
+            engine_core_client
+                .remove_lora(lora_request.lora_int_id)
+                .await
+                .map_err(|source| UnloadLoraError::Engine {
+                    lora_name: lora_request.lora_name.clone(),
+                    source,
+                })?;
         if !removed {
             return Err(UnloadLoraError::NotRemoved {
                 lora_name: lora_request.lora_name,
@@ -163,6 +192,6 @@ impl LoraManager {
             });
         }
 
-        Ok(self.requests.write().await.remove(lora_name).unwrap_or(lora_request))
+        Ok(self.requests.write().await.shift_remove(lora_name).unwrap_or(lora_request))
     }
 }

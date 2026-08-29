@@ -52,15 +52,6 @@ __host__ __forceinline__ hipblasStatus_t __compat_hipblasHgemm(
   #define rocblas_hgemm __compat_hipblasHgemm
 #endif
 
-__forceinline__ __device__ half2 dot22_8(half2 (&dq)[4], const half* a_ptr,
-                                         const half2 g_result) {
-  half2 result = {};
-  const half2* a2_ptr = (const half2*)a_ptr;
-#pragma unroll
-  for (int i = 0; i < 4; i++) result = __hfma2(dq[i], *a2_ptr++, result);
-  return __hadd2(result, g_result);
-}
-
 __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr) {
   half2 result = {};
   const half2* a2_ptr = (const half2*)a_ptr;
@@ -138,30 +129,6 @@ __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr,
   const half2* a2_ptr = (const half2*)a_ptr;
 #pragma unroll
   for (int i = 0; i < 4; i++) result = __hfma2(dq[i], *a2_ptr++, result);
-  float result_f =
-      __half2float(__low2half(result)) + __half2float(__high2half(result));
-  return fma(result_f, qs_f, g_result);
-}
-
-__forceinline__ __device__ float dot22_16_f(half2 (&dq)[8], const half* a_ptr,
-                                            const float g_result,
-                                            const float qs_f) {
-  half2 result = {};
-  const half2* a2_ptr = (const half2*)a_ptr;
-#pragma unroll
-  for (int i = 0; i < 8; i++) result = __hfma2(dq[i], *a2_ptr++, result);
-  float result_f =
-      __half2float(__low2half(result)) + __half2float(__high2half(result));
-  return fma(result_f, qs_f, g_result);
-}
-
-__forceinline__ __device__ float dot22_32_f(half2 (&dq)[16], const half* a_ptr,
-                                            const float g_result,
-                                            const float qs_f) {
-  half2 result = {};
-  const half2* a2_ptr = (const half2*)a_ptr;
-#pragma unroll
-  for (int i = 0; i < 16; i += 1) result = __hfma2(dq[i], *a2_ptr++, result);
   float result_f =
       __half2float(__low2half(result)) + __half2float(__high2half(result));
   return fma(result_f, qs_f, g_result);
@@ -253,8 +220,8 @@ typedef void (*fp_gemm_half_q_half_gptq_kernel)(const half*, const uint32_t*,
                                                 const int, const int,
                                                 const bool, const int*);
 
-template <bool first_block, int m_count>
-__global__ __launch_bounds__(BLOCK_KN_SIZE, 1)
+template <bool first_block, int m_count, int BKN = BLOCK_KN_SIZE>
+__global__ __launch_bounds__(BKN, 1)
 void gemm_half_q_half_gptq_4bit_kernel(
     const half* __restrict__ a, const uint32_t* __restrict__ b_q_weight,
     const uint32_t* __restrict__ b_gptq_qzeros,
@@ -272,16 +239,16 @@ void gemm_half_q_half_gptq_4bit_kernel(
   auto t = threadIdx.x;
 
   // Block
-  auto offset_n = blockIdx.x * BLOCK_KN_SIZE * 4;
+  auto offset_n = blockIdx.x * BKN * 4;
   auto offset_m = blockIdx.y * m_count;
-  auto offset_k = blockIdx.z * BLOCK_KN_SIZE;
+  auto offset_k = blockIdx.z * BKN;
 
-  int end_k = min(offset_k + BLOCK_KN_SIZE, size_k);
+  int end_k = min(offset_k + BKN, size_k);
 
   int n = offset_n + t * 4;
 
   // Preload block_a
-  __shared__ half block_a[m_count][BLOCK_KN_SIZE];
+  __shared__ half block_a[m_count][BKN];
 
   if (offset_k + t < end_k) {
     for (int m = 0; m < m_count; ++m) {
@@ -312,7 +279,7 @@ void gemm_half_q_half_gptq_4bit_kernel(
 
   const uint32_t* b_ptr = b_q_weight + qk * size_n + n;
   const half* a_ptr = &block_a[0][0];
-  int a_stride = BLOCK_KN_SIZE;
+  int a_stride = BKN;
 
   // Initial group
   int zeros[4];
@@ -329,9 +296,27 @@ void gemm_half_q_half_gptq_4bit_kernel(
   // Column result
   float block_c[m_count][4] = {};
 
-  // Dequantize and multiply
+  // Dequantize and multiply. Software-pipelined (2026-08-28): the next
+  // 32-k chunk's four int4 loads are issued before computing the current
+  // chunk. Counters showed this kernel latency-bound at decode/verify M
+  // (MemUnitBusy ~9%, VALUBusy ~13%); prefetch is worth ~10% at M=6 on
+  // gfx908 microbench across real TP4 shard shapes.
   int k = offset_k;
+  int4 pre4[4];
+  {
+    const uint32_t* pb = b_ptr;
+#pragma unroll
+    for (int j = 0; j < 4; j++) { pre4[j] = *(const int4*)pb; pb += size_n; }
+  }
   while (k < end_k) {
+    int4 cur4[4];
+#pragma unroll
+    for (int j = 0; j < 4; j++) cur4[j] = pre4[j];
+    if (k + 32 < end_k) {
+      const uint32_t* pb = b_ptr + 4 * size_n;
+#pragma unroll
+      for (int j = 0; j < 4; j++) { pre4[j] = *(const int4*)pb; pb += size_n; }
+    }
     if (k == nextgroup) {
       group++;
       nextgroup += groupsize;
@@ -345,8 +330,7 @@ void gemm_half_q_half_gptq_4bit_kernel(
 
 #pragma unroll
     for (int j = 0; j < 4; j++) {
-      const int4* b_ptr4 = (int4*)b_ptr;
-      int4 load_int4 = *b_ptr4;
+      int4 load_int4 = cur4[j];
 
       half2 dq[4][4];
       dequant_4bit_8_gptq(load_int4.x, dq[0], z1z16[0], y1y16[0], size_n,
@@ -814,12 +798,54 @@ fp_gemm_half_q_half_gptq_kernel pick_gemm_half_q_half_gptq_kernel(
   return NULL;
 }
 
+// gfx908: small TP-shard shapes underfill the GPU at BKN=256 (e.g. a
+// 1536x5120 o_proj shard launches 30 blocks for 120 CUs) and the kernel is
+// latency-bound; a BKN=128 instantiation quadruples the grid for those
+// shapes (+11-36% measured at M<=6). Selected when the 256-grid would run
+// fewer than GPTQ4_BKN128_BLOCK_CUTOFF blocks.
+#define GPTQ4_BKN128_BLOCK_CUTOFF 100
+
+template <int m_count>
+void launch_gptq4_bkn128(const half* a, const uint32_t* b_q_weight,
+                         const uint32_t* b_gptq_qzeros,
+                         const half* b_gptq_scales, const int* b_q_perm,
+                         half* c, int size_m, int size_n, int size_k,
+                         int groups, bool use_v2_format,
+                         const cudaStream_t stream) {
+  dim3 blockDim(128, 1, 1);
+  dim3 gridDim(DIVIDE(size_n, 128 * 4), DIVIDE(size_m, m_count),
+               DIVIDE(size_k, 128));
+  gemm_half_q_half_gptq_4bit_kernel<true, m_count, 128>
+      <<<gridDim, blockDim, 0, stream>>>(a, b_q_weight, b_gptq_qzeros,
+                                         b_gptq_scales, c, size_m, size_n,
+                                         size_k, groups, use_v2_format,
+                                         b_q_perm);
+}
+
 void gemm_half_q_half_cuda_part(const half* a, const uint32_t* b_q_weight,
                                 const uint32_t* b_gptq_qzeros,
                                 const half* b_gptq_scales, const int* b_q_perm,
                                 half* c, int size_m, int size_n, int size_k,
                                 int m_count, int groups, bool use_v2_format,
                                 int bit) {
+  if (bit == 4) {
+    int blocks_256 =
+        DIVIDE(size_n, BLOCK_KN_SIZE * 4) * DIVIDE(size_k, BLOCK_KN_SIZE);
+    if (blocks_256 < GPTQ4_BKN128_BLOCK_CUTOFF) {
+      const cudaStream_t stream = get_current_cuda_stream();
+      switch (m_count) {
+        case 1: launch_gptq4_bkn128<1>(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_q_perm, c, size_m, size_n, size_k, groups, use_v2_format, stream); return;
+        case 2: launch_gptq4_bkn128<2>(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_q_perm, c, size_m, size_n, size_k, groups, use_v2_format, stream); return;
+        case 3: launch_gptq4_bkn128<3>(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_q_perm, c, size_m, size_n, size_k, groups, use_v2_format, stream); return;
+        case 4: launch_gptq4_bkn128<4>(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_q_perm, c, size_m, size_n, size_k, groups, use_v2_format, stream); return;
+        case 5: launch_gptq4_bkn128<5>(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_q_perm, c, size_m, size_n, size_k, groups, use_v2_format, stream); return;
+        case 6: launch_gptq4_bkn128<6>(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_q_perm, c, size_m, size_n, size_k, groups, use_v2_format, stream); return;
+        case 7: launch_gptq4_bkn128<7>(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_q_perm, c, size_m, size_n, size_k, groups, use_v2_format, stream); return;
+        case 8: launch_gptq4_bkn128<8>(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_q_perm, c, size_m, size_n, size_k, groups, use_v2_format, stream); return;
+        default: break;  // fall through to the BKN=256 path
+      }
+    }
+  }
   dim3 blockDim, gridDim;
   blockDim.x = BLOCK_KN_SIZE;
   blockDim.y = 1;

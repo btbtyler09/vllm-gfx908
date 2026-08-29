@@ -6,12 +6,10 @@
 # prebuilt aiter-mi100 image (set AITER_FROM_GIT=0 to skip the in-image build).
 ARG REMOTE_VLLM="0"
 ARG COMMON_WORKDIR=/app
-ARG BASE_IMAGE=btbtyler09/vllm-dev-mi100:2026.04.18
+ARG BASE_IMAGE=btbtyler09/vllm-dev-mi100:2026.04.19
 ARG AITER_GIT_REPO=https://github.com/btbtyler09/aiter-gfx908.git
-# Pinned to the 439-commit upstream-AITER sync (mi100-optimized HEAD as of this
-# release). The sync restructured Unified Attention and fixes the long-standing
-# gfx908 UA state-corruption bug; see docs/mi100_decode_opt/ua_eval_dense27b_gfx908.md.
-ARG AITER_GIT_REF=395f84533c74067a83bcf3eaebd730071dcebe02
+# Pinned to the 2026-08-27 aiter sync (ROCm/aiter main + gfx908 CAR fixes).
+ARG AITER_GIT_REF=a454235de7100387b81f1bd56620c7744307f735
 ARG AITER_FROM_GIT=1
 
 FROM ${BASE_IMAGE} AS base
@@ -29,6 +27,7 @@ ARG AITER_FROM_GIT
 ENV GPU_ARCHS=gfx908
 ENV PREBUILD_KERNELS=0
 RUN if [ "$AITER_FROM_GIT" = "1" ]; then \
+        cd / && rm -rf /workspace/aiter && \
         git clone --recursive "$AITER_GIT_REPO" /workspace/aiter && \
         cd /workspace/aiter && git checkout "$AITER_GIT_REF" && \
         git submodule update --init --recursive && \

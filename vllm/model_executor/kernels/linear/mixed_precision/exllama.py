@@ -17,7 +17,8 @@ from vllm.scalar_type import scalar_types
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
-from .triton_w8a16 import triton_w8a16_gemm
+from .triton_w4a16 import triton_w4a16_dequant, triton_w4a16_gemm
+from .triton_w8a16 import triton_w8a16_dequant, triton_w8a16_gemm
 
 logger = init_logger(__name__)
 
@@ -41,12 +42,57 @@ def _gptq_dual_gemm_gfx908_impl(
     scales: torch.Tensor,
     g_idx: torch.Tensor,
     mthresh: int,
+    dequant_mthresh: int,
     group_size: int,
     zero_offset: int,
     exllama_ready: bool,
     use_v2: bool,
     bit: int,
 ) -> torch.Tensor:
+    if bit == 4:
+        # GPTQ4 (uint4b8, symmetric): the fused/dequant Triton W4A16 paths
+        # take qzeros=None + zp_bias=8; the stored qzeros (constant 7) are
+        # only consumed by the native exllama path below.
+        # Mid-M band (microbenched on gfx908 TP4 shard shapes): the fused
+        # kernel's tiles lose to dequant-once+hgemm below M~160 (e.g. -16%
+        # at M=64) and win at M=256-512, so the dequant route serves BOTH
+        # the low band (mthresh < M < GPTQ4_FUSED_LOWM) and the high band
+        # (M > dequant_mthresh).
+        if x.shape[0] > dequant_mthresh or (
+            mthresh < x.shape[0] < _gfx908_gptq4_fused_lowm()
+        ):
+            w = triton_w4a16_dequant(
+                b_q=qweight_repacked,
+                scales=scales,
+                group_size=group_size,
+                zp_bias=8,
+            )
+            return torch.mm(x, w)
+        if x.shape[0] > mthresh:
+            return triton_w4a16_gemm(
+                a=x,
+                b_q=qweight_repacked,
+                scales=scales,
+                qzeros=None,
+                group_size=group_size,
+                zp_bias=8,
+            )
+        return ops.gptq_gemm(
+            x, qweight, qzeros, scales, g_idx, exllama_ready, use_v2, bit
+        )
+    if x.shape[0] > dequant_mthresh:
+        # Prefill/high-batch: dequant-once + rocBLAS hgemm. The fused Triton
+        # MFMA kernel is capped at BLOCK_K=group_size (=32 for our
+        # checkpoints), which costs ~1.4x vs hgemm at M>=~512.
+        w = triton_w8a16_dequant(
+            b_q=qweight_repacked,
+            scales=scales,
+            qzeros=qzeros,
+            group_size=group_size,
+            zp_bias=0,
+            zero_offset=zero_offset,
+        )
+        return torch.mm(x, w)
     if x.shape[0] > mthresh:
         return triton_w8a16_gemm(
             a=x,
@@ -68,6 +114,7 @@ def _gptq_dual_gemm_gfx908_fake(
     scales: torch.Tensor,
     g_idx: torch.Tensor,
     mthresh: int,
+    dequant_mthresh: int,
     group_size: int,
     zero_offset: int,
     exllama_ready: bool,
@@ -109,6 +156,67 @@ def _repack_gptq8_qweight_for_triton_w8a16(qweight: torch.Tensor) -> torch.Tenso
     return repacked.contiguous()
 
 
+def _repack_gptq4_qweight_for_triton_w4a16(qweight: torch.Tensor) -> torch.Tensor:
+    """Convert a GPTQ4 K-packed qweight [K//8, N] to the [K, N//8] layout the
+    Triton W4A16 MFMA kernel consumes. Requires N divisible by 8; callers must
+    fall back to the native path when it is not."""
+    k8, output_size = qweight.shape
+    if output_size % 8 != 0:
+        raise ValueError(
+            "Triton W4A16 GPTQ path requires output features divisible by 8, "
+            f"got {output_size}."
+        )
+    shifts = torch.arange(8, device=qweight.device, dtype=torch.int32) * 4
+    qweight_by_output = qweight.t().contiguous()
+    unpacked = ((qweight_by_output.unsqueeze(-1) >> shifts) & 0xF).reshape(
+        output_size, k8 * 8
+    )
+    unpacked = unpacked.t().contiguous()
+    repacked = torch.sum(
+        (unpacked.view(k8 * 8, output_size // 8, 8) & 0xF) << shifts,
+        dim=2,
+        dtype=torch.int32,
+    )
+    return repacked.contiguous()
+
+
+def _gfx908_gptq4_fused_lowm() -> int:
+    """Lower M bound of the fused Triton W4A16 band; below it (and above
+    MTHRESH) the dequant+hgemm route wins on gfx908. 0 disables the band."""
+    # Default 0 (band disabled): the microbench win at M=64-128 did NOT
+    # survive serving — the per-step dequant traffic regressed the c=64
+    # no-spec tier -25% (suite-attributed 2026-08-28). Env kept for
+    # experiments.
+    try:
+        return int(os.environ.get("VLLM_GFX908_GPTQ4_FUSED_LOWM", "0"))
+    except ValueError:
+        return 0
+
+
+def _gfx908_gptq4_dual_enabled(c: MPLinearLayerConfig) -> bool:
+    """gfx908 GPTQ4 dual-layout dispatch (default ON, symmetric uint4b8).
+
+    VLLM_GFX908_GPTQ4 = "dual" keeps BOTH weight layouts resident: native
+    K-packed exllama for M<=MTHRESH (decode, zero regression, cudagraph'd) +
+    repacked [K, N//8] Triton W4A16 MFMA / dequant+hgemm for M>MTHRESH
+    (prefill/high-batch). Symmetric uint4b8 only — the Triton path assumes
+    the constant zp=8. Costs half a qweight copy in VRAM. Default "dual"
+    since the 2026-08-28 full-suite validation (27B-GS32: TTFT 1632->772,
+    c=128 198->398 with spec / 619 no-spec, GSM8K unchanged); "native"
+    opts out for max-density serving.
+    """
+    if c.weight_type != scalar_types.uint4b8 or c.has_g_idx:
+        return False
+    try:
+        from vllm.platforms.rocm import on_gfx908
+
+        if not (current_platform.is_rocm() and on_gfx908()):
+            return False
+    except Exception:
+        return False
+    return os.environ.get("VLLM_GFX908_GPTQ4", "dual").strip().lower() == "dual"
+
+
 def _gfx908_gptq8_dual_enabled(c: MPLinearLayerConfig) -> bool:
     """gfx908 GPTQ8 dual-layout dispatch (default ON for W8, no act reorder).
 
@@ -136,6 +244,16 @@ def _gfx908_gptq8_mthresh() -> int:
         return int(os.environ.get("VLLM_GFX908_GPTQ8_MTHRESH", "16"))
     except ValueError:
         return 16
+
+
+def _gfx908_gptq8_dequant_mthresh() -> int:
+    """M above which the dual op dequantizes + uses rocBLAS hgemm instead of
+    the fused Triton MFMA kernel. Crossover measured ~512 on granite-4B
+    shapes (wash at M=256, 1.4x win at M=2048). Set very large to disable."""
+    try:
+        return int(os.environ.get("VLLM_GFX908_GPTQ8_DEQUANT_MTHRESH", "512"))
+    except ValueError:
+        return 512
 
 
 class ExllamaLinearKernel(MPLinearKernel):
@@ -256,22 +374,28 @@ class ExllamaLinearKernel(MPLinearKernel):
 
             permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
             x_cont = x.data.contiguous()
+            dual_repack = None
             if _gfx908_gptq8_dual_enabled(c):
+                dual_repack = _repack_gptq8_qweight_for_triton_w8a16
+            elif _gfx908_gptq4_dual_enabled(c):
+                dual_repack = _repack_gptq4_qweight_for_triton_w4a16
+            if dual_repack is not None:
                 # dual: materialize a SEPARATE repacked qweight copy for the
                 # high-M Triton MFMA path BEFORE gptq_shuffle reorders the
                 # K-packed layout the repack expects. scales/qzeros are shared.
-                # Any layer whose repack is unsupported (e.g. N % 4 != 0) or
-                # OOMs degrades to the native path rather than crashing load.
+                # Any layer whose repack is unsupported (e.g. N not divisible
+                # by the pack factor) or OOMs degrades to the native path
+                # rather than crashing load.
                 try:
                     layer.gptq_qweight_repacked = torch.nn.Parameter(
-                        _repack_gptq8_qweight_for_triton_w8a16(x_cont),
+                        dual_repack(x_cont),
                         requires_grad=False,
                     )
                     layer.gptq_dual_ready = True
                 except Exception as e:
                     if not getattr(ExllamaLinearKernel, "_dual_fallback_warned", False):
                         logger.warning(
-                            "gfx908 GPTQ8 dual repack unavailable (%s); falling "
+                            "gfx908 GPTQ dual repack unavailable (%s); falling "
                             "back to native exllama for affected layers.",
                             e,
                         )
@@ -323,6 +447,7 @@ class ExllamaLinearKernel(MPLinearKernel):
                 w_s,
                 w_g_idx,
                 _gfx908_gptq8_mthresh(),
+                _gfx908_gptq8_dequant_mthresh(),
                 c.group_size,
                 zero_offset,
                 True,
