@@ -36,6 +36,11 @@ class DFlashProposer(SpecDecodeBaseProposer):
             runner=runner,
         )
 
+        # DFlash context K/V is projected from the target's hidden states by
+        # precompute_and_store_context_kv, independently of the drafter
+        # forward, so a K=0 step can skip the forward and stay in sync.
+        self.kv_sync_independent_of_forward = True
+
         # Only next_token_ids and mask tokens are query tokens, all other context is K/V
         self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
         self.max_padded_query_tokens = max(

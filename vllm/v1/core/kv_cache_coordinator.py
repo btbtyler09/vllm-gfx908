@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import NamedTuple
@@ -109,7 +110,23 @@ class KVCacheCoordinator(ABC):
         }
         # Conservatively fall back to flag all groups when no group is flagged.
         if use_eagle and not self.eagle_group_ids:
-            self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
+            all_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
+            if os.environ.get("VLLM_GFX908_EAGLE_DROP_ATTN_ONLY", "0") == "1":
+                # Only attention groups can be polluted by the prefill lookahead
+                # token that the drop below guards against. On hybrid models the
+                # blanket fallback also flags the Mamba/linear-attention group,
+                # whose coarse block granularity means dropping its "last block"
+                # discards every prefix-cache hit: measured 0/6952 hits with
+                # DFlash on vs 6272/6952 with spec off, a 5x TTFT penalty on
+                # repeated prefixes.
+                non_mamba_ids = {
+                    i
+                    for i, g in enumerate(kv_cache_config.kv_cache_groups)
+                    if not isinstance(g.kv_cache_spec, MambaSpec)
+                }
+                self.eagle_group_ids = non_mamba_ids or all_group_ids
+            else:
+                self.eagle_group_ids = all_group_ids
 
         # During chunked prefill with EAGLE, the single next prefill lookahead
         # token past the chunk boundary is combined with the final hidden state

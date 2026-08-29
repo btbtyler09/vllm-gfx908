@@ -124,6 +124,13 @@ class SpecDecodeBaseProposer:
         # with the target and always predict from the same position.
         self.constant_draft_positions: bool = False
 
+        # When True, the drafter's persistent KV cache is written outside the
+        # model forward (cross-attention drafters project the target's hidden
+        # states into context K/V), so a K=0 step can skip the forward without
+        # desynchronizing the cache. Self-attention drafters (Eagle, draft
+        # models) build their cache *in* the forward and must leave this False.
+        self.kv_sync_independent_of_forward: bool = False
+
         self.parallel_drafting_token_id: int = 0
         self.parallel_drafting_hidden_state_tensor: torch.Tensor | None = None
         if self.parallel_drafting:
@@ -573,6 +580,23 @@ class SpecDecodeBaseProposer:
         model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
             num_tokens, num_input_tokens, mm_embed_inputs
         )
+
+        # Dynamic SD chose K=0: skip the drafter's transformer forward.
+        # Cross-attention drafters keep their persistent KV cache in sync via
+        # precompute_and_store_context_kv (called from
+        # build_model_inputs_first_pass above), which projects the target's
+        # hidden states into the context K/V slots. The forward below only
+        # produces hidden states used to draft, so at K=0 it is pure cost.
+        # Skipping it is what makes disabling speculation in flight actually
+        # cheaper than speculating; without it a K=0 step pays the full
+        # drafter cost for a single token and loses to both spec and no-spec.
+        if (
+            self.num_speculative_tokens == 0
+            and self.kv_sync_independent_of_forward
+            and not self._share_mtp_indices
+        ):
+            return torch.empty(batch_size, 0, device=self.device, dtype=torch.int64)
+
         # Step 0 of index_share_for_mtp_iteration: let the MTP layer
         # compute its own indices (skip_topk=False) so subsequent steps
         # can reuse them.

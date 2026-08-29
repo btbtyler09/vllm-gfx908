@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -264,6 +265,12 @@ class Scheduler(SchedulerInterface):
         # reserve between a chunk boundary and the prefill end.
         self.num_prefill_lookahead = 0
         self.dynamic_sd_lookup: list[int] | None = None
+        # Dynamic-SD context clause (see the K computation in schedule()):
+        # average running-request context length above which speculation is
+        # forced off for the step. 0 (default) disables the clause.
+        self.dynamic_sd_max_avg_context = int(
+            os.environ.get("VLLM_DYNAMIC_SD_MAX_AVG_CONTEXT", "0") or 0
+        )
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
@@ -1280,12 +1287,30 @@ class Scheduler(SchedulerInterface):
             self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
         pending_kv_cache_block_copies = kv_cache_block_copies or None
 
-        # Dynamic speculative decoding: compute optimal K
+        # Dynamic speculative decoding: compute optimal K. Key the lookup on
+        # the running-queue depth, not the per-step scheduled request count:
+        # during chunked prefill of a deep queue only a few (large) requests
+        # are scheduled per step, which would misread a heavily loaded server
+        # as a small batch and re-enable speculation for exactly the steps
+        # where the drafter's context processing is most expensive.
         num_spec_tokens_to_schedule = self.num_spec_tokens
         if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
+            effective_batch_size = max(len(self.running), len(num_scheduled_tokens))
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
-                len(num_scheduled_tokens)
+                min(effective_batch_size, len(self.dynamic_sd_lookup) - 1)
             ]
+            # Optional context-length clause: speculative decoding loses to
+            # plain decode at long context under batching (verify attention
+            # over deep KV dominates). When the average context length of
+            # running requests exceeds the threshold, force K=0 for the step.
+            if (
+                num_spec_tokens_to_schedule > 0
+                and self.dynamic_sd_max_avg_context > 0
+                and self.running
+            ):
+                total_ctx = sum(r.num_tokens for r in self.running)
+                if total_ctx > self.dynamic_sd_max_avg_context * len(self.running):
+                    num_spec_tokens_to_schedule = 0
 
         scheduled_encoder_input_stats = None
         if (
