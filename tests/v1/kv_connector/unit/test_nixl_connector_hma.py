@@ -685,6 +685,10 @@ def _make_mock_worker_for_desc_ids(
     worker._group_spec_types = group_spec_types
     worker.block_len_per_layer = block_len_per_layer or [100]
     worker._conv_decomp = None
+    worker._is_csa_linear = False
+    worker._ssm_region_indices = [0] if has_mamba else []
+    worker._ple_group_index = None
+    worker._ple_region_index = None
     if has_mamba:
         from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (  # noqa: E501
             MambaConvSplitInfo,
@@ -854,7 +858,10 @@ def test_post_process_zeroes_untransferred_tail():
     worker.device_kv_caches = {"attn.0": attn_cache, "mamba.0": mamba_cache}
     fa_group = MagicMock(layer_names=["attn.0"])
     ssm_group = MagicMock(layer_names=["mamba.0"])
-    worker.kv_cache_config = MagicMock(kv_cache_groups=[fa_group, ssm_group])
+    worker.kv_cache_config = MagicMock(
+        kv_cache_groups=[fa_group, ssm_group],
+        transfer_groups=[fa_group, ssm_group],
+    )
     # The cached property filters mamba layers out of the permuted caches.
     attn_caches = NixlConnectorWorker._attention_kv_caches.func(worker)
     assert len(attn_caches) == 1 and attn_caches[0] is attn_cache
@@ -1477,6 +1484,16 @@ def test_exchange_clipped_blocks_ssm_positional_states():
     assert clipped == ([1, 2, 3], [0, 5, 6, 7])
 
 
+@pytest.mark.cpu_test
+def test_exchange_clipped_blocks_excludes_nontransfer_groups():
+    """Scheduler block tables must match the worker's registered regions."""
+    sched = make_nixl_scheduler()
+    sched.kv_cache_config = make_kv_cache_config(block_size=16, swa_enabled=True)
+    sched.kv_cache_config.kv_cache_groups[1].enable_kv_transfer = False
+
+    assert sched.get_exchange_clipped_blocks(([1, 2], [9])) == ([1, 2],)
+
+
 # ── Hybrid MLA+SSM (KimiLinear-shaped KDA+MLA) tests ─────────────────────
 
 
@@ -1630,6 +1647,7 @@ def test_push_write_hybrid_mla_replicates_attention():
     worker.shutdown = lambda: None  # skeleton worker: silence __del__
     worker.use_mla = True
     worker._has_mamba = True
+    worker._is_csa_linear = False
     worker._group_spec_types = (MLAAttentionSpec, MambaSpec)
     worker.transfer_topo = MagicMock()
     worker.transfer_topo.tp_ratio.return_value = -2

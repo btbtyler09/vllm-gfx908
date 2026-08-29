@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import gc
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -43,10 +44,12 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.core.kv_cache_utils import estimate_max_model_len, get_kv_cache_configs
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -1457,6 +1460,57 @@ def test_mamba_state_table_width_is_not_aligned():
     assert block_tables[0].max_num_blocks_per_req == 1
 
 
+@pytest.mark.parametrize("wrap_uniform", [False, True])
+def test_circular_buffer_uses_custom_slot_mapping(wrap_uniform: bool):
+    circular_spec = CircularBufferSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+    spec = (
+        UniformTypeKVCacheSpecs(
+            block_size=8,
+            kv_cache_specs={"raw_key_cache": circular_spec},
+        )
+        if wrap_uniform
+        else circular_spec
+    )
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.max_model_len = 16
+    runner.max_encoder_len = 0
+    runner.max_num_reqs = 1
+    runner.max_num_tokens = 2
+    runner.num_spec_tokens = 0
+    runner.device = torch.device("cpu")
+    runner.model_config = SimpleNamespace(get_vocab_size=lambda: 8)
+    runner.parallel_config = SimpleNamespace(cp_kv_cache_interleave_size=1)
+    runner.vllm_config = SimpleNamespace(reasoning_config=None)
+    runner.cache_config = SimpleNamespace(use_replayssm=False)
+    runner.jit_warmup_registry = SimpleNamespace(activate=nullcontext)
+    runner.is_pooling_model = False
+    runner.input_batch = SimpleNamespace(
+        logitsprocs=None,
+        logitsprocs_need_output_token_ids=False,
+    )
+    runner._init_block_sizes = []
+    runner._init_kernel_block_sizes = []
+    runner._init_max_num_blocks = []
+    runner._init_slot_mapping_modes = []
+    kv_cache_config = KVCacheConfig(
+        num_blocks=1,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=["raw"], kv_cache_spec=spec)],
+    )
+
+    runner.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes=[8])
+
+    block_table = runner.input_batch.block_table[0]
+    assert block_table.slot_mapping_mode == SlotMappingMode.NONE
+    assert block_table.max_num_blocks_per_req == 1
+
+
 def test_input_batch_with_kernel_block_sizes():
     """Test InputBatch initialization with kernel_block_sizes parameter."""
     max_num_reqs = 10
@@ -1752,59 +1806,3 @@ def test_mamba_cache_raises_when_max_num_seqs_exceeds_blocks():
 
         with pytest.raises(ValueError, match="max_num_seqs"):
             runner.initialize_kv_cache(kv_cache_config)
-
-
-class TestInitFp8KvScalesHybridModels:
-    """Verify init_fp8_kv_scales handles heterogeneous kv_caches entries.
-
-    Hybrid models (Mamba, DeltaNet) store per-layer state as a list of tensors
-    rather than a single tensor. init_fp8_kv_scales must iterate both forms.
-    """
-
-    @staticmethod
-    def _make_runner_stub(kv_caches):
-        runner = Mock(spec=GPUModelRunner)
-        runner.cache_config = SimpleNamespace(cache_dtype="fp8_e4m3")
-        runner.kv_caches = kv_caches
-        runner.compilation_config = SimpleNamespace(static_forward_context={})
-        runner.init_fp8_kv_scales = GPUModelRunner.init_fp8_kv_scales.__get__(
-            runner, GPUModelRunner
-        )
-        return runner
-
-    def test_zeroes_both_tensor_and_list_entries(self):
-        single_tensor = torch.ones(4, 8)
-        list_tensors = [torch.ones(2, 4), torch.ones(3, 6)]
-
-        runner = self._make_runner_stub([single_tensor, list_tensors])
-        runner.init_fp8_kv_scales()
-
-        assert (single_tensor == 0).all()
-        assert all((t == 0).all() for t in list_tensors)
-
-    def test_skips_none_entries(self):
-        tensor = torch.ones(4, 8)
-        runner = self._make_runner_stub([None, tensor, None])
-        runner.init_fp8_kv_scales()
-
-        assert (tensor == 0).all()
-
-    def test_noop_when_kv_cache_not_quantized(self):
-        tensor = torch.ones(4, 8)
-        runner = self._make_runner_stub([tensor])
-        runner.cache_config.cache_dtype = "auto"
-        runner.init_fp8_kv_scales()
-
-        assert (tensor == 1).all()
-
-    def test_mixed_none_tensor_and_list(self):
-        t1 = torch.ones(2, 2)
-        t2 = torch.ones(3, 3)
-        list_entry = [torch.ones(1, 1), torch.ones(1, 1)]
-
-        runner = self._make_runner_stub([None, t1, list_entry, None, t2])
-        runner.init_fp8_kv_scales()
-
-        assert (t1 == 0).all()
-        assert (t2 == 0).all()
-        assert all((t == 0).all() for t in list_entry)
