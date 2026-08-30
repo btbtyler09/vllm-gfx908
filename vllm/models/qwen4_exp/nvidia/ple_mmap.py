@@ -858,7 +858,10 @@ def set_weight_scale(
 # Startup guard: the whole-forward op (hashing + gather) must never run
 # inside CUDA graph capture.
 # --------------------------------------------------------------------------- #
-def check_cudagraph_safety(compilation_config: CompilationConfig) -> None:
+def check_cudagraph_safety(
+    compilation_config: CompilationConfig,
+    required_op: str | None = None,
+) -> None:
     """Raise if VLLM_PLE_MMAP=1 would run the hashing+gather forward inside
     a capture.
 
@@ -890,9 +893,13 @@ def check_cudagraph_safety(compilation_config: CompilationConfig) -> None:
             f"suppress CUDA graph capture on this model. Got mode="
             f"{compilation_config.mode}."
         )
-    if QUALIFIED_OP_NAME not in (compilation_config.splitting_ops or []):
+    # The AMD tree splits around its own gather op instead of the widened
+    # nvidia forward op; callers pass the op that actually guards their path.
+    if required_op is None:
+        required_op = QUALIFIED_OP_NAME
+    if required_op not in (compilation_config.splitting_ops or []):
         raise RuntimeError(
-            f"VLLM_PLE_MMAP=1 requires {QUALIFIED_OP_NAME!r} in "
+            f"VLLM_PLE_MMAP=1 requires {required_op!r} in "
             "compilation_config.splitting_ops (an operator-supplied "
             "-cc.splitting_ops list, or an attn-fusion reset, can drop it). "
             f"Got splitting_ops={compilation_config.splitting_ops!r}."

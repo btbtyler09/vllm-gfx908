@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
@@ -77,6 +77,7 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from ..config import Qwen4ExpConfig
+from ..nvidia import ple_mmap
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ple_layer import Qwen4ExpPLELayer
@@ -817,7 +818,12 @@ class Qwen4ExpForCausalLM(
             self,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(weights, mapper=mapper)
+        loaded = loader.load_weights(weights, mapper=mapper)
+        if ple_mmap.enabled():
+            ple_mmap.build_tables(
+                self.model_config, get_current_vllm_config().compilation_config
+            )
+        return loaded
 
 
 class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
@@ -1011,7 +1017,12 @@ class Qwen4ExpForConditionalGeneration(
             self,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(weights, mapper=mapper)
+        loaded = loader.load_weights(weights, mapper=mapper)
+        if ple_mmap.enabled():
+            ple_mmap.build_tables(
+                self.model_config, get_current_vllm_config().compilation_config
+            )
+        return loaded
 
     @classmethod
     def get_mamba_state_dtype_from_config(

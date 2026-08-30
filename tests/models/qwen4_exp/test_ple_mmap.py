@@ -1103,13 +1103,13 @@ def test_op_is_registered_under_platform_default_and_cpu_dispatch_keys() -> None
     assert schema.endswith("-> ()")
     # Exercise the CPU key directly: this is what every other test below
     # relies on to run without a GPU. The widened op calls
-    # ple_embedding_module._hash_ngram_ids THEN .ngram_embedding(...), so
+    # ple_embedding_module.compute_ngram_ids THEN .ngram_embedding(...), so
     # the fake stands in for both.
     hash_calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
     gather_calls: list[torch.Tensor] = []
 
     class _FakePleEmbeddingModule:
-        def _hash_ngram_ids(
+        def compute_ngram_ids(
             self,
             input_ids: torch.Tensor,
             query_start_loc: torch.Tensor,
@@ -2315,13 +2315,13 @@ def test_resolve_model_path_falls_back_to_offline_snapshot_download(
 # --------------------------------------------------------------------------- #
 # (a) env-on vs env-off FORWARD equivalence, through the CPU dispatch key.
 # The op boundary is the whole forward: env-on hashes AND gathers inside the
-# op. Both arms call the SAME Qwen4ExpNGramEmbedding._hash_ngram_ids, so
+# op. Both arms call the SAME Qwen4ExpNGramEmbedding.compute_ngram_ids, so
 # this test proves the env-on path loads the RIGHT weights and gathers and
 # dequantizes them the same way the stock VocabParallelEmbedding path
 # does — it does NOT independently verify the hashing math itself: a bug
-# in _hash_ngram_ids would move both arms identically and cancel out here.
+# in compute_ngram_ids would move both arms identically and cancel out here.
 # Hashing correctness is pinned separately by
-# test_hash_ngram_ids_matches_golden_ids below.
+# testcompute_ngram_ids_matches_golden_ids below.
 # --------------------------------------------------------------------------- #
 
 
@@ -2337,7 +2337,7 @@ def test_env_on_off_forward_equivalence_fp8_and_dequantized(
     both sides; compared byte-equal at fp8 AND through
     _dequantize_embeddings to bf16. Proves weight-loading/gather/dequant
     equivalence between the two paths, not hashing correctness (both
-    arms share the same _hash_ngram_ids call, see module comment above).
+    arms share the same compute_ngram_ids call, see module comment above).
     """
     config = _make_text_config()  # ngram_size=3, heads_per_ngram=2 -> 4 heads
     embedding_dim = 8  # head_dim = 2
@@ -2461,8 +2461,8 @@ def test_dequantize_embeddings_casts_a_bf16_table_to_the_output_dtype() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# _hash_ngram_ids golden pin. The equivalence test above drives BOTH
-# arms through the same _hash_ngram_ids call, so it cannot catch a bug in
+# compute_ngram_ids golden pin. The equivalence test above drives BOTH
+# arms through the same compute_ngram_ids call, so it cannot catch a bug in
 # the hashing math itself (xor chain / remainder / offset) — a mutation
 # there moves both arms identically and cancels out. This test freezes the
 # exact output of a fixed, small, real Qwen4ExpNGramEmbedding on fixed
@@ -2470,10 +2470,10 @@ def test_dequantize_embeddings_casts_a_bf16_table_to_the_output_dtype() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_hash_ngram_ids_matches_golden_ids() -> None:
+def testcompute_ngram_ids_matches_golden_ids() -> None:
     """Golden values captured by running this exact scenario once and
     hardcoding the result — they pin the xor-chain/remainder/offset math
-    in _hash_ngram_ids (ngram_size=3, heads_per_ngram=2, seed=1234,
+    in compute_ngram_ids (ngram_size=3, heads_per_ngram=2, seed=1234,
     ple_dense_layer_id=0), not merely its shape.
     """
     config = _make_text_config()  # ngram_size=3, heads_per_ngram=2 -> 4 heads
@@ -2492,7 +2492,7 @@ def test_hash_ngram_ids_matches_golden_ids() -> None:
     query_start_loc = torch.tensor([0, 2, 3], dtype=torch.long)
     ngram_context = torch.tensor([[44, 55], [66, 77]], dtype=torch.long)
 
-    ngram_ids = module._hash_ngram_ids(input_ids, query_start_loc, ngram_context)
+    ngram_ids = module.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
 
     assert ngram_ids.shape == (3, 4)
     golden = torch.tensor(
@@ -2574,7 +2574,7 @@ def test_mmap_forward_allocates_an_fp8_output_buffer(
     )
 
     # ple_embedding must be the REAL module (not a bare embedding wrapper):
-    # the widened op calls ple_embedding_module._hash_ngram_ids(...)
+    # the widened op calls ple_embedding_module.compute_ngram_ids(...)
     # before the gather, and only Qwen4ExpNGramEmbedding provides that.
     fake_ple_layer = SimpleNamespace(ple_embedding=module)
     ctx = SimpleNamespace(no_compile_layers={layer_name: fake_ple_layer})
