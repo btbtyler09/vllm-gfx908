@@ -772,7 +772,6 @@ class CompilationConfig:
         "vllm::qwen4_exp_compute_ple_ngram_ids",
         "vllm::qwen4_exp_ple_short_conv",
         "vllm::qwen4_exp_ple_mmap_forward",
-        "vllm::qwen4_exp_amd_ple_ngram_embedding",
         "vllm::qwen4_exp_qsa_with_output",
         "vllm::linear_attention",
         "vllm::qwen_gdn_attention_core",
@@ -783,7 +782,16 @@ class CompilationConfig:
         "vllm::rocm_aiter_sparse_attn_indexer",
         "vllm::deepseek_v4_attention",
         "vllm::hpc_rope_norm_forward",
-    ]
+    ] + (
+        # The AMD qwen4_exp PLE gather op is ALWAYS present in the graph
+        # (unlike the nvidia mmap forward op, which only exists when mmap
+        # is enabled), so splitting on it unconditionally would change the
+        # default piecewise partitioning. Only the mmap table needs the
+        # gather outside captures.
+        ["vllm::qwen4_exp_amd_ple_ngram_embedding"]
+        if envs.VLLM_PLE_MMAP
+        else []
+    )
 
     def compute_hash(self) -> str:
         """

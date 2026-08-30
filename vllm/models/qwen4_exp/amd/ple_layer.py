@@ -247,6 +247,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             self.ngram_embedding = ple_mmap.MmapNgramEmbedding(
                 padded_vocab_size, self.head_dim
             )
+            # The placeholder's torch_dtype is fp8 until a real table
+            # attaches (bf16 for our tables). Downstream layers compute in
+            # the model dtype, so forward casts to this — a no-op once the
+            # attached table dtype matches (e.g. a dummy-load probe never
+            # attaches and would otherwise leak fp8 zeros into bf16 GEMMs).
+            self._mmap_cast_dtype = vllm_config.model_config.dtype
         else:
             self.ngram_embedding = VocabParallelEmbedding(
                 padded_vocab_size,
@@ -381,6 +387,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             output,
             self.layer_name,
         )
+        if (
+            isinstance(self.ngram_embedding, ple_mmap.MmapNgramEmbedding)
+            and output.dtype != self._mmap_cast_dtype
+        ):
+            output = output.to(self._mmap_cast_dtype)
         return output
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
