@@ -38,8 +38,6 @@ from ..common.ple import copy_ple_embedding_shard_
 # pool + plain H2D copies); the module lives in the nvidia tree upstream.
 from ..nvidia import ple_mmap
 
-_AMD_PLE_GATHER_OP = "vllm::qwen4_exp_amd_ple_ngram_embedding"
-
 
 class Qwen4ExpPLEGroupedNorm(nn.Module):
     def __init__(
@@ -235,12 +233,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self.ngram_embedding: VocabParallelEmbedding | ple_mmap.MmapNgramEmbedding
         if ple_mmap.enabled():
             vllm_config = get_current_vllm_config()
-            # On AMD the mmap gather runs inside the existing per-layer
-            # gather op, so that op (not the widened nvidia forward op) must
-            # be the split point.
-            ple_mmap.check_cudagraph_safety(
-                vllm_config.compilation_config, required_op=_AMD_PLE_GATHER_OP
-            )
+            # AMD reuses the widened nvidia mmap forward op (see forward),
+            # so the stock safety check's required op applies unchanged.
+            ple_mmap.check_cudagraph_safety(vllm_config.compilation_config)
             ple_mmap.validate_shards_for(
                 vllm_config.model_config, layer_name, self.head_dim
             )
@@ -310,12 +305,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         valid = (source.unsqueeze(0) >= 0) & (position_in_segment >= shift)
         return torch.where(valid, shifted, tokens.new_full((), eos_token_id))
 
-    def forward(
+    def compute_ngram_ids(
         self,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
     ) -> torch.Tensor:
+        """Compute n-gram embedding indices for the current request layout."""
         input_ids = input_ids.reshape(-1).long()
         query_start_loc = query_start_loc.long()
         num_reqs = query_start_loc.numel() - 1
@@ -374,24 +370,42 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ids = torch.remainder(mixed.unsqueeze(-1), sizes) + offsets
             id_blocks.append(ids[request_indices, adjusted_columns])
         ngram_ids = torch.cat(id_blocks, dim=-1)
+        return ngram_ids
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> torch.Tensor:
         if isinstance(self.ngram_embedding, ple_mmap.MmapNgramEmbedding):
-            output_dtype = self.ngram_embedding.torch_dtype
-        else:
-            output_dtype = self.ngram_embedding.params_dtype
+            # Widened op boundary (mirrors the nvidia mmap path): hashing
+            # must run EAGERLY inside the op. If it stayed in a captured
+            # partition, cudagraph capture would record (not execute) it and
+            # hand the eager gather an uninitialized ngram_ids buffer —
+            # garbage row ids. input_ids is an eager-provided buffer, valid
+            # even during capture.
+            num_tokens = input_ids.reshape(-1).shape[0]
+            output = input_ids.new_empty(
+                (num_tokens, self.embedding_dim),
+                dtype=self.ngram_embedding.torch_dtype,
+            )
+            torch.ops.vllm.qwen4_exp_ple_mmap_forward(
+                input_ids, query_start_loc, ngram_context, output, self.layer_name
+            )
+            if output.dtype != self._mmap_cast_dtype:
+                output = output.to(self._mmap_cast_dtype)
+            return output
+        ngram_ids = self.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
         output = ngram_ids.new_empty(
             (ngram_ids.shape[0], self.embedding_dim),
-            dtype=output_dtype,
+            dtype=self.ngram_embedding.params_dtype,
         )
         torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding(
             ngram_ids,
             output,
             self.layer_name,
         )
-        if (
-            isinstance(self.ngram_embedding, ple_mmap.MmapNgramEmbedding)
-            and output.dtype != self._mmap_cast_dtype
-        ):
-            output = output.to(self._mmap_cast_dtype)
         return output
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
