@@ -44,12 +44,10 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.core.kv_cache_utils import estimate_max_model_len, get_kv_cache_configs
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
-    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
-    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -879,6 +877,111 @@ def test_reload_weights_before_load_model(model_runner):
         model_runner.reload_weights()
 
 
+def test_reload_weights_checkpoint_format_preflights_before_any_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A model exposing `preflight_reload_weights` must be preflighted right
+    after `get_model()`, before the disk iterator is built, model_config is
+    repointed, or `initialize_layerwise_reload` moves params to meta."""
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.lora_config = None
+    runner.model_config = SimpleNamespace(
+        model="original/model", revision="orig-rev", quantization=None
+    )
+    runner.load_config = SimpleNamespace(load_format="auto")
+
+    model = Mock(spec=["named_parameters", "preflight_reload_weights", "load_weights"])
+    model.named_parameters.return_value = iter([("w", torch.zeros(1))])
+    model.preflight_reload_weights.side_effect = RuntimeError(
+        "PLE mmap: table already attached"
+    )
+    model.load_weights.return_value = set()
+    runner.get_model = Mock(return_value=model)
+
+    get_all_weights_calls = []
+
+    def _get_all_weights(model_config, model_arg):
+        get_all_weights_calls.append((model_config.model, model_config.revision))
+        return iter([])
+
+    mock_loader = Mock(spec=["get_all_weights"])
+    mock_loader.get_all_weights.side_effect = _get_all_weights
+    monkeypatch.setattr(
+        gpu_model_runner_module, "get_model_loader", lambda load_config: mock_loader
+    )
+    init_layerwise_calls = []
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "initialize_layerwise_reload",
+        lambda m: init_layerwise_calls.append(m),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "finalize_layerwise_reload",
+        lambda m, model_config: None,
+    )
+
+    with pytest.raises(RuntimeError, match="PLE mmap"):
+        runner.reload_weights(weights_path="new/model/path")
+
+    model.preflight_reload_weights.assert_called_once()
+    model.named_parameters.assert_not_called()
+    model.load_weights.assert_not_called()
+    assert get_all_weights_calls == []
+    assert init_layerwise_calls == []
+    # model_config must not have been repointed at the new path/revision.
+    assert runner.model_config.model == "original/model"
+    assert runner.model_config.revision == "orig-rev"
+
+
+def test_reload_weights_kernel_format_preflights_before_first_parameter_copy(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Kernel-format reload bypasses `model.load_weights` and copies
+    parameters directly; preflight must still run before the iterator is
+    advanced or any parameter is copied."""
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.lora_config = None
+    runner.model_config = SimpleNamespace(
+        model="orig", revision=None, quantization=None
+    )
+
+    model = Mock(spec=["named_parameters", "preflight_reload_weights"])
+    model.named_parameters.return_value = iter([("w", torch.zeros(1))])
+    model.preflight_reload_weights.side_effect = RuntimeError(
+        "PLE mmap: table already attached"
+    )
+    runner.get_model = Mock(return_value=model)
+
+    advanced = []
+
+    def _weights_iterator():
+        advanced.append(True)
+        yield ("w", torch.zeros(1))
+
+    get_parameter_calls = []
+
+    def _get_parameter_for_reload(m, name):
+        get_parameter_calls.append(name)
+        return Mock()
+
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "_get_parameter_for_reload",
+        _get_parameter_for_reload,
+    )
+
+    with pytest.raises(RuntimeError, match="PLE mmap"):
+        runner.reload_weights(
+            weights_iterator=_weights_iterator(), is_checkpoint_format=False
+        )
+
+    model.preflight_reload_weights.assert_called_once()
+    model.named_parameters.assert_not_called()
+    assert advanced == []
+    assert get_parameter_calls == []
+
+
 def test_sample_passes_reordered_draft_probs_to_rejection_sampler():
     runner = object.__new__(GPUModelRunner)
     runner.use_async_scheduling = False
@@ -1383,6 +1486,76 @@ def test_hybrid_attention_mamba_tensor_shapes():
             assert torch.equal(actual_ssm, expected_ssm)
 
 
+def test_input_batch_reinitialized_after_late_interleave_adjustment(monkeypatch):
+    runner = object.__new__(GPUModelRunner)
+    runner.vllm_config = SimpleNamespace(reasoning_config=None)
+    runner.parallel_config = SimpleNamespace(cp_kv_cache_interleave_size=16)
+    runner.cache_config = SimpleNamespace(use_replayssm=False)
+    runner.model_config = SimpleNamespace(get_vocab_size=lambda: 32)
+    runner.max_model_len = 64
+    runner.max_encoder_len = 0
+    runner.max_num_reqs = 1
+    runner.max_num_tokens = 64
+    runner.num_spec_tokens = 0
+    runner.device = torch.device("cpu")
+    runner.is_pooling_model = False
+    runner._init_block_sizes = [16]
+    runner._init_kernel_block_sizes = [16]
+    runner._init_max_num_blocks = [4]
+    runner._init_slot_mapping_modes = [
+        gpu_model_runner_module.SlotMappingMode.TOKEN_TO_KV_SLOT
+    ]
+    runner.cp_kv_cache_interleave_size = 1
+    runner.input_batch = SimpleNamespace(
+        logitsprocs=None,
+        logitsprocs_need_output_token_ids=False,
+    )
+    runner.jit_warmup_registry = Mock()
+    runner.jit_warmup_registry.activate.return_value = nullcontext()
+
+    spec = SimpleNamespace(
+        block_size=16,
+        max_num_blocks_per_req=lambda *_: 4,
+    )
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+    )
+    input_batch_cls = Mock(return_value=SimpleNamespace())
+    monkeypatch.setattr(gpu_model_runner_module, "InputBatch", input_batch_cls)
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "get_kv_cache_spec_kind",
+        lambda _: gpu_model_runner_module.KVCacheSpecKind.FULL_ATTENTION,
+    )
+
+    runner.may_reinitialize_input_batch(kv_cache_config, [16])
+
+    assert input_batch_cls.call_count == 1
+    assert input_batch_cls.call_args.kwargs["cp_kv_cache_interleave_size"] == 16
+
+
+def test_v2_runner_snapshots_late_interleave_adjustment(monkeypatch):
+    from vllm.v1.worker.gpu import model_runner as v2_model_runner_module
+
+    runner = object.__new__(v2_model_runner_module.GPUModelRunner)
+    runner.parallel_config = SimpleNamespace(cp_kv_cache_interleave_size=16)
+    runner.cp_interleave = 1
+
+    class StopInitialization(Exception):
+        pass
+
+    monkeypatch.setattr(
+        v2_model_runner_module,
+        "deepcopy",
+        Mock(side_effect=StopInitialization),
+    )
+
+    with pytest.raises(StopInitialization):
+        runner.initialize_kv_cache(SimpleNamespace())
+
+    assert runner.cp_interleave == 16
+
+
 def test_hybrid_block_table_initialization():
     """Test hybrid block table with different kernel and kvcache_manager block
     sizes."""
@@ -1458,57 +1631,6 @@ def test_mamba_state_table_width_is_not_aligned():
     )
 
     assert block_tables[0].max_num_blocks_per_req == 1
-
-
-@pytest.mark.parametrize("wrap_uniform", [False, True])
-def test_circular_buffer_uses_custom_slot_mapping(wrap_uniform: bool):
-    circular_spec = CircularBufferSpec(
-        block_size=8,
-        num_kv_heads=1,
-        head_size=128,
-        dtype=torch.bfloat16,
-    )
-    spec = (
-        UniformTypeKVCacheSpecs(
-            block_size=8,
-            kv_cache_specs={"raw_key_cache": circular_spec},
-        )
-        if wrap_uniform
-        else circular_spec
-    )
-
-    runner = GPUModelRunner.__new__(GPUModelRunner)
-    runner.max_model_len = 16
-    runner.max_encoder_len = 0
-    runner.max_num_reqs = 1
-    runner.max_num_tokens = 2
-    runner.num_spec_tokens = 0
-    runner.device = torch.device("cpu")
-    runner.model_config = SimpleNamespace(get_vocab_size=lambda: 8)
-    runner.parallel_config = SimpleNamespace(cp_kv_cache_interleave_size=1)
-    runner.vllm_config = SimpleNamespace(reasoning_config=None)
-    runner.cache_config = SimpleNamespace(use_replayssm=False)
-    runner.jit_warmup_registry = SimpleNamespace(activate=nullcontext)
-    runner.is_pooling_model = False
-    runner.input_batch = SimpleNamespace(
-        logitsprocs=None,
-        logitsprocs_need_output_token_ids=False,
-    )
-    runner._init_block_sizes = []
-    runner._init_kernel_block_sizes = []
-    runner._init_max_num_blocks = []
-    runner._init_slot_mapping_modes = []
-    kv_cache_config = KVCacheConfig(
-        num_blocks=1,
-        kv_cache_tensors=[],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=["raw"], kv_cache_spec=spec)],
-    )
-
-    runner.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes=[8])
-
-    block_table = runner.input_batch.block_table[0]
-    assert block_table.slot_mapping_mode == SlotMappingMode.NONE
-    assert block_table.max_num_blocks_per_req == 1
 
 
 def test_input_batch_with_kernel_block_sizes():

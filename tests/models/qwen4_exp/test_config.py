@@ -8,6 +8,10 @@ import pytest
 import torch
 
 from vllm.config.speculative import SpeculativeConfig
+from vllm.model_executor.models.config import (
+    Qwen3_5ForConditionalGenerationConfig,
+    Qwen4ExpForConditionalGenerationConfig,
+)
 from vllm.models.qwen4_exp.config import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
@@ -111,9 +115,37 @@ def test_qwen4_exp_mtp_override_sets_draft_config(
     assert draft_config.n_predict == 1
 
 
+@pytest.mark.parametrize("ple_layer_ids", [[1], []])
+def test_qwen4_exp_rejects_pipeline_parallel_only_with_ple(ple_layer_ids) -> None:
+    """PLE needs raw input_ids, which non-first pipeline ranks never see. The
+    rest of the architecture is PP-capable, so the refusal must be conditional
+    -- and must land before the engine spends time loading weights."""
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=_text_config(ple_layer_ids=ple_layer_ids),
+            multimodal_config=None,
+        ),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=2, enable_dbo=False, ubatch_size=1
+        ),
+        speculative_config=None,
+    )
+    with patch.object(
+        Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"
+    ):
+        if ple_layer_ids:
+            with pytest.raises(NotImplementedError, match="pipeline_parallel_size=1"):
+                Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(
+                    vllm_config
+                )
+        else:
+            Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+
+
 def test_qwen4_exp_model_state_prepares_ngram_context() -> None:
     model_state = object.__new__(Qwen4ExpModelState)
     model_state.uses_ngram_embedding = True
+    model_state._mmap_ple_modules = ()
     model_state.ngram_context_len = 3
     model_state.ngram_eos_token_id = 99
     model_state.ngram_context = torch.empty((4, 3), dtype=torch.int32)
@@ -149,6 +181,7 @@ def test_qwen4_exp_model_state_prepares_ngram_context() -> None:
 def test_qwen4_exp_model_state_prepares_stable_dummy_ngram_inputs() -> None:
     model_state = object.__new__(Qwen4ExpModelState)
     model_state.uses_ngram_embedding = True
+    model_state._mmap_ple_modules = ()
     model_state.ngram_eos_token_id = 99
     model_state.ngram_context = torch.empty((4, 3), dtype=torch.int32)
     model_state.ple_query_start_loc = torch.empty(5, dtype=torch.int32)

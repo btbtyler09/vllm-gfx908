@@ -18,14 +18,11 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding,
-)
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
-from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.utils.torch_utils import direct_register_custom_op, get_dtype_size
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionBackend,
@@ -33,7 +30,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
-from ..common.ple import copy_ple_embedding_shard_
+from ..common.ple import PLEVocabParallelEmbedding
 # The mmap PLE table (VLLM_PLE_MMAP) is platform-neutral (np.memmap + thread
 # pool + plain H2D copies); the module lives in the nvidia tree upstream.
 from ..nvidia import ple_mmap
@@ -230,26 +227,28 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         divisor = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab_size = ((total_vocab_size + divisor - 1) // divisor) * divisor
-        self.ngram_embedding: VocabParallelEmbedding | ple_mmap.MmapNgramEmbedding
+        self.ngram_embedding: PLEVocabParallelEmbedding | ple_mmap.MmapNgramEmbedding
+        # Non-persistent, module-owned staging buffer for V2 mmap external
+        # staging (see initialize_mmap_staging). None until V2 model state
+        # allocates it; stays None for the non-mmap embedding.
+        self._mmap_staging: torch.Tensor | None = None
         if ple_mmap.enabled():
             vllm_config = get_current_vllm_config()
-            # AMD reuses the widened nvidia mmap forward op (see forward),
-            # so the stock safety check's required op applies unchanged.
-            ple_mmap.check_cudagraph_safety(vllm_config.compilation_config)
-            ple_mmap.validate_shards_for(
+            ple_mmap.check_cudagraph_safety(vllm_config)
+            discovered_dtype = ple_mmap.validate_shards_for(
                 vllm_config.model_config, layer_name, self.head_dim
             )
             self.ngram_embedding = ple_mmap.MmapNgramEmbedding(
                 padded_vocab_size, self.head_dim
             )
-            # The placeholder's torch_dtype is fp8 until a real table
-            # attaches (bf16 for our tables). Downstream layers compute in
-            # the model dtype, so forward casts to this — a no-op once the
-            # attached table dtype matches (e.g. a dummy-load probe never
-            # attaches and would otherwise leak fp8 zeros into bf16 GEMMs).
-            self._mmap_cast_dtype = vllm_config.model_config.dtype
+            if discovered_dtype is not None:
+                # Seed the placeholder's fallback dtype from validated shard
+                # headers now, before any weights stream, so a dummy load's
+                # V2 staging buffer (initialize_mmap_staging) allocates at
+                # the checkpoint's real dtype instead of the FP8 default.
+                self.ngram_embedding.torch_dtype = discovered_dtype
         else:
-            self.ngram_embedding = VocabParallelEmbedding(
+            self.ngram_embedding = PLEVocabParallelEmbedding(
                 padded_vocab_size,
                 self.head_dim,
                 padding_size=divisor,
@@ -372,6 +371,107 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ngram_ids = torch.cat(id_blocks, dim=-1)
         return ngram_ids
 
+    def _require_mmap_embedding(self) -> ple_mmap.MmapNgramEmbedding:
+        if not isinstance(self.ngram_embedding, ple_mmap.MmapNgramEmbedding):
+            raise RuntimeError(
+                f"PLE mmap: {self.layer_name!r} is not using mmap staging"
+            )
+        return self.ngram_embedding
+
+    def _resolve_mmap_dtype(self) -> torch.dtype:
+        """Resolve this layer's PLE row dtype without allocating a buffer.
+
+        Prefers the attached table's dtype — the authoritative source once a
+        real load has streamed weights. Falls back to the placeholder's own
+        ``torch_dtype`` (derived from validated shard headers at
+        construction, or its FP8 default when construction never resolved a
+        model path) for a dummy load that has not attached a table.
+
+        Raises:
+            RuntimeError: a real (non-dummy) load already streamed weights
+                but ``build_tables`` never attached a table — fail closed
+                rather than silently stage zeros as if they were real rows.
+        """
+        embedding = self._require_mmap_embedding()
+        table = embedding.table
+        if table is not None:
+            return table.torch_dtype
+        if embedding.weights_streamed:
+            raise RuntimeError(
+                f"PLE mmap: {self.layer_name!r} streamed weights but never "
+                "attached a table before mmap staging was initialized"
+            )
+        return embedding.torch_dtype
+
+    def mmap_staging_nbytes(self, max_num_tokens: int) -> int:
+        """Bytes this layer's staging buffer would occupy at ``max_num_tokens``.
+
+        Used by V2 model state to compute the aggregate allocation preflight
+        BEFORE any layer's buffer is actually allocated.
+        """
+        dtype = self._resolve_mmap_dtype()
+        return max_num_tokens * self.ngram_heads * self.head_dim * get_dtype_size(dtype)
+
+    def initialize_mmap_staging(
+        self, max_num_tokens: int, device: torch.device
+    ) -> None:
+        """Allocate this layer's stable, non-persistent staged-row buffer.
+
+        Called once by V2 model state, after the aggregate allocation
+        preflight has already cleared every layer for allocation. The
+        buffer's address, dtype, and shape never change afterward; only its
+        contents are overwritten in place by ``prepare_mmap_rows`` /
+        ``prepare_dummy_mmap_rows``.
+        """
+        dtype = self._resolve_mmap_dtype()
+        self._mmap_staging = torch.zeros(
+            (max_num_tokens, self.ngram_heads, self.head_dim),
+            dtype=dtype,
+            device=device,
+        )
+
+    def prepare_mmap_rows(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+        actual_tokens: int,
+        padded_tokens: int,
+    ) -> None:
+        """Gather this layer's staged rows for the current real step.
+
+        V2 model state calls this from ``prepare_inputs``, BEFORE the
+        compiled/captured forward runs. ``input_ids``/``query_start_loc``/
+        ``ngram_context`` must already be sliced to actual (unpadded)
+        extents by the caller — this never gathers graph padding. Zeros
+        ``[actual_tokens:padded_tokens]`` every call so a smaller batch
+        reusing a larger graph's buffer never replays stale rows.
+        """
+        if self._mmap_staging is None:
+            raise RuntimeError(
+                f"PLE mmap: {self.layer_name!r} staging was never initialized"
+            )
+        embedding = self._require_mmap_embedding()
+        if actual_tokens > 0:
+            ngram_ids = self.compute_ngram_ids(
+                input_ids, query_start_loc, ngram_context
+            )
+            embedding.gather_into(ngram_ids, self._mmap_staging[:actual_tokens])
+        if padded_tokens > actual_tokens:
+            self._mmap_staging[actual_tokens:padded_tokens].zero_()
+
+    def prepare_dummy_mmap_rows(self, padded_tokens: int) -> None:
+        """Zero this layer's staged rows for a dummy/capture step.
+
+        No hashing, mmap file access, pinned allocation, or H2D copy —
+        dummy preparation performs no table access at all.
+        """
+        if self._mmap_staging is None:
+            raise RuntimeError(
+                f"PLE mmap: {self.layer_name!r} staging was never initialized"
+            )
+        self._mmap_staging[:padded_tokens].zero_()
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -379,23 +479,16 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ngram_context: torch.Tensor,
     ) -> torch.Tensor:
         if isinstance(self.ngram_embedding, ple_mmap.MmapNgramEmbedding):
-            # Widened op boundary (mirrors the nvidia mmap path): hashing
-            # must run EAGERLY inside the op. If it stayed in a captured
-            # partition, cudagraph capture would record (not execute) it and
-            # hand the eager gather an uninitialized ngram_ids buffer —
-            # garbage row ids. input_ids is an eager-provided buffer, valid
-            # even during capture.
+            if self._mmap_staging is None:
+                raise RuntimeError(
+                    f"PLE mmap: input preparation did not initialize "
+                    f"{self.layer_name!r}; Model Runner V2 is required"
+                )
+            # Keep this symbolic under torch.compile: no int() and no
+            # .numel()-derived slicing. A plain shape[0] read stays a SymInt
+            # when traced.
             num_tokens = input_ids.reshape(-1).shape[0]
-            output = input_ids.new_empty(
-                (num_tokens, self.embedding_dim),
-                dtype=self.ngram_embedding.torch_dtype,
-            )
-            torch.ops.vllm.qwen4_exp_ple_mmap_forward(
-                input_ids, query_start_loc, ngram_context, output, self.layer_name
-            )
-            if output.dtype != self._mmap_cast_dtype:
-                output = output.to(self._mmap_cast_dtype)
-            return output
+            return self._mmap_staging[:num_tokens].flatten(-2)
         ngram_ids = self.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
         output = ngram_ids.new_empty(
             (ngram_ids.shape[0], self.embedding_dim),
@@ -410,6 +503,22 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
+        embedding = self.ngram_embedding
+        if (
+            isinstance(embedding, ple_mmap.MmapNgramEmbedding)
+            and embedding.table is not None
+        ):
+            # Fail closed BEFORE touching `weights` at all: a same-path
+            # reload would otherwise mutate weight_scale and discard this
+            # call's shards onto a module whose table+scale still belong to
+            # the load that already attached.
+            raise RuntimeError(
+                f"PLE mmap: {self.layer_name!r} already has a table "
+                "attached from a previous load; calling load_weights again "
+                "on the same live module is unsupported — it would mix "
+                "this reload's rows with the already-attached checkpoint's "
+                "scale. Restart the seat to load different weights."
+            )
 
         persistent_buffers = {
             "layer_multipliers": self.layer_multipliers,
@@ -481,12 +590,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                     embedding.weights_streamed = True
                     loaded.add("ngram_embedding.weight")
                     continue
-                copy_ple_embedding_shard_(
-                    embedding.weight.data,
+                embedding.weight.weight_loader(
+                    embedding.weight,
                     loaded_weight,
                     checkpoint_start=checkpoint_start,
-                    tp_start=embedding.shard_indices.org_vocab_start_index,
-                    tp_end=embedding.shard_indices.org_vocab_end_index,
                 )
                 loaded.add("ngram_embedding.weight")
                 continue

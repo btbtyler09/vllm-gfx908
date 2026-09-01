@@ -87,7 +87,11 @@ from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
 )
-from vllm.v1.worker.utils import is_residual_scattered_for_sp
+from vllm.v1.worker.utils import (
+    is_residual_scattered_for_sp,
+    maybe_clear_reload_approval,
+    maybe_preflight_reload_weights,
+)
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -216,8 +220,6 @@ class Worker(WorkerBase):
         self.profiler_config = vllm_config.profiler_config
 
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
-        # pending non-blocking PP send work from the previous iteration
-        self._pp_send_work: list[Handle] = []
 
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
@@ -1108,12 +1110,6 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        # ensure any previous non-blocking PP sends are complete
-        if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
-            self._pp_send_work = []
-
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -1186,8 +1182,12 @@ class Worker(WorkerBase):
             and not get_pp_group().is_last_rank
         )
 
-        # launch non-blocking send of intermediate tensors
-        self._pp_send_work = get_pp_group().isend_tensor_dict(
+        # launch non-blocking send of intermediate tensors; the
+        # GroupCoordinator self-retains the source tensors and the
+        # metadata handle in ``_pending_isends`` and reaps them lazily on
+        # the next ``isend_tensor_dict(is_async=True)`` call, so this
+        # step returns without waiting for the receiver to drain.
+        get_pp_group().isend_tensor_dict(
             output.tensors,
             all_gather_group=get_tp_group(),
             all_gather_tensors=all_gather_tensors,
@@ -1344,6 +1344,13 @@ class Worker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             self._start_weight_update(is_draft=True)
 
+    def _get_weight_update_target_model(
+        self, is_draft: bool | None = None
+    ) -> nn.Module | None:
+        if is_draft is None:
+            is_draft = self._weight_update_is_draft
+        return self.get_draft_model() if is_draft else self.get_model()
+
     def _start_weight_update(self, is_draft: bool = False) -> None:
         self._check_weight_transfer_engine()
         assert self.weight_transfer_engine is not None
@@ -1360,11 +1367,24 @@ class Worker(WorkerBase):
                 "active. Call finish_weight_update first."
             )
 
+        target_model = None
         try:
+            # Guard the exact base or draft target before starting the engine.
+            target_model = self._get_weight_update_target_model(is_draft)
+            if target_model is not None:
+                maybe_preflight_reload_weights(target_model)
             if is_draft:
                 self._set_draft_weight_update_target()
             self.weight_transfer_engine.start_weight_update()
         except BaseException:
+            # A preflight that granted `target_model` a transaction-scoped
+            # reload approval, followed by a later failure in this same
+            # `try` (draft target set, engine start), must not leave that
+            # approval dangling for an unrelated later reload to validate
+            # against: this session never reaches `finish_weight_update`,
+            # which is the only other place it would otherwise be cleared.
+            if target_model is not None:
+                maybe_clear_reload_approval(target_model)
             self.weight_transfer_engine.reset_weight_update_target()
             raise
         self._weight_update_active = True
@@ -1405,6 +1425,13 @@ class Worker(WorkerBase):
             except BaseException:
                 self._weight_update_active = False
                 self.weight_transfer_engine.reset_weight_update_target()
+                # This session is now dead (a second `start_weight_update`
+                # is required before any further chunk), so nothing else
+                # will ever validate against or clear an approval granted to
+                # this session's target at `start_weight_update` time.
+                target_model = self._get_weight_update_target_model()
+                if target_model is not None:
+                    maybe_clear_reload_approval(target_model)
                 raise
 
     def finish_weight_update(self) -> None:
@@ -1418,9 +1445,16 @@ class Worker(WorkerBase):
             )
 
         with set_current_vllm_config(self.vllm_config):
-            self.weight_transfer_engine.finish_weight_update()
-            self.weight_transfer_engine.reset_weight_update_target()
-            self._weight_update_active = False
+            target_model = self._get_weight_update_target_model()
+            try:
+                self.weight_transfer_engine.finish_weight_update()
+            finally:
+                self.weight_transfer_engine.reset_weight_update_target()
+                # Weight transfer bypasses model.load_weights, so the session
+                # boundary owns approval cleanup even when finalization fails.
+                if target_model is not None:
+                    maybe_clear_reload_approval(target_model)
+                self._weight_update_active = False
 
         # Weight transfer bypasses GPUModelRunner.reload_weights().
         if not self._weight_update_is_draft:
