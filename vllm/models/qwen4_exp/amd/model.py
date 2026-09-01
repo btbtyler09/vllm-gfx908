@@ -1083,7 +1083,7 @@ class Qwen4ExpForConditionalGeneration(
         if ple_mmap.enabled():
             compilation_config = get_current_vllm_config().compilation_config
             owns_transaction, should_build_tables = ple_mmap.validate_reload_approval(
-                self, compilation_config
+                self, compilation_config, inner_model_attr="language_model"
             )
         try:
             mapper = self.hf_to_vllm_mapper | WeightsMapper(
@@ -1102,7 +1102,7 @@ class Qwen4ExpForConditionalGeneration(
             return loaded
         finally:
             if owns_transaction:
-                ple_mmap.clear_reload_approval(self)
+                ple_mmap.clear_reload_approval(self, inner_model=self.language_model)
 
     def preflight_reload_weights(
         self,
