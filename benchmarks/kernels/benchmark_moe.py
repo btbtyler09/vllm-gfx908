@@ -791,6 +791,8 @@ def get_model_params(config):
         "Qwen3VLMoeForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5MoeTextConfig",
+        "Qwen4ExpForConditionalGeneration",
+        "Qwen4ExpForCausalLM",
     ):
         text_config = config.get_text_config()
         E = text_config.num_experts
@@ -841,7 +843,13 @@ def get_model_params(config):
     return E, topk, intermediate_size, hidden_size
 
 
-def resolve_dtype(config) -> torch.dtype:
+def resolve_dtype(config, act_dtype: str = "auto") -> torch.dtype:
+    # Explicit override: tune with the activation dtype the model is served in.
+    if act_dtype == "float16":
+        return torch.float16
+    if act_dtype == "bfloat16":
+        return torch.bfloat16
+
     if current_platform.is_rocm():
         return torch.float16
 
@@ -905,7 +913,7 @@ def main(args: argparse.Namespace):
     else:
         ensure_divisibility(intermediate_size, args.tp_size, "intermediate_size")
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    dtype = resolve_dtype(config)
+    dtype = resolve_dtype(config, args.act_dtype)
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
     use_int4_w4a16 = args.dtype == "int4_w4a16"
@@ -1076,6 +1084,13 @@ if __name__ == "__main__":
         default="auto",
     )
     parser.add_argument("--use-deep-gemm", action="store_true")
+    parser.add_argument(
+        "--act-dtype",
+        type=str,
+        choices=["auto", "float16", "bfloat16"],
+        default="auto",
+        help="Activation dtype to tune with (auto: config dtype, fp16 on ROCm)",
+    )
     parser.add_argument(
         "--save-dir", type=str, default="./", help="Directory to save tuned results"
     )

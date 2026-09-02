@@ -244,7 +244,7 @@ def _gfx908_gemv_enabled() -> bool:
         from vllm.platforms.rocm import on_gfx908
 
         _GFX908_GEMV_FLAG = on_gfx908() and os.environ.get(
-            "VLLM_GFX908_W4_GEMV", "0"
+            "VLLM_GFX908_W4_GEMV", "1"
         ) == "1"
     return _GFX908_GEMV_FLAG
 
