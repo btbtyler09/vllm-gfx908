@@ -40,6 +40,10 @@ from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.gfx908_shared_expert import (
+    gfx908_shared_expert_applies as _gfx908_shared_expert_applies,
+    gfx908_shared_expert_forward as _gfx908_shared_expert_forward,
+)
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -110,6 +114,8 @@ class Qwen2MoeMLP(nn.Module):
         self.expert_gate = expert_gate
 
     def forward(self, x):
+        if self.expert_gate is not None and _gfx908_shared_expert_applies(self, x):
+            return _gfx908_shared_expert_forward(self, x)
         gate_up, _ = self.gate_up_proj(x)
         out = self.act_fn(gate_up)
         out, _ = self.down_proj(out)
