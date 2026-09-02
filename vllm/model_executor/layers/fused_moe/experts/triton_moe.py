@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton-based MoE expert implementations."""
 
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -580,6 +582,42 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         ops.moe_sum(input, output)
 
 
+_GFX908_MOE_HIP: bool | None = None
+
+
+def _gfx908_moe_hip_applies(experts, hidden_states, num_tokens, activation, expert_map) -> bool:
+    """gfx908 HIP GEMV MoE path: symmetric int4 W4A16, bf16, SILU, no EP map, M <= 8."""
+    global _GFX908_MOE_HIP
+    if _GFX908_MOE_HIP is None:
+        from vllm.platforms.rocm import on_gfx908
+
+        _GFX908_MOE_HIP = (
+            on_gfx908() and os.environ.get("VLLM_GFX908_MOE_HIP", "1") == "1"
+        )
+        if _GFX908_MOE_HIP:
+            from vllm.model_executor.layers.fused_moe.gfx908_moe_hip import (
+                hip_gemv_available,
+            )
+
+            _GFX908_MOE_HIP = hip_gemv_available()
+    if not _GFX908_MOE_HIP:
+        return False
+    from vllm.model_executor.layers.fused_moe.gfx908_moe_hip import MOE_HIP_MAX_TOKENS
+
+    qc = experts.quant_config
+    return (
+        num_tokens <= MOE_HIP_MAX_TOKENS
+        and hidden_states.dtype == torch.bfloat16
+        and bool(qc.use_int4_w4a16)
+        and qc.w1_zp is None
+        and qc.w2_zp is None
+        and expert_map is None
+        and activation == MoEActivation.SILU
+        and experts.w1_scale is not None
+        and experts.w2_scale is not None
+    )
+
+
 class TritonWNA16Experts(TritonExperts):
     @staticmethod
     def _supports_current_device() -> bool:
@@ -672,6 +710,16 @@ class TritonWNA16Experts(TritonExperts):
 
         if global_num_experts == -1:
             global_num_experts = E
+        if _gfx908_moe_hip_applies(self, hidden_states, num_tokens, activation, expert_map):
+            from vllm.model_executor.layers.fused_moe.gfx908_moe_hip import gfx908_moe_hip
+
+            gfx908_moe_hip(
+                output, hidden_states, w1, w2, self.w1_scale, self.w2_scale,
+                topk_weights, topk_ids,
+                self.block_shape[1] if self.block_shape else K,
+                not apply_router_weight_on_input,
+            )
+            return
 
         config = try_get_optimal_moe_config(
             w1.size(),
