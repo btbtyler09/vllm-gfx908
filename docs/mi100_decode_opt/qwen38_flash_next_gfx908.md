@@ -93,6 +93,12 @@ Image: `btbtyler09/vllm-rocm-gfx908:v0.28.0rc2.dev-q38fn` (HIP ext at `/opt/vllm
   restricted to 32); never set both `HIP_VISIBLE_DEVICES` and `ROCR_VISIBLE_DEVICES`; the ray
   tuner dies on the first GPU fault — use the crash-isolated driver in the job dir.
 
+### Round 3 findings that did not ship
+- **All-reduce is at its floor.** `ar_bench.py` (4 processes, graph-captured): vLLM custom AR 7.8 µs per 5 KB call, RCCL 19 µs. The 25–37 µs seen in the model profile is profiler inflation plus barrier accounting; all four ranks carry equal non-AR work and the profiled busy time (18.3 ms) exceeds the real step (16.8 ms). True AR cost ≈ 1 ms/token. Sanity-check profiler sums against wall time before attributing.
+- **Fused split-K finalize (v3 HIP GEMV)**: last-arriving block sums partials and applies the epilogue (cast / silu·mul / routed accumulate). 25% faster in the microbench (43 vs 57 µs per MoE layer), **4% slower in the server** (57.0–57.7 vs 59.6–59.9 tok/s over 3 probes each) — the serialized reduction on one block delays the dependent kernel more than a separate parallel reduce. Dense 1-launch variant only ties the Triton 2-launch GEMV. Rule: fusion wins need ≥3 in-server c=1 probes before commit.
+- Triton small-M top-k: neutral in-graph (21 vs 24 µs), default off.
+- GPU clocks are pinned at max (sclk 1502 / mclk 1200 MHz); bf16 GEMMs run at 65–98% of HBM peak via wvSplitK, so only fewer bytes helps there.
+
 ### Open levers
 - Quantize the bf16 GDN projections (Quantizer-side): ~3.5 ms/token at c=1.
 - Hand-written W4 GEMV (dense + MoE).
