@@ -64,6 +64,24 @@ Profile of the 32 ms step after the first fix (rank 0, 64 decode tokens, ~2,500 
 GPU ~100% busy): W4 dense GEMMs 26%, W4 MoE 13%, custom all-reduce 11% (97/token × 37 µs),
 bf16 GDN projections 11% (1.04 GB/token/rank at ~30% of HBM BW), ~1,700 tiny glue kernels 28%.
 
+## Rounds 2–3 (2026-09-02 afternoon/evening): 37.7 → 59.6 tok/s at c=1
+
+| commit | change | c=1 tok/s |
+|---|---|---|
+| `71d3402a4d` | W4A16 GEMM dispatch as an opaque custom op. The `M ≤ 16` GEMV branch ran under dynamo tracing with a symbolic M and was specialized at trace time (large M), so the 12 QSA layers' qkv/o_proj ran the MFMA kernel with a large-M tile config at M=1 (162/98 µs). | 46.3 |
+| `5d4d45abd0` | Fused small-M shared-expert MLP: two GEMV partial kernels + reduce·silu·mul + reduce·sigmoid(x·w_gate) (10 launches → 4). | 49.2 |
+| `701f1f41e4` | QSA indexer GemmaRMSNorms as single Triton launches (were ~7 eager launches each inside the custom op). | 51.2 |
+| `cfac8d0d97` | HIP W4A16 GEMV MoE path for M ≤ 8 (`fused_moe/csrc/gfx908_w4gemv.hip`, JIT via `torch.utils.cpp_extension`, prebuilt in the image) + fused Triton reduces: 57 vs 96 µs per layer at M=1. Kernel zero-fills for out-of-range expert ids (cudagraph-capture routing on dummy inputs). | 57.4 |
+| `518e7d4394` | Cached HIP row-index tensors; Triton small-M top-k (neutral in-graph, default off). | 59.6 |
+
+Lessons: (1) any Python shape dispatch inside the traced region is frozen at trace time — wrap it in a custom op whenever a kernel choice "ignores" M; (2) the dense projections (0.4–4.6 MB) sit at the ~8 µs launch/latency floor — a faster kernel can't help them, only fewer launches can; the MoE experts (6 MB/layer) were the one GEMM where a better kernel paid; (3) `VLLM_PLE_MMAP_SERIAL=4096` cuts the PLE host gather from 3–10 ms to 0.4 ms per step at c=16 (thread-pool dispatch overhead).
+
+Validation: greedy per-token logprob fingerprints (16 GSM8K prompts × 160 tokens, temp 0, c=1 and c=16) differ from the round-1 image by 0.004–0.007 nats mean — the same-stack c=1-vs-c=16 noise floor. GSM8K at temp 0.6 varies ±2% run to run on this model (98.0 / 96.4 on identical-parity stacks), so it is a coarse gate here.
+
+Round-3c per-token profile (c=1, 18.3 ms GPU, 2,135 launches): bf16 GEMMs 4.2 ms (23%), all-reduce 1.5–3.4 (jitter), MoE HIP 2.2, dense W4 GEMV 1.8, HC ops 1.4, eager glue 1.2, QSA 1.0, norms 0.9, copies 0.8, GDN 0.7.
+
+Image: `btbtyler09/vllm-rocm-gfx908:v0.28.0rc2.dev-q38fn` (HIP ext at `/opt/vllm-gfx908-ext`; add `VLLM_PLE_MMAP_SERIAL=4096` to the serve env).
+
 ### Tried and rejected
 - EP-within-TP (`--enable-expert-parallel`): c=1 −8%, c=48 −18% (untuned E=128,N=640). DP
   layouts don't fit (≥35 GB/GPU).
