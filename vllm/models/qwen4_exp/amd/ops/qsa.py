@@ -866,6 +866,12 @@ def qsa_sparse_paged_attention(
 
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)
+    if current_platform.is_rocm():
+        # gfx908: BLOCK_M of 4/8 miscompiles this kernel's online-softmax
+        # dot chain (garbage output for GROUP_SIZE <= 8, i.e. TP4 with 2 KV
+        # heads). The head mask already handles GROUP_SIZE < BLOCK_M, so a
+        # 16-row minimum is correctness-neutral.
+        block_m = max(block_m, 16)
     base_programs = q.shape[0] * k_cache.shape[2]
     small_profile_limit = 8 if block_m <= 8 else 4
 
