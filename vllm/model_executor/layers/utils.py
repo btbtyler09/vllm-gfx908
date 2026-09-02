@@ -19,6 +19,10 @@ from vllm.utils.flashinfer import (
     is_flashinfer_cutedsl_bf16_gemm_supported,
 )
 from vllm.utils.platform_utils import num_compute_units
+from vllm.model_executor.layers.gfx908_midm_gemm import (
+    gfx908_midm_gemm,
+    midm_gemm_applies,
+)
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
@@ -589,6 +593,16 @@ def cpu_unquantized_gemm(
     return layer.cpu_linear(x, weight, bias)
 
 
+_GFX908_MIDM_FLAG: bool | None = None
+
+
+def _gfx908_midm_enabled() -> bool:
+    global _GFX908_MIDM_FLAG
+    if _GFX908_MIDM_FLAG is None:
+        _GFX908_MIDM_FLAG = os.environ.get("VLLM_GFX908_MIDM_GEMM", "1") == "1"
+    return _GFX908_MIDM_FLAG
+
+
 def rocm_unquantized_gemm_gfx908_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -651,6 +665,19 @@ def rocm_unquantized_gemm_gfx908_impl(
                 x_view = x_view.to(weight.dtype)
             out = ops.LLMM1(weight, x_view, 4)
             return out.reshape(*x.shape[:-1], weight.shape[0])
+
+    # 5 <= n <= 64 (batched decode): rocBLAS is 2-7x off for the small-N /
+    # long-K Qwen4Exp shapes (see gfx908_midm_gemm.py); Triton split-K.
+    if (
+        skinny_ok
+        and weight.dtype == x.dtype
+        and _gfx908_midm_enabled()
+        and midm_gemm_applies(n, m, k)
+    ):
+        if debug:
+            import sys as _sys
+            print(f"[MIDM] n={n} m={m} k={k}", file=_sys.stderr, flush=True)
+        return gfx908_midm_gemm(x, weight, bias)
 
     if use_aiter_triton_gemm(n, m, k, x.dtype):
         from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
