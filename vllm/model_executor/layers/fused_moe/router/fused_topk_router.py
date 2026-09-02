@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
 
+import os
+
 import torch
 
 import vllm._custom_ops as ops
@@ -23,6 +25,35 @@ def _get_padding_mask(num_tokens: int) -> torch.Tensor | None:
     return None
 
 
+_GFX908_TOPK: bool | None = None
+
+
+def _gfx908_small_m_topk(gating_output: torch.Tensor, topk_indices: torch.Tensor) -> bool:
+    global _GFX908_TOPK
+    if _GFX908_TOPK is None:
+        from vllm.platforms.rocm import on_gfx908
+
+        _GFX908_TOPK = (
+            current_platform_is_rocm()
+            and on_gfx908()
+            and os.environ.get("VLLM_GFX908_TOPK", "0") == "1"
+        )
+    from vllm.model_executor.layers.fused_moe.gfx908_topk import TOPK_MAX_TOKENS
+
+    return (
+        _GFX908_TOPK
+        and gating_output.shape[0] <= TOPK_MAX_TOKENS
+        and gating_output.is_cuda
+        and topk_indices.dtype == torch.int32
+    )
+
+
+def current_platform_is_rocm() -> bool:
+    from vllm.platforms import current_platform
+
+    return current_platform.is_rocm()
+
+
 def vllm_topk_softmax(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -30,6 +61,14 @@ def vllm_topk_softmax(
     gating_output: torch.Tensor,
     renormalize: bool = False,
 ) -> tuple[torch.Tensor, ...]:
+    if _gfx908_small_m_topk(gating_output, topk_indices):
+        from vllm.model_executor.layers.fused_moe.gfx908_topk import gfx908_topk_softmax
+
+        gfx908_topk_softmax(
+            topk_weights, topk_indices, gating_output, renormalize,
+            _get_padding_mask(topk_indices.shape[0]),
+        )
+        return topk_weights, topk_indices
     ops.topk_softmax(
         topk_weights,
         topk_indices,
