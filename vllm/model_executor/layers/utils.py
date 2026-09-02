@@ -661,6 +661,18 @@ def rocm_unquantized_gemm_gfx908_impl(
         if cfg is not None:
             return gemm_a16w16(x, weight, bias, config=cfg)
         return gemm_a16w16(x, weight, bias)
+    # Tiny output width (m <= 8): rocBLAS/Tensile picks a ~500us kernel for
+    # bf16/fp16 GEMMs with N=1 regardless of row count (Qwen4Exp
+    # shared_expert_gate 2560 -> 1, once per layer = 45% of a decode step).
+    # einsum routes the same contraction to a sane kernel (24-70us, fp32
+    # accumulate, mb_tiny_n.py). Neither skinny kernel accepts m <= 8.
+    if m <= 8 and x.dtype in (torch.float16, torch.bfloat16):
+        if x.dtype != weight.dtype:
+            x = x.to(weight.dtype)
+        out = torch.einsum("nk,mk->nm", x.reshape(-1, k), weight)
+        if bias is not None:
+            out = out + bias
+        return out.reshape(*x.shape[:-1], m)
     # rocBLAS fallback for M >= 8 (no skinny-GEMM applies). Now reachable
     # from inside compiled forwards too (Stage 5h custom-op wrapper below).
     return torch.nn.functional.linear(x, weight, bias)
