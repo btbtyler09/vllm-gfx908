@@ -66,8 +66,20 @@ def apply_qsa_rmsnorm(
     norm: GemmaRMSNorm,
     tensor: torch.Tensor,
 ) -> torch.Tensor:
-    """Use vLLM's portable RMSNorm implementation on ROCm."""
+    """Gemma RMSNorm over the last dim as one Triton launch.
 
+    The portable GemmaRMSNorm runs as ~7 eager elementwise/reduce kernels
+    inside the QSA custom op (no inductor fusion there); the grouped Gemma
+    kernel from the hyper-connection ops does the same (1 + w) affine in a
+    single launch with a shared [head_dim] weight.
+    """
+
+    if tensor.dim() == 2 and tensor.stride(1) == 1 and tensor.is_cuda:
+        from .ops.hc import grouped_gemma_rmsnorm
+
+        return grouped_gemma_rmsnorm(
+            tensor, norm.weight, float(norm.variance_epsilon), 1
+        )
     return cast(torch.Tensor, norm(tensor))
 
 
