@@ -26,6 +26,7 @@ from vllm.model_executor.parameter import BasevLLMParameter, permute_param_layou
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
@@ -432,6 +433,38 @@ def triton_w4a16_gemm(
     return c
 
 
+def _gfx908_w4a16_gemm_op(
+    a: torch.Tensor,
+    b_q: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    zp_bias: int,
+) -> torch.Tensor:
+    return triton_w4a16_gemm(a, b_q, scales, None, group_size, zp_bias)
+
+
+def _gfx908_w4a16_gemm_op_fake(
+    a: torch.Tensor,
+    b_q: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    zp_bias: int,
+) -> torch.Tensor:
+    return a.new_empty((a.shape[0], b_q.shape[1] * 8))
+
+
+# Opaque to torch.compile: the small-M GEMV / tile selection in
+# triton_w4a16_gemm branches on M, and under dynamo M is symbolic, so the
+# branch was specialized once at trace time (large M) and frozen for every
+# cudagraph size — the QSA projections ran the MFMA kernel with a large-M
+# tile config at M=1 (162 us) while the eager MoE region took the GEMV.
+direct_register_custom_op(
+    op_name="gfx908_w4a16_gemm",
+    op_func=_gfx908_w4a16_gemm_op,
+    fake_impl=_gfx908_w4a16_gemm_op_fake,
+)
+
+
 @triton.jit
 def triton_w4a16_dequant_kernel(
     b_ptr,           # [K, N//8] int32 packed weights (8 nibbles per int32)
@@ -699,14 +732,19 @@ class TritonW4A16LinearKernel(MPLinearKernel):
         else:
             zp_bias = 0
 
-        output = triton_w4a16_gemm(
-            a=x_2d,
-            b_q=w_q,
-            scales=w_s,
-            qzeros=w_zp,
-            group_size=group_size,
-            zp_bias=zp_bias,
-        )
+        if w_zp is None and _gfx908_gemv_enabled():
+            output = torch.ops.vllm.gfx908_w4a16_gemm(
+                x_2d, w_q, w_s, group_size, zp_bias
+            )
+        else:
+            output = triton_w4a16_gemm(
+                a=x_2d,
+                b_q=w_q,
+                scales=w_s,
+                qzeros=w_zp,
+                group_size=group_size,
+                zp_bias=zp_bias,
+            )
 
         if bias is not None:
             output.add_(bias)
