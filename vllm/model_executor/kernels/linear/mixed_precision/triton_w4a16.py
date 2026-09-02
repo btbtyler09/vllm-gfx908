@@ -161,6 +161,142 @@ def triton_w4a16_gemm_kernel(
     tl.store(c_ptrs, c, mask=mask_c)
 
 
+# --------------------------------------------------------------------------- #
+# gfx908 small-M path: no-MFMA GEMV with K-split (fp32 partials + reduce).
+# The MFMA kernel above runs BLOCK_M=16 tiles at M=1 with no split-K, so a
+# K=2560 -> N=320 projection launches 5 programs on 120 CUs and takes ~75 us;
+# this path launches N/BLOCK_N * SPLIT_K programs and reads each weight byte
+# once. Symmetric (uint4b8) only; asymmetric falls through to the MFMA kernel.
+# --------------------------------------------------------------------------- #
+@triton.jit
+def triton_w4a16_gemv_partial_kernel(
+    a_ptr, b_ptr, scales_ptr, part_ptr, M, N, K,
+    stride_am, stride_bk, stride_pk, stride_pm,
+    group_size,
+    ZP_BIAS: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr, SPLIT_K: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_bn = pid_n * (BLOCK_N // 8) + tl.arange(0, BLOCK_N // 8)
+    offs_m = tl.arange(0, BLOCK_M)
+    shifts_row = tl.arange(0, 8) * 4
+    shifts_1d = tl.reshape(
+        tl.broadcast_to(shifts_row[None, :], (BLOCK_N // 8, 8)), (BLOCK_N,)
+    )
+    shifts = tl.broadcast_to(shifts_1d[None, :], (BLOCK_K, BLOCK_N))
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    n_k_tiles = tl.cdiv(K, BLOCK_K)
+    tiles_per_split = tl.cdiv(n_k_tiles, SPLIT_K)
+    k_tile_start = pid_k * tiles_per_split
+    k_tile_end = tl.minimum(k_tile_start + tiles_per_split, n_k_tiles)
+    for kt in range(k_tile_start, k_tile_end):
+        offs_k = kt * BLOCK_K + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+        a = tl.load(
+            a_ptr + offs_m[:, None] * stride_am + offs_k[None, :],
+            mask=(offs_m[:, None] < M) & mask_k[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        b_packed = tl.load(
+            b_ptr + offs_k[:, None] * stride_bk + offs_bn[None, :],
+            mask=mask_k[:, None] & (offs_bn[None, :] < N // 8),
+            other=0,
+        )
+        b = tl.interleave(b_packed, b_packed)
+        b = tl.interleave(b, b)
+        b = tl.interleave(b, b)
+        b = ((b >> shifts) & 0xF) - ZP_BIAS
+        g_idx = (kt * BLOCK_K) // group_size
+        scales = tl.load(
+            scales_ptr + g_idx * N + offs_n, mask=offs_n < N, other=0.0
+        ).to(tl.float32)
+        prod = a[:, :, None] * b.to(tl.float32)[None, :, :]
+        acc += tl.sum(prod, axis=1) * scales[None, :]
+    p_ptrs = part_ptr + pid_k * stride_pk + offs_m[:, None] * stride_pm + offs_n[None, :]
+    tl.store(p_ptrs, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+@triton.jit
+def triton_w4a16_splitk_reduce_kernel(
+    part_ptr, c_ptr, M, N, stride_pk, stride_pm, stride_cm,
+    SPLIT_K: tl.constexpr, BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    m = tl.program_id(1)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for s in range(SPLIT_K):
+        acc += tl.load(part_ptr + s * stride_pk + m * stride_pm + offs, mask=mask, other=0.0)
+    tl.store(c_ptr + m * stride_cm + offs, acc.to(c_ptr.type.element_ty), mask=mask)
+
+
+_GFX908_GEMV_FLAG: bool | None = None
+
+
+def _gfx908_gemv_enabled() -> bool:
+    global _GFX908_GEMV_FLAG
+    if _GFX908_GEMV_FLAG is None:
+        import os
+
+        from vllm.platforms.rocm import on_gfx908
+
+        _GFX908_GEMV_FLAG = on_gfx908() and os.environ.get(
+            "VLLM_GFX908_W4_GEMV", "0"
+        ) == "1"
+    return _GFX908_GEMV_FLAG
+
+
+_GFX908_GEMV_MAX_M = 16
+# (K, N) -> ((BLOCK_N, SPLIT_K) for M == 1, (BLOCK_N, SPLIT_K) for 1 < M <= 16).
+# Graph-timed on MI100 (mb_w4a16_gemv.py / mb_gemv_bm16.py, 2026-09-02) for the
+# Qwen3.8-Flash-Next TP4 dense projections; BLOCK_M is 1 at M == 1 and 16
+# otherwise (the 2/4/8-row tiles compile much worse than the 16-row tile).
+_GFX908_GEMV_TABLE = {
+    (2560, 320): ((64, 20), (64, 20)),  # shared_expert gate_up
+    (160, 2560): ((128, 5), (64, 5)),  # shared_expert down
+    (2560, 3584): ((256, 16), (64, 10)),  # QSA qkv(+gate)
+    (1536, 2560): ((256, 32), (64, 10)),  # QSA o_proj
+}
+
+
+def _gfx908_gemv_config(M, K, N, k_tiles):
+    entry = _GFX908_GEMV_TABLE.get((K, N))
+    if entry is not None:
+        block_n, split_k = entry[0] if M == 1 else entry[1]
+    else:
+        block_n = 64
+        n_tiles = triton.cdiv(N, block_n)
+        split_k = max(1, min(k_tiles, round(128 / n_tiles)))
+    return block_n, min(split_k, k_tiles)
+
+
+def _gfx908_w4a16_gemv(a, b_q, scales, group_size, zp_bias):
+    M, K = a.shape
+    N = b_q.shape[1] * 8
+    BLOCK_K = min(32, group_size)
+    BLOCK_M = 1 if M == 1 else 16
+    k_tiles = triton.cdiv(K, BLOCK_K)
+    block_n, split_k = _gfx908_gemv_config(M, K, N, k_tiles)
+    n_tiles = triton.cdiv(N, block_n)
+    part = torch.empty((split_k, M, N), dtype=torch.float32, device=a.device)
+    triton_w4a16_gemv_partial_kernel[(n_tiles, split_k)](
+        a, b_q, scales, part, M, N, K,
+        a.stride(0), b_q.stride(0), part.stride(0), part.stride(1),
+        group_size, ZP_BIAS=zp_bias, BLOCK_M=BLOCK_M, BLOCK_N=block_n,
+        BLOCK_K=BLOCK_K, SPLIT_K=split_k,
+    )
+    c = torch.empty((M, N), dtype=a.dtype, device=a.device)
+    RB = 1024
+    triton_w4a16_splitk_reduce_kernel[(triton.cdiv(N, RB), M)](
+        part, c, M, N, part.stride(0), part.stride(1), c.stride(0),
+        SPLIT_K=split_k, BLOCK=RB,
+    )
+    return c
+
+
 def triton_w4a16_gemm(
     a: torch.Tensor,  # [M, K] fp16/bf16
     b_q: torch.Tensor,  # [K, N//8] int32
@@ -201,6 +337,14 @@ def triton_w4a16_gemm(
         assert qzeros.shape == (K // group_size, N // 8), (
             f"qzeros shape mismatch: {qzeros.shape}"
         )
+
+    if (
+        qzeros is None
+        and M <= _GFX908_GEMV_MAX_M
+        and current_platform.is_rocm()
+        and _gfx908_gemv_enabled()
+    ):
+        return _gfx908_w4a16_gemv(a, b_q, scales, group_size, zp_bias)
 
     c = torch.empty((M, N), dtype=a.dtype, device=a.device)
 

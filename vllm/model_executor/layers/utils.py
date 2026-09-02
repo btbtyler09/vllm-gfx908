@@ -629,15 +629,9 @@ def rocm_unquantized_gemm_gfx908_impl(
     )
     if skinny_ok:
         x_view = x.reshape(-1, x.size(-1))
-        if n == 1 and m % 4 == 0 and k <= 8192 and bias is None:
-            if debug:
-                import sys as _sys
-                print(f"[LLMM1] n={n} m={m} k={k}",
-                      file=_sys.stderr, flush=True)
-            if x.dtype != weight.dtype:
-                x_view = x_view.to(weight.dtype)
-            out = ops.LLMM1(weight, x_view, 4)
-            return out.reshape(*x.shape[:-1], weight.shape[0])
+        # wvSplitK first: graph-timed on MI100 (mb_skinny.py, 2026-09-02) it
+        # beats LLMM1 at n == 1 on every Qwen4Exp shape (in_proj_qkvz 19 vs
+        # 23.5 us, out_proj 6.7 vs 9.3, router 3.9 vs 5.9, lm_head 338 vs 382).
         if m > 8 and 0 < n <= 4:
             if debug:
                 import sys as _sys
@@ -647,6 +641,15 @@ def rocm_unquantized_gemm_gfx908_impl(
             if x.dtype != weight.dtype:
                 x_view = x_view.to(weight.dtype)
             out = ops.wvSplitK(weight, x_view, cu_count, bias)
+            return out.reshape(*x.shape[:-1], weight.shape[0])
+        if n == 1 and m % 4 == 0 and k <= 8192 and bias is None:
+            if debug:
+                import sys as _sys
+                print(f"[LLMM1] n={n} m={m} k={k}",
+                      file=_sys.stderr, flush=True)
+            if x.dtype != weight.dtype:
+                x_view = x_view.to(weight.dtype)
+            out = ops.LLMM1(weight, x_view, 4)
             return out.reshape(*x.shape[:-1], weight.shape[0])
 
     if use_aiter_triton_gemm(n, m, k, x.dtype):
