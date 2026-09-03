@@ -123,6 +123,11 @@ class GatedResidual(nn.Module):
             prefix=maybe_prefix(prefix, "input_mix_weight_up"),
             return_bias=False,
         )
+        self._gfx908_hc_fused = False
+        if use_combine:
+            from .gfx908_hc_fused import hc_fused_enabled
+
+            self._gfx908_hc_fused = hc_fused_enabled()
 
     def mix(
         self, hidden_states: torch.Tensor
@@ -133,6 +138,10 @@ class GatedResidual(nn.Module):
             self.config.rms_norm_eps,
             self.hc_count,
         )
+
+        if self.use_combine and self._gfx908_hc_fused_applies(xn):
+            block_input, injection = self._gfx908_hc_fused_mix(xn)
+            return hidden_states, block_input, injection
 
         if self.use_combine:
             # produce injection logits for combine
@@ -170,6 +179,10 @@ class GatedResidual(nn.Module):
             self.hc_count,
         )
 
+        if self.use_combine and self._gfx908_hc_fused_applies(xn):
+            block_input, injection = self._gfx908_hc_fused_mix(xn)
+            return hidden_states, block_input, injection
+
         if self.use_combine:
             # produce injection logits for combine
             split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
@@ -184,6 +197,25 @@ class GatedResidual(nn.Module):
         block_input = hc_gate_mix(xn, gate, self.hc_count)
 
         return hidden_states, block_input, injection
+
+    # -- gfx908 fused projections (wvSplitK copy with silu / gate-mix epilogues) --
+    def _gfx908_hc_fused_applies(self, xn: torch.Tensor) -> bool:
+        # Plain attribute checks only: this runs under torch.compile tracing
+        # (M is symbolic, and the extension loader is a dynamo-skipped call).
+        # The op dispatches on the real M at capture/run time.
+        return xn.dtype == torch.bfloat16 and self._gfx908_hc_fused
+
+    def _gfx908_hc_fused_mix(self, xn: torch.Tensor):
+        from .gfx908_hc_fused import hc_fused_mix
+
+        return hc_fused_mix(
+            xn,
+            self.input_mix_weight_down_block_inject.weight,
+            self.input_mix_weight_up.weight,
+            self.hc_count,
+            self.lora_rank,
+            self.hidden_size,
+        )
 
     def combine(
         self,
