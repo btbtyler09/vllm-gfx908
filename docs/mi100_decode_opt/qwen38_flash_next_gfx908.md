@@ -274,6 +274,12 @@ levers below had microbench wins that did not survive the real op.
 | fixed tree: + `QSA_STABLE_TOPK=1` (v2) | 11.37 | 87.3 | 19.0 (203) |
 | fixed tree: + `MOE_PREP_FOLD=1` | 11.24 | 88.4 | 18.7 (205.9) |
 
+Caveat: a no-op-flag control pair on the fixed tree read 10.87 vs 11.24
+ms/step, so the boot-to-boot floor is ~0.3-0.4 ms (3%), not the 0.05 ms the
+200-step windows suggest. Deltas below 0.4 ms need repeated boots or an
+in-process A/B before they count; the c=4 numbers (>1.5 ms deltas) and the HC
+code-object fix are above that floor, the stable top-k cost is not yet.
+
 * **HC fused range M<=4** (`VLLM_GFX908_HC_FUSED_MAX_M`, default 4): the
   fused bf16/W8 mix-chain kernels now cover M<=8 (K-chunked LDS staging);
   it only *pays* to M=4 because the kernels are GEMVs whose cost grows with
@@ -289,22 +295,27 @@ levers below had microbench wins that did not survive the real op.
   per-dispatch cost on gfx908; keep hot GEMV kernels in small modules.
 * **MoE prep fold** (`VLLM_GFX908_MOE_PREP_FOLD`, default off): folds the
   activation quantize/pack into the gate_up GEMV's LDS staging (5 -> 4
-  launches per MoE layer). Isolated real-op timing at M=1 says win (MoE
-  layer 22.8 -> 21.0 us int8, GDN in_proj 16.1 -> 13.5 us, bit-identical),
-  but the same-tree in-server pair says **+0.37 ms/step at c=1** (10.87 ->
-  11.24), c=4 neutral. Working hypothesis: the isolated bench replays
-  L2-resident weights, so the fused kernel's lower occupancy (72 VGPR, 3
-  waves) costs nothing there, while the server streams ~1.9 GB cold per step
-  and needs the waves for latency hiding. Kept in tree, off; cold-L2
-  re-measure pending. Rule: a GEMV microbench must evict L2 between calls.
-* **Stable top-k** (`VLLM_GFX908_QSA_STABLE_TOPK`): `topKPerRowDecode`
-  resolves ties and slot order via atomicAdd, so long-context greedy output
-  differed run-to-run at token 0 (3/4 prompts at 6K). A repair kernel
-  re-sorts each row's k indices deterministically; with a per-run
-  `cache_salt` this gives 4/4 bit-identical long-context outputs. Cost
-  ~0.2 ms/step in decode graphs (runs at the full column width) — being cut
-  to visible-bounded work before it becomes a default. Until then it is a
-  gate-time flag: turn it on for parity runs, off for throughput.
+  launches per MoE layer). Real-op timing at M=1, warm and cold-L2 (weight
+  rotation and 64 MB eviction): MoE layer -7..-13%, dense W4A8 GEMVs
+  -19..-25%, bit-identical. But in the shipping config it is a no-op: with
+  `SHARED_AS_EXPERT=1` the routed MoE takes the fused shared+routed path,
+  which the fold does not cover, and the GDN projections are W8A16. The
+  "+0.37 ms" first attributed to it was therefore boot-to-boot variance
+  (see the caveat under the table). Being extended to the shared-as-expert
+  path; expected value ~0.08 ms/step (48 layers x ~1.7 us).
+* **Stable top-k** (`VLLM_GFX908_QSA_STABLE_TOPK`, **default on** since rc5):
+  `topKPerRowDecode` resolves ties and slot order via atomicAdd, so long-context
+  greedy output differed run-to-run at token 0 (3/4 prompts at 6K). A repair
+  kernel re-sorts each row's k indices deterministically (short rows with
+  visible<=k get the identity without reading logits); with a per-run
+  `cache_salt` this gives 4/4 bit-identical ~6K outputs. Cost measured the
+  right way (same process, whole select op captured in a graph, alternating
+  arms): +1.14 us per QSA layer, 12 layers -> ~0.014 ms/step. Under eager
+  dispatch the repair is instead fused into the expand kernel (+11.5 us vs
+  +31 us of launcher time), chosen on `is_current_stream_capturing()`.
+  Prefill: +0.2..1.4% of the select at 2K..8K rows. The "+0.2..0.5 ms"
+  seen in single-boot arms was boot variance plus a stale overlay (the
+  served copy was still v1) -- see the caveat above.
 * **MFMA W8 GEMM 5<=M<=64** (`VLLM_GFX908_W8A16_MFMA`): swizzled int8 MFMA
   16x16x16 path for batched decode with a deterministic LDS reduce (the
   first version used `ds_add_f32` atomics and failed cudagraph replay

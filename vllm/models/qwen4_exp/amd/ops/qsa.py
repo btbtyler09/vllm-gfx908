@@ -728,10 +728,10 @@ def _stable_topk_enabled() -> bool:
     products, so ~6% of them are exactly ``0.0``; whenever a query's budget cut
     lands in that atom the selection changes run to run.
 
-    Read per call (one dict lookup); the default is off.
+    Read per call (one dict lookup); the default is on (set 0 to disable).
     """
 
-    return os.environ.get("VLLM_GFX908_QSA_STABLE_TOPK", "0").strip() in (
+    return os.environ.get("VLLM_GFX908_QSA_STABLE_TOPK", "1").strip() in (
         "1",
         "true",
         "True",
@@ -1009,6 +1009,7 @@ def qsa_stable_topk_expand(
     compress_ratio: int,
     token_topk: int,
     out: torch.Tensor,
+    column_block: int = 1024,
 ) -> torch.Tensor:
     """Deterministic repair + index expansion in one launch (decode shapes)."""
 
@@ -1024,7 +1025,6 @@ def qsa_stable_topk_expand(
         raise ValueError("QSA fused stable top-k needs row-contiguous inputs")
     if not rows or not topk:
         return out
-    column_block = 256
     _qsa_stable_topk_expand_kernel[(rows,)](
         logits,
         visible_blocks,
@@ -1196,9 +1196,24 @@ def qsa_select_paged_tokens(
                 block_topk,
             )
         if _stable_topk_enabled():
-            if blocks.shape[0] <= _STABLE_TOPK_FUSED_MAX_ROWS:
-                # Decode: repair inside the expand so the flag adds no node to
-                # the captured graph.
+            # Two ways to pay for determinism, and which is cheaper depends on
+            # whether the caller is building a graph or launching from Python.
+            #
+            #   captured  an extra node between the top-k and the expand costs
+            #             its GPU time only (+1.1 us/layer measured); folding
+            #             the expand into one program per row to avoid that
+            #             node costs *more* (+2.1 us), because the expand loses
+            #             its OUTPUT_WIDTH/COLUMN_BLOCK-way parallelism.
+            #   eager     an extra Triton launch costs the Python launcher
+            #             (+31 us/layer measured, ~25x its GPU time), so
+            #             saving the launch is well worth losing the
+            #             parallelism (+12 us).
+            #
+            # ``_qsa_num_columns`` already branches on the same predicate.
+            if (
+                blocks.shape[0] <= _STABLE_TOPK_FUSED_MAX_ROWS
+                and not torch.cuda.is_current_stream_capturing()
+            ):
                 qsa_stable_topk_expand(
                     logits,
                     visible_blocks,
