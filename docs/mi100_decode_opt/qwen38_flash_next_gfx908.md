@@ -356,3 +356,19 @@ rc4, and stable top-k now makes ~6K-context greedy output reproducible by
 default. The c=1 step time is within the boot floor of rc4; the c=4 gain is
 the HC range extension, the TTFT gain is the MoE M=8192 key plus the prefill
 round already in rc4 measured warm.
+
+12-tier BenchAndReport on the pure rc5 image (mixed real-text corpus,
+`mi100-llm-testing/Model_Reports/benchmark_Qwen3.8-Flash-Next-GPTQ-4bit_rc5.md`):
+
+| tier | rc4 | rc5 |
+|---|---|---|
+| Single user 2K/512 TTFT / TPOT | 663 ms / 11.24 ms | 541 ms / 11.43 ms |
+| Decode stress 128/2048 c=1 | 89.6 tok/s, 11.04 ms | 89.2 tok/s, 11.08 ms |
+| Short context c=16 | 251.6 tok/s, TTFT 2.35 s | 276.0 tok/s, TTFT 1.87 s |
+| Long context 16K c=4 | 107.6 tok/s, TTFT 9.39 s, TPOT 23.8 | 115.8 tok/s, TTFT 9.02 s, TPOT 21.6 |
+| Mixed c=8 | 260.6 tok/s | 264.9 tok/s |
+| Concurrency c=4 / c=32 / c=64 / c=128 | 164 / 360 / 338 / 379 | 175 / 357 / 341 / 387 |
+
+c=1 decode is unchanged within the boot floor; the gains are TTFT (-18%
+single user), c=4..16 decode (+7..10%, HC range 4) and the 16K tier (+8%,
+MoE M=8192 key + tiled QSA measured warm).
