@@ -63,6 +63,7 @@ _FLAG: bool | None = None
 _MODE: str | None = None
 _SHARED_AS_EXPERT: bool | None = None
 _PREP_FOLD: bool | None = None
+_SILU_FOLD: bool | None = None
 
 
 def _load(name: str, src: str, subdir: str):
@@ -182,6 +183,35 @@ def prep_fold_enabled() -> bool:
 _FOLD_MIN_TILES = 480
 
 
+def silu_fold_enabled() -> bool:
+    """VLLM_GFX908_MOE_SILU_FOLD: fold silu*mul + Q8_1 into the down GEMV (one launch fewer).
+
+    Bit-exact vs silu_mul_quant + gemv_rowlane (the Triton sigmoid/exp/divide/rounding sequence is
+    reproduced exactly), but the win is modest -- cold, two runs: M=1 -0.25/-0.30 us,
+    M=4 -0.86/-0.94, M=8 -1.28/-1.35 -- because every down workgroup redoes the 5 groups of
+    silu*mul, which costs the down GEMV ~1.5 us of the ~1.8 us the launch was worth.  Default off.
+    """
+    global _SILU_FOLD
+    if _SILU_FOLD is None:
+        _SILU_FOLD = os.environ.get("VLLM_GFX908_MOE_SILU_FOLD", "0") == "1"
+        if _SILU_FOLD:
+            logger.info_once("gfx908: MoE silu*mul+Q8_1 folded into the down GEMV "
+                             "(VLLM_GFX908_MOE_SILU_FOLD=1)")
+    return _SILU_FOLD
+
+
+def silu_fold_applies(N: int, K2: int, P: int) -> bool:
+    """Instantiated for the intermediate width 160 only; a block must not straddle two pairs."""
+    if not (silu_fold_enabled() and K2 == 160 and N % 64 == 0):
+        return False
+    return (N // 64) % _silu_fold_wpb(N, P) == 0
+
+
+def _silu_fold_wpb(N: int, P: int) -> int:
+    """4 waves per block while the grid is small, 8 above it (measured best at M=1 vs M>=4)."""
+    return 4 if P * (N // 64) <= 1024 else 8
+
+
 def prep_fold_applies(N: int, K: int, P: int) -> bool:
     """The folded slab kernel stages one token per 4-wave block, so a block must not straddle two
     pairs: (N / ROWS) % 4 == 0 with ROWS = 64 / lpr = 4.  K must be an instantiated slab case, and
@@ -198,7 +228,8 @@ def prep_fold_applies(N: int, K: int, P: int) -> bool:
 def _reset_env_cache():
     """Re-read VLLM_GFX908_W4A8 / _MODE / _SHARED_AS_EXPERT / _PREP_FOLD (tests only;
     extensions stay cached)."""
-    global _FLAG, _MODE, _SHARED_AS_EXPERT, _PREP_FOLD
+    global _FLAG, _MODE, _SHARED_AS_EXPERT, _PREP_FOLD, _SILU_FOLD
+    _SILU_FOLD = None
     _FLAG = None
     _MODE = None
     _SHARED_AS_EXPERT = None
@@ -266,6 +297,19 @@ def gemv_slab_prep_gate(w, s, x, row_tok, row_exp, wcomb, wg, topk_ids, topk_w, 
     out = torch.empty((row_tok.numel(), w.shape[1]), dtype=torch.float32, device=x.device)
     _ext().gemv_slab_prep_gate(w, s, x, row_tok, out, 16, extra[0], extra[1],
                                wg, topk_ids, topk_w, row_exp, wcomb, E)
+    return out
+
+
+def gemv_rowlane_silu(w, s, part, row_tok, row_exp, extra=None) -> torch.Tensor:
+    """D2 with silu*mul + Q8_1 folded in: ``part`` is the raw fp32 [P, 2*K2] gate|up partial, so
+    the silu_mul_quant launch disappears.  Bit-identical to
+    ``gemv_rowlane(*silu_mul_quant(part), ...)``."""
+    N = w.shape[1]
+    P = row_tok.numel()
+    out = torch.empty((P, N), dtype=torch.float32, device=part.device)
+    wx, sx = _extra_pair(extra, part.device)
+    wpb = _silu_fold_wpb(N, P)
+    _ext().gemv_rowlane_silu(w, s, part, row_tok, row_exp, out, wpb, 0 if wpb == 4 else 1, wx, sx)
     return out
 
 
@@ -605,9 +649,21 @@ def moe_w4a8(
         elif fold:
             part1 = gemv_slab_prep(w1_i, w1_scale, hidden_states, row_token, row_expert)
         else:
-            part1 = gemv_slab(w1_i, w1_scale, x8, xs, xsum, row_token, row_expert, wpb=1, extra=extra1)
-        i8, isc, isum = silu_mul_quant(part1)
-        part2 = gemv_rowlane(w2_i, w2_scale, i8, isc, isum, row_self, row_expert, wpb=1, extra=extra2)
+            # gemv_flight (2026-09-04), cold M=1/4/8, two runs each: one wave per block wins
+            # while the tile count is small (M=1 -0.23/-0.25 us, M=4 -0.61/-0.67) but REGRESSES
+            # once it passes ~4k, because 7040 one-wave dispatches cost more than they save
+            # (M=8 +1.24/+0.42 us).  Gate on the tile count, not on M, so it also holds for other
+            # N1 / topk.  Empty-kernel dispatch is 1.89 us at 220 workgroups and 7.42 us at 3520.
+            sw = 1 if P * (N1 // 4) <= 4096 else 4
+            part1 = gemv_slab(w1_i, w1_scale, x8, xs, xsum, row_token, row_expert, wpb=sw, extra=extra1)
+        if silu_fold_applies(K, K2, P):
+            part2 = gemv_rowlane_silu(w2_i, w2_scale, part1, row_self, row_expert, extra=extra2)
+        else:
+            i8, isc, isum = silu_mul_quant(part1)
+            # rowlane wpb: 1 vs 4 measured -0.02/-0.14 us over M=1/4/8, i.e. at the noise floor.
+            # Kept at 1 (never a regression), but it is not a win worth quoting.
+            part2 = gemv_rowlane(w2_i, w2_scale, i8, isc, isum, row_self, row_expert, wpb=1,
+                                 extra=extra2)
     rb2 = 256  # 3 -> 10 workgroups; 3.13 -> 1.98 us at M=1 (agents/gemv_flight), same per-element order
     _moe_reduce_weighted_sum_kernel[(triton.cdiv(K, rb2), M)](
         part2, wsum, output, K,

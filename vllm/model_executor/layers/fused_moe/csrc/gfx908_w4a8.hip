@@ -74,20 +74,42 @@ __device__ __forceinline__ void gate_row(const GateArgs& g, int m) {
   }
   const uint32_t* xr = g.x2 + (long)m * g.khalf;
   float acc = 0.f;
-  for (int k = tid; k < g.khalf; k += 256) {
+  // x4 unrolled: four (x, wg) pairs in flight instead of one.  Identical k sequence and identical
+  // accumulation order into `acc`, so the value is unchanged.
+  int k = tid;
+  for (; k + 3 * 256 < g.khalf; k += 4 * 256) {
+    uint32_t a[4], b[4];
+#pragma unroll
+    for (int u = 0; u < 4; ++u) { a[u] = xr[k + u * 256]; b[u] = g.wg2[k + u * 256]; }
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      acc = fmaf(bf2f(a[u] & 0xFFFFu), bf2f(b[u] & 0xFFFFu), acc);
+      acc = fmaf(__uint_as_float(a[u] & 0xFFFF0000u), __uint_as_float(b[u] & 0xFFFF0000u), acc);
+    }
+  }
+  for (; k < g.khalf; k += 256) {
     const uint32_t a = xr[k], b = g.wg2[k];
     acc = fmaf(bf2f(a & 0xFFFFu), bf2f(b & 0xFFFFu), acc);
     acc = fmaf(__uint_as_float(a & 0xFFFF0000u), __uint_as_float(b & 0xFFFF0000u), acc);
   }
+  // gemv_flight (2026-09-04): the o = 128..1 LDS tree cost 8 __syncthreads and 8 LDS round trips on
+  // a block that is pure latency (quant_q8_gate is a 2-workgroup launch, and under MOE_PREP_FOLD
+  // this is the tail of the gate blocks).  Only o = 128 and o = 64 cross a wave boundary; the rest
+  // fit inside wave 0.  The pairing order red[t] += red[t + o] is preserved exactly, so the sigmoid
+  // input -- and the shared-expert weight -- are bit-identical (verified torch.equal, bench.log s5).
+  // 4.08/4.09 -> 3.30/3.32 us at M=1, 4.11/4.12 -> 3.28/3.32 at M=4, 4.07/4.03 -> 3.20/3.19 at M=8.
   red[tid] = acc;
   __syncthreads();
-  for (int o = 128; o > 0; o >>= 1) {
-    if (tid < o) red[tid] += red[tid + o];
-    __syncthreads();
-  }
-  if (tid == 0) {
-    g.row_exp[m * stride + g.topk] = g.E;
-    g.wcomb[m * stride + g.topk] = 1.f / (1.f + expf(-red[0]));
+  if (tid < 128) red[tid] += red[tid + 128];
+  __syncthreads();
+  if (tid < 64) {
+    float v = red[tid] + red[tid + 64];
+#pragma unroll
+    for (int o = 32; o > 0; o >>= 1) v += __shfl_down(v, o, 64);
+    if (tid == 0) {
+      g.row_exp[m * stride + g.topk] = g.E;
+      g.wcomb[m * stride + g.topk] = 1.f / (1.f + expf(-v));
+    }
   }
 }
 
@@ -455,6 +477,127 @@ __global__ void __launch_bounds__(64 * WPB) w4a8_rowlane_kernel(
 }
 
 // ---------------------------------------------------------------------------------------------
+// D2 with silu*mul + Q8_1 FOLDED IN (VLLM_GFX908_MOE_SILU_FOLD=1).
+//
+// Same idea as MOE_PREP_FOLD one stage later: the down GEMV recomputes its own pair's
+// silu(gate)*up + Q8_1 into LDS, so the separate silu_mul_quant launch disappears.  One block =
+// WPB waves of the SAME pair (needs (N/64) % WPB == 0), so the staging is block-uniform and there
+// is no cross-workgroup dependency, no counter and no atomic.
+//
+// Bit-exactness: this reproduces `_silu_mul_quant_kernel`'s value sequence instruction for
+// instruction, read off its own AMDGCN.  tl.sigmoid(x) = 1 / (1 + tl.exp(-x)), and llvm.exp.f32
+// on gfx908 lowers to a denormal-guarded exp2:
+//     under = (-x) * log2e < -126 ;  t = fma(log2e, 0 - x, under ? 64 : 0)
+//     e = exp2(t) ;  e = ldexp(e, under ? -64 : 0)
+// and 1/(1+e) is the FULL IEEE divide expansion (v_div_scale / v_rcp / v_div_fmas / v_div_fixup),
+// i.e. plain `/` without -ffast-math -- NOT a bare v_rcp.  The quantizer's rounding is
+// round-half-AWAY-from-zero via the CONTRACTED fma(y, inv, +/-0.5) -> floor/ceil, with a PLAIN
+// y*inv only for the sign test; note this differs from q8_group's __float2int_rn (half-to-even).
+// Verified: int8 / xs / xsum and the layer output are bitwise identical (NaN payloads included)
+// to silu_mul_quant + gemv_rowlane over 6 input distributions covering exact zeros, denormals,
+// the exp underflow branch and inf-producing overflow (agents/gemv_flight/test_silu.log).
+__device__ __forceinline__ float triton_expf(float y) {
+  const float LOG2E = 0x1.715476p+0f;                  // 0x3fb8aa3b
+  const bool under = (y * LOG2E) < -126.0f;
+  const float t = fmaf(LOG2E, y, under ? 64.0f : 0.0f);
+  const float e = __builtin_amdgcn_exp2f(t);
+  return e * (under ? 0x1p-64f : 1.0f);                // == v_ldexp_f32 by 0 / -64 (exact)
+}
+__device__ __forceinline__ float triton_sigmoid(float x) {
+  return 1.0f / (1.0f + triton_expf(0.0f - x));
+}
+
+// 32 lanes cooperate on one group of 32 -- the same width the Triton kernel uses.  Putting all 32
+// elements (and so 32 v_exp_f32 + 32 full IEEE divides) in one thread instead made the fold
+// 2.6-6.4 us SLOWER than the launch it removes.  max is order-independent and the int sum is exact
+// in fp32 (|qsum| <= 32*127), so the cross-lane reduction does not change the value.
+__device__ __forceinline__ void silu_q8_group_lp(const float* __restrict__ gp,
+                                                 const float* __restrict__ up, int i,
+                                                 int8_t* __restrict__ dst8, float& d, float& dsum) {
+  const float gv = gp[i];
+  const float y = (gv * triton_sigmoid(gv)) * up[i];
+  float amax = fabsf(y);
+#pragma unroll
+  for (int m = 1; m < 32; m <<= 1) amax = fmaxf(amax, __shfl_xor(amax, m, 32));
+  d = amax / 127.0f;
+  const float inv = amax > 0.f ? 127.0f / amax : 0.f;
+  const float v = y * inv;
+  const float r = (v >= 0.f) ? __builtin_floorf(fmaf(y, inv, 0.5f))
+                             : __builtin_ceilf(fmaf(y, inv, -0.5f));
+  const int q = (int)r;
+  int qsum = q;
+#pragma unroll
+  for (int m = 1; m < 32; m <<= 1) qsum += __shfl_xor(qsum, m, 32);
+  dsum = d * (float)qsum;
+  dst8[(i / 8) * 8 + (i % 2) * 4 + (i % 8) / 2] = (int8_t)q;    // per-8 de-interleave
+}
+
+// `part` is [P, 2*K] (gate | up) fp32 with K = the INTERMEDIATE width (160); `N` is the down
+// projection's OUTPUT width (2560).  HOIST=1 issues the weight loads before the staging barrier.
+template <int K, int WPB, int HOIST>
+__global__ void __launch_bounds__(64 * WPB) w4a8_rowlane_silu_kernel(
+    const uint32_t* __restrict__ w, const uint16_t* __restrict__ s, const float* __restrict__ part,
+    const int* __restrict__ row_tok, const int* __restrict__ row_exp, float* __restrict__ out,
+    int N, int P, int E, long stride_we, long stride_se, long stride_pp,
+    const uint32_t* __restrict__ w_extra, const uint16_t* __restrict__ s_extra) {
+  constexpr int G = K / 32, NTHR = 64 * WPB;
+  __shared__ __align__(16) int8_t ly[K];
+  __shared__ float lys[G], lysum[G];
+  const int lane = threadIdx.x & 63;
+  const int waves_per_p = N / 64;
+  const int wave0 = blockIdx.x * WPB;
+  if (wave0 >= P * waves_per_p) return;
+  const int p = wave0 / waves_per_p;                          // block-uniform
+  const int wave = wave0 + (int)(threadIdx.x >> 6);
+  const int n = (wave % waves_per_p) * 64 + lane;
+  const int e = row_exp[p], t = row_tok[p];
+  const uint32_t* wbase;
+  const uint16_t* sbase;
+  if (!pick_expert(e, E, w, s, stride_we, stride_se, w_extra, s_extra, wbase, sbase)) {
+    out[(long)p * N + n] = 0.f;                               // block-uniform: no barrier below
+    return;
+  }
+  const uint4* wp = reinterpret_cast<const uint4*>(wbase + (long)n * (K / 8));
+  const uint16_t* sp = sbase + (long)n * G;
+  uint4 q[G];
+  uint32_t sc[G];
+  if constexpr (HOIST) {
+#pragma unroll
+    for (int j = 0; j < G; ++j) { q[j] = wp[j]; sc[j] = sp[j]; }
+    __builtin_amdgcn_sched_barrier(0);
+  }
+  {
+    const int i = threadIdx.x & 31;
+    for (int g = threadIdx.x >> 5; g < G; g += NTHR / 32) {
+      const float* pr = part + (long)t * stride_pp + g * 32;
+      float d, ds;
+      silu_q8_group_lp(pr, pr + K, i, ly + g * 32, d, ds);
+      if (i == 0) { lys[g] = d; lysum[g] = ds; }
+    }
+  }
+  __syncthreads();
+  if constexpr (!HOIST) {
+#pragma unroll
+    for (int j = 0; j < G; ++j) { q[j] = wp[j]; sc[j] = sp[j]; }
+    __builtin_amdgcn_sched_barrier(0);
+  }
+  const int* lyi = reinterpret_cast<const int*>(ly);
+  float acc = 0.f;
+#pragma unroll
+  for (int j = 0; j < G; ++j) {
+    const uint32_t qw[4] = {q[j].x, q[j].y, q[j].z, q[j].w};
+    int sumi = 0;
+#pragma unroll
+    for (int wd = 0; wd < 4; ++wd) {
+      sumi = dot4(qw[wd] & 0x0F0F0F0Fu, lyi[8 * j + 2 * wd], sumi);
+      sumi = dot4((qw[wd] >> 4) & 0x0F0F0F0Fu, lyi[8 * j + 2 * wd + 1], sumi);
+    }
+    acc += bf2f(sc[j]) * (lys[j] * (float)sumi - 8.f * lysum[j]);
+  }
+  out[(long)p * N + n] = acc;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Host wrappers
 static void check_act(const at::Tensor& x8, const at::Tensor& xs, const at::Tensor& xsum, int K) {
   TORCH_CHECK(x8.scalar_type() == at::kChar && x8.is_contiguous() && x8.size(1) == K);
@@ -716,6 +859,39 @@ void gemv_rowlane(at::Tensor w, at::Tensor s, at::Tensor x8, at::Tensor xs, at::
   TORCH_CHECK(false, "gemv_rowlane: wpb must be 1 or 4");
 }
 
+
+// D2 + silu fold.  K (intermediate) == 160 only; part fp32 [P, 320]; N % 64 == 0 and
+// (N / 64) % wpb == 0; out fp32 [P, N].
+void gemv_rowlane_silu(at::Tensor w, at::Tensor s, at::Tensor part, at::Tensor row_tok,
+                       at::Tensor row_exp, at::Tensor out, int64_t wpb, int64_t hoist,
+                       at::Tensor w_extra, at::Tensor s_extra) {
+  TORCH_CHECK(part.scalar_type() == at::kFloat && part.dim() == 2 && part.size(1) == 320,
+              "gemv_rowlane_silu: part must be fp32 [P, 320]");
+  check_gemv(w, s, row_tok, row_exp, out, 160);
+  TORCH_CHECK((w.scalar_type() == at::kInt && w.size(2) == 20) ||
+              (w.scalar_type() == at::kByte && w.size(2) == 80));
+  const int P = row_tok.numel(), N = w.size(1), E = w.size(0);
+  TORCH_CHECK(N % 64 == 0, "gemv_rowlane_silu: N % 64 != 0");
+  check_extra(w_extra, s_extra, N, 160);
+  auto stream = c10::hip::getCurrentHIPStream().stream();
+  const long waves = (long)P * (N / 64);
+  if (waves == 0) return;
+  const uint32_t* wx = w_extra.numel() ? reinterpret_cast<const uint32_t*>(w_extra.data_ptr()) : nullptr;
+  const uint16_t* sx = w_extra.numel() ? reinterpret_cast<const uint16_t*>(s_extra.data_ptr()) : nullptr;
+#define RLSILU_CASE(W, H) \
+  if (wpb == W && hoist == H) { \
+    TORCH_CHECK((N / 64) % W == 0, "gemv_rowlane_silu: (N/64) % wpb != 0"); \
+    w4a8_rowlane_silu_kernel<160, W, H><<<(int)(waves / W), 64 * W, 0, stream>>>( \
+        reinterpret_cast<const uint32_t*>(w.data_ptr()), reinterpret_cast<const uint16_t*>(s.data_ptr()), \
+        part.data_ptr<float>(), row_tok.data_ptr<int32_t>(), row_exp.data_ptr<int32_t>(), \
+        out.data_ptr<float>(), N, P, E, (long)N * 20, (long)N * 5, part.stride(0), wx, sx); \
+    return; \
+  }
+  RLSILU_CASE(4, 0) RLSILU_CASE(8, 1) RLSILU_CASE(4, 1) RLSILU_CASE(8, 0)
+#undef RLSILU_CASE
+  TORCH_CHECK(false, "gemv_rowlane_silu: unsupported wpb/hoist ", wpb, "/", hoist);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("quant_q8", &quant_q8, "x bf16 [R,K] -> x8 int8 [R,K] (per-8 de-interleaved), xs/xsum fp32 [R,K/32]");
   m.def("quant_q8_gate", &quant_q8_gate,
@@ -729,6 +905,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "w, s, x bf16 [M,K], row_tok, out fp32 [P,N], lpr(16), w_extra, s_extra, wg, topk_ids, "
         "topk_w, row_exp(out), wcomb(out), E  (Q8_1 prep + shared-as-expert row/gate prep folded "
         "into the slab GEMV)");
+  m.def("gemv_rowlane_silu", &gemv_rowlane_silu,
+        "w, s, part fp32 [P,320] (gate|up), row_tok, row_exp, out fp32 [P,N], wpb, hoist, "
+        "w_extra, s_extra  (silu*mul + Q8_1 folded into the down GEMV; bit-exact)");
   m.def("gemv_rowlane", &gemv_rowlane,
         "w, s, x8, xs, xsum, row_tok, row_exp, out fp32 [P,N], wpb(1|4), w_extra, s_extra  (K=160)");
 }
