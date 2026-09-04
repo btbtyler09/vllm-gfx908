@@ -17,6 +17,8 @@ from collections.abc import Iterable
 
 import regex as re
 import torch
+
+from vllm.logger import init_logger
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
@@ -108,6 +110,31 @@ def _remap_mtp_weight_name(name: str) -> str | None:
     return None
 
 
+
+logger = init_logger(__name__)
+
+
+def _mtp_checkpoint_is_unquantized(vllm_config: VllmConfig) -> bool:
+    import json
+    import os
+
+    force = os.environ.get("VLLM_MTP_FORCE_UNQUANT")
+    if force is not None:
+        return force == "1"
+    idx = os.path.join(vllm_config.model_config.model, "model.safetensors.index.json")
+    if not os.path.isfile(idx):
+        return False
+    try:
+        with open(idx) as f:
+            names = list(json.load(f)["weight_map"].keys())
+    except Exception:  # unreadable index: keep the default behaviour
+        return False
+    mtp = [n for n in names if n.startswith("mtp.") or n.startswith("model.mtp.")]
+    if not mtp:
+        return False
+    return not any(("qweight" in n or "weight_packed" in n or ".scales" in n) for n in mtp)
+
+
 def _make_draft_vllm_config(
     vllm_config: VllmConfig,
     mtp_start_layer_idx: int,
@@ -118,6 +145,17 @@ def _make_draft_vllm_config(
         raise ValueError("speculative_config.draft_model_config must be set")
 
     draft_quant_config = get_draft_quant_config(vllm_config)
+    # PTQ checkpoints (GPTQ/AWQ) usually leave the MTP draft layer unquantized
+    # without recording the exclusion; building it quantized then fails to
+    # place the plain `mtp.*` weights (FusedMoE expects w13_qweight). Detect
+    # from the checkpoint index and build the draft unquantized when no
+    # quantized `mtp.*` tensor exists. VLLM_MTP_FORCE_UNQUANT=0/1 overrides.
+    if draft_quant_config is not None and _mtp_checkpoint_is_unquantized(vllm_config):
+        logger.info(
+            "qwen4_exp MTP: checkpoint mtp.* weights are unquantized; "
+            "building the draft without quant_config"
+        )
+        draft_quant_config = None
 
     # inject packed and ignored modules to the quantization config of draft model
     if draft_quant_config is not None:
