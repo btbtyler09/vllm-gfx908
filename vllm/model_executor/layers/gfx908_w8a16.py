@@ -47,9 +47,11 @@ Because the MFMA kernel needs a different byte order than the ``M <= 4`` GEMV,
 keeping both int8 layouts would cost a second full int8 copy (+678 MB/rank for
 the whitelisted set).  So with the flag on the **swizzled layout is the only
 resident int8 copy** and every M is served from it: ``M <= 4`` also goes through
-the MFMA kernel (M padded to 16), which costs a few us per launch versus the
-row-major GEMV but saves the duplicate.  ``M > 64`` rematerialises from the
-swizzled copy with ``mfma_w8_dequant``.
+a GEMV that reads the swizzled bytes directly (``csrc/gfx908_w8sw_gemv.cuh``,
+``w8sw_gemv``): one wave64 owns a 16-row n-tile and lane ``l`` owns the same 16 B
+it owns in the MFMA kernel, so the k-tile is a single coalesced 1 KiB
+``dwordx4`` per wave and there is no M padding.  ``M > 64`` rematerialises from
+the swizzled copy with ``mfma_w8_dequant``.
 
 Phase 4 (``VLLM_GFX908_W4_LOADTIME=gdn|all``, default OFF): the two GDN
 projections are RTN-quantized to the **W4 GS32** layout the W4 GEMV kernels
@@ -92,6 +94,11 @@ _SOURCES = [
         "gfx908_w8a16.hip",
         "gfx908_w8a16_dequant.hip",
         "gfx908_w8a16_mfma.hip",
+        "gfx908_w8sw.hip",
+        "gfx908_w8sw_nb1.hip",
+        "gfx908_w8sw_nb2.hip",
+        "gfx908_w8sw_nb3.hip",
+        "gfx908_w8sw_nb4.hip",
         "gfx908_w8a16_nb1.hip",
         "gfx908_w8a16_nb2.hip",
         "gfx908_w8a16_nb3.hip",
@@ -248,6 +255,41 @@ _MFMA_BEATS_STOCK: dict[tuple[int, int], int] = {
     (4096, 2560): 64,    # gdn in_proj_qkvz: 1.21-2.44x vs stock at 5 <= M <= 64
     (2560, 1536): 64,    # gdn out_proj: 1.17-1.89x vs stock at 5 <= M <= 64
 }
+
+# M = 1 reads the swizzled copy with a plain GEMV (csrc/gfx908_w8sw_gemv.cuh) instead of
+# padding the M-tile to 16 rows in the MFMA kernel: same bytes, same launch count, no second
+# resident layout.  (N, K) -> {M: (NT, UNRL, KS)} from the graph-timed L2-cold sweep
+# (agents/mfma_gemv/REPORT.md).  Only M = 1 is listed: the MFMA kernel is nearly M-independent
+# below 16 rows, so it already wins at M >= 2 (0.88-0.95x of the GEMV there) and a shape/M that
+# is absent from this table falls through to it.
+_WSW_CFG: dict[tuple[int, int], dict[int, tuple[int, int, int]]] = {
+    (4096, 2560): {1: (1, 1, 4)},
+    (2560, 1536): {1: (1, 1, 8)},
+    (62080, 2560): {1: (2, 1, 1)},
+}
+
+
+_WSW_FLAG: bool | None = None
+
+
+def w8sw_gemv_enabled() -> bool:
+    """VLLM_GFX908_W8A16_SWGEMV=0 disables the M <= 4 swizzled GEMV (default on).
+
+    Escape hatch only: with the MFMA path on there is no row-major copy left, so turning
+    this off puts M <= 4 back on the MFMA kernel with the M-tile padded to 16 rows.
+    """
+    global _WSW_FLAG
+    if _WSW_FLAG is None:
+        _WSW_FLAG = os.environ.get("VLLM_GFX908_W8A16_SWGEMV", "1") == "1"
+    return _WSW_FLAG
+
+
+def _wsw_cfg(n: int, k: int, m: int) -> tuple[int, int, int] | None:
+    if not w8sw_gemv_enabled():
+        return None
+    per_m = _WSW_CFG.get((n, k))
+    return None if per_m is None else per_m.get(m)
+
 
 _MFMA_FLAG: bool | None = None
 
@@ -487,8 +529,9 @@ def w4lt_available() -> bool:
 def _reset_env_cache():
     """Re-read every VLLM_GFX908_W8A16* / W4_LOADTIME env (tests only; extensions stay cached)."""
     global _FLAG, _GS, _FREE, _MFMA_FLAG, _W4LT_POLICY, _W4LT_GS, _W4LT_ACT, _W4LT_FREE
+    global _WSW_FLAG
     global _W4LT_FLAG
-    _FLAG = _GS = _FREE = _MFMA_FLAG = None
+    _FLAG = _GS = _FREE = _MFMA_FLAG = _WSW_FLAG = None
     _W4LT_POLICY = _W4LT_GS = _W4LT_ACT = _W4LT_FREE = _W4LT_FLAG = None
     _Q_CACHE.clear()
 
@@ -975,7 +1018,21 @@ def w8a16_gemm(
             if w4out is not None:
                 return w4out.reshape(*x.shape[:-1], n)
     elif ent.qsw is not None:
-        # MFMA path owns the only int8 copy: it serves every M it covers.
+        # MFMA path owns the only int8 copy: it serves every M it covers.  At M <= 4 a plain
+        # GEMV over the same swizzled bytes is cheaper than the MFMA kernel's 16-row M padding,
+        # so try it first and fall through to the MFMA kernel if it declines this config.
+        wcfg = _wsw_cfg(n, k, m) if (bias is None and 1 <= m <= W8A16_MAX_M) else None
+        if wcfg is not None and x.dtype == torch.bfloat16:
+            x2 = x.reshape(-1, k)
+            if not x2.is_contiguous():
+                x2 = x2.contiguous()
+            out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+            nt, unrl, ks = wcfg
+            if _ext().w8sw_gemv(
+                ent.qsw, ent.ssw, x2, out, ent.gs, nt, unrl, ks, _cu_count()
+            ):
+                return out.reshape(*x.shape[:-1], n)
+            del out
         if bias is None and 1 <= m <= MFMA_MAX_M:
             cfg = _mfma_cfg(n, k, m)
             # Above M = 4 a weight that still has its bf16 master copy is only

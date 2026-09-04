@@ -14,6 +14,9 @@ bool w8a16_dequant(at::Tensor W, at::Tensor S, at::Tensor O, int64_t gs);
 bool mfma_w8_gemm(at::Tensor Wsw, at::Tensor Ssw, at::Tensor X, at::Tensor C, int64_t tile,
                   int64_t nw, int64_t sk, int64_t ug, int64_t dbg);
 bool mfma_w8_dequant(at::Tensor Wsw, at::Tensor Ssw, at::Tensor O, int64_t r0, int64_t Nfull);
+void wsw_stream(at::Tensor W, at::Tensor out, int64_t cu);
+bool w8sw_gemv(at::Tensor Wsw, at::Tensor Ssw, at::Tensor X, at::Tensor C, int64_t gs,
+               int64_t nt, int64_t unrl, int64_t ks, int64_t cu);
 
 extern template bool w8_launch_nb<1>(const W8Args&, int, int, int, int, int);
 extern template bool w8_launch_nb<2>(const W8Args&, int, int, int, int, int);
@@ -59,4 +62,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("w8a16_dequant", &w8a16_dequant);
   m.def("mfma_w8_gemm", &mfma_w8_gemm);
   m.def("mfma_w8_dequant", &mfma_w8_dequant);
+  m.def("w8sw_gemv", &w8sw_gemv);
+  m.def("wsw_stream", &wsw_stream);
 }
