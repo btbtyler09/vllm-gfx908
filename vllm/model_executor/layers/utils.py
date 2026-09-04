@@ -23,6 +23,10 @@ from vllm.model_executor.layers.gfx908_midm_gemm import (
     gfx908_midm_gemm,
     midm_gemm_applies,
 )
+from vllm.model_executor.layers.gfx908_w8a16 import (
+    w8a16_enabled,
+    w8a16_gemm,
+)
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
@@ -642,6 +646,20 @@ def rocm_unquantized_gemm_gfx908_impl(
         and weight.is_contiguous()
     )
     if skinny_ok:
+        # W8A16 (opt-in, VLLM_GFX908_W8A16=1): int8 weight copy + bf16 acts for
+        # the whitelisted decode projections (GDN in_proj_qkvz / out_proj,
+        # lm_head) at M <= 4. Halves the weight bytes of the HBM-bound skinny
+        # GEMV (1.5-2.0x graph-timed). Returns None -> stock wvSplitK below
+        # (shape not whitelisted, M > 4, bias, or not yet quantized because we
+        # are inside a cudagraph capture).
+        if w8a16_enabled():
+            w8_out = w8a16_gemm(x, weight, bias)
+            if w8_out is not None:
+                if debug:
+                    import sys as _sys
+                    print(f"[W8A16] n={n} m={m} k={k}",
+                          file=_sys.stderr, flush=True)
+                return w8_out
         x_view = x.reshape(-1, x.size(-1))
         # wvSplitK first: graph-timed on MI100 (mb_skinny.py, 2026-09-02) it
         # beats LLMM1 at n == 1 on every Qwen4Exp shape (in_proj_qkvz 19 vs
