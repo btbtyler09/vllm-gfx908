@@ -62,6 +62,7 @@ _MODES = ("int8", "f16")
 _FLAG: bool | None = None
 _MODE: str | None = None
 _SHARED_AS_EXPERT: bool | None = None
+_PREP_FOLD: bool | None = None
 
 
 def _load(name: str, src: str, subdir: str):
@@ -149,12 +150,59 @@ def shared_as_expert_enabled() -> bool:
     return _SHARED_AS_EXPERT
 
 
+def prep_fold_enabled() -> bool:
+    """VLLM_GFX908_MOE_PREP_FOLD=1 (default off): fold the gate_up projection's activation
+    preparation (Q8_1 quant in ``int8`` mode, fp16 cast + per-8 permutation in ``f16`` mode) into
+    the slab GEMV's LDS staging, so the separate ``quant_q8`` / ``cast_f16`` launch disappears.
+
+    The staged bytes and the order they are read in are the same as the two-launch flow, so the
+    result is **bit-identical**; only the launch count changes (-1 per gate_up GEMV).  The down
+    projection is untouched: its activation already comes out of the silu*mul kernel in the
+    prepared format.
+
+    Not taken when the shared expert rides along as expert #E: that flow needs the prep kernel's
+    extra blocks to build ``row_exp`` / ``wcomb`` *before* the slab kernel reads them, so folding
+    the activation half would save no launch.
+    """
+    global _PREP_FOLD
+    if _PREP_FOLD is None:
+        _PREP_FOLD = os.environ.get("VLLM_GFX908_MOE_PREP_FOLD", "0") == "1" and w4a8_enabled()
+        if _PREP_FOLD:
+            logger.info_once(
+                "gfx908: MoE gate_up activation prep folded into the slab GEMV "
+                "(VLLM_GFX908_MOE_PREP_FOLD=1, mode=%s)",
+                w4a8_mode(),
+            )
+    return _PREP_FOLD
+
+
+# The folded kernel always runs the 4-waves-per-block LDS geometry (one staged token per block).
+# Below this many tiles that geometry leaves most of the 120 CUs idle and the one saved launch
+# does not pay for it -- the same 480-tile rule ``_slab_cfg_f16`` uses to pick its LDS variant.
+_FOLD_MIN_TILES = 480
+
+
+def prep_fold_applies(N: int, K: int, P: int) -> bool:
+    """The folded slab kernel stages one token per 4-wave block, so a block must not straddle two
+    pairs: (N / ROWS) % 4 == 0 with ROWS = 64 / lpr = 4.  K must be an instantiated slab case, and
+    there must be enough tiles (P rows x N/ROWS) to fill the machine with 4-wave blocks."""
+    return (
+        prep_fold_enabled()
+        and K in _SLAB_K
+        and N % 4 == 0
+        and (N // 4) % 4 == 0
+        and P * (N // 4) >= _FOLD_MIN_TILES
+    )
+
+
 def _reset_env_cache():
-    """Re-read VLLM_GFX908_W4A8 / _MODE / _SHARED_AS_EXPERT (tests only; extensions stay cached)."""
-    global _FLAG, _MODE, _SHARED_AS_EXPERT
+    """Re-read VLLM_GFX908_W4A8 / _MODE / _SHARED_AS_EXPERT / _PREP_FOLD (tests only;
+    extensions stay cached)."""
+    global _FLAG, _MODE, _SHARED_AS_EXPERT, _PREP_FOLD
     _FLAG = None
     _MODE = None
     _SHARED_AS_EXPERT = None
+    _PREP_FOLD = None
 
 
 # --------------------------------------------------------------------------- #
@@ -199,6 +247,15 @@ def gemv_slab(w, s, x8, xs, xsum, row_tok, row_exp, wpb: int = 4, extra=None) ->
     out = torch.empty((row_tok.numel(), w.shape[1]), dtype=torch.float32, device=x8.device)
     wx, sx = _extra_pair(extra, x8.device)
     _ext().gemv_slab(w, s, x8, xs, xsum, row_tok, row_exp, out, 16, wpb, wx, sx)
+    return out
+
+
+def gemv_slab_prep(w, s, x, row_tok, row_exp, extra=None) -> torch.Tensor:
+    """D1 with the Q8_1 prep folded in: x is the raw bf16 [R, K] activation, no quant_q8 launch.
+    Bit-identical to ``gemv_slab(*quant_q8(x), ...)``."""
+    out = torch.empty((row_tok.numel(), w.shape[1]), dtype=torch.float32, device=x.device)
+    wx, sx = _extra_pair(extra, x.device)
+    _ext().gemv_slab_prep(w, s, x, row_tok, row_exp, out, 16, wx, sx)
     return out
 
 
@@ -249,6 +306,16 @@ def gemv_slab_f16(w, s, xh, row_tok, row_exp, cfg=None, extra=None) -> torch.Ten
     out = torch.empty((P, N), dtype=torch.float32, device=xh.device)
     wx, sx = _extra_pair(extra, xh.device)
     _ext_f16().gemv_slab_f16(w, s, xh, row_tok, row_exp, out, lpr, mode, wpb, wx, sx)
+    return out
+
+
+def gemv_slab_f16_prep(w, s, x, row_tok, row_exp, extra=None) -> torch.Tensor:
+    """D5 slab with the bf16 -> fp16 cast + per-8 permutation folded into the LDS staging: x is the
+    raw bf16 [R, K] activation, no cast_f16 launch.  Bit-identical to
+    ``gemv_slab_f16(w, s, cast_f16(x), ..., cfg=(16, 1, 4))``."""
+    out = torch.empty((row_tok.numel(), w.shape[1]), dtype=torch.float32, device=x.device)
+    wx, sx = _extra_pair(extra, x.device)
+    _ext_f16().gemv_slab_f16_prep(w, s, x, row_tok, row_exp, out, 16, wx, sx)
     return out
 
 
@@ -469,6 +536,8 @@ def moe_w4a8(
     extra1 = extra2 = None
     wsum = topk_weights.reshape(-1).to(torch.float32)
     rows = topk
+    # the gate_up activation prep rides along with the slab kernel's LDS staging (-1 launch)
+    fold = shared is None and prep_fold_applies(N1, K, P)
 
     if shared is not None:
         if not (mul_routed_weight and shared_pack_applies(shared, E, N1, K, K2)):
@@ -488,17 +557,27 @@ def moe_w4a8(
         row_expert = row_expert_f
         wsum = wcomb.view(-1)
         rows = topk + 1
+    elif fold:
+        pass                                  # no separate prep launch
     elif w4a8_mode() == "f16":
         xh = cast_f16(hidden_states)
     else:
         x8, xs, xsum = quant_q8(hidden_states)
 
     if w4a8_mode() == "f16":
-        part1 = gemv_slab_f16(w1_i, w1_scale, xh, row_token, row_expert, extra=extra1)
+        part1 = (
+            gemv_slab_f16_prep(w1_i, w1_scale, hidden_states, row_token, row_expert)
+            if fold
+            else gemv_slab_f16(w1_i, w1_scale, xh, row_token, row_expert, extra=extra1)
+        )
         ih = silu_mul_cast(part1)
         part2 = gemv_rowlane_f16(w2_i, w2_scale, ih, row_self, row_expert, wpb=4, extra=extra2)
     else:
-        part1 = gemv_slab(w1_i, w1_scale, x8, xs, xsum, row_token, row_expert, wpb=4, extra=extra1)
+        part1 = (
+            gemv_slab_prep(w1_i, w1_scale, hidden_states, row_token, row_expert)
+            if fold
+            else gemv_slab(w1_i, w1_scale, x8, xs, xsum, row_token, row_expert, wpb=4, extra=extra1)
+        )
         i8, isc, isum = silu_mul_quant(part1)
         part2 = gemv_rowlane(w2_i, w2_scale, i8, isc, isum, row_self, row_expert, wpb=4, extra=extra2)
     rb2 = 1024
@@ -537,14 +616,20 @@ def shared_expert_from_pack(x, pack):
     M, K = x.shape
     H = w2x.shape[1]
     rt, re = _rows(M, x.device)
+    fold = prep_fold_applies(w1x.shape[1], K, M)
     if w4a8_mode() == "f16":
-        xh = cast_f16(x)
-        part1 = gemv_slab_f16(w1x, s1x, xh, rt, re)
+        part1 = (
+            gemv_slab_f16_prep(w1x, s1x, x, rt, re) if fold
+            else gemv_slab_f16(w1x, s1x, cast_f16(x), rt, re)
+        )
         ih = silu_mul_cast(part1)
         part2 = gemv_rowlane_f16(w2x, s2x, ih, rt, re, wpb=1)
     else:
-        x8, xs, xsum = quant_q8(x)
-        part1 = gemv_slab(w1x, s1x, x8, xs, xsum, rt, re, wpb=1)
+        if fold:
+            part1 = gemv_slab_prep(w1x, s1x, x, rt, re)
+        else:
+            x8, xs, xsum = quant_q8(x)
+            part1 = gemv_slab(w1x, s1x, x8, xs, xsum, rt, re, wpb=1)
         i8, isc, isum = silu_mul_quant(part1)
         part2 = gemv_rowlane(w2x, s2x, i8, isc, isum, rt, re, wpb=1)
     out = torch.empty((M, H), dtype=x.dtype, device=x.device)
@@ -661,8 +746,14 @@ def dense_w4a8_gemv(a, b_q, scales):
     if p is None:
         return None
     rt, re = _rows(M, a.device)
+    fold = prep_fold_applies(N, K, M)
     if w4a8_mode() == "f16":
-        part = gemv_slab_f16(p[0], p[1], cast_f16(a), rt, re)
+        part = (
+            gemv_slab_f16_prep(p[0], p[1], a, rt, re) if fold
+            else gemv_slab_f16(p[0], p[1], cast_f16(a), rt, re)
+        )
+    elif fold:
+        part = gemv_slab_prep(p[0], p[1], a, rt, re)
     else:
         x8, xs, xsum = quant_q8(a)
         part = gemv_slab(p[0], p[1], x8, xs, xsum, rt, re, wpb=1 if N <= 512 else 4)

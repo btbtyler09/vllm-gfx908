@@ -256,3 +256,71 @@ copies. Parked; needs a captured proposer, a sampler fix and a W4 drafter. Loadi
 HC bf16 masters costs ~90 ms per 2K prefill through the M>3 dequant fallback). 12-tier vs rc3: single-user
 TTFT 850 -> 663 ms (TPOT 11.2), 16K c=4 TTFT 12.1 -> 9.4 s, c=32/64/128 337/301/337 -> 360/338/379 tok/s.
 Report + start script in mi100-llm-testing (`scripts/serve_qwen38_flash_next_rc4.sh`).
+
+## Round 8 (2026-09-04/05): batched-decode range, determinism, and the step-timer rule
+
+Ground truth for every entry here is the in-server step timer
+(`VLLM_GFX908_STEP_TIMING=1`: CUDA events around execute_model, /200 steps)
+on the same working-tree overlay, not microbenches — three of the four
+levers below had microbench wins that did not survive the real op.
+
+| arm (c=1, TP4, FULL graphs) | ms/step | c=1 tok/s | c=4 ms/step (tok/s) |
+|---|---|---|---|
+| first tree: control (new flags off, but NB4..8 kernels linked) | 11.10 | 89.4 | 20.7 (185.7) |
+| first tree: `HC_FUSED_MAX_M=4` | 11.16 | 88.8 | 18.65 (198) |
+| first tree: + `MOE_PREP_FOLD=1` | 11.25 | 88.3 | — |
+| first tree: + `QSA_STABLE_TOPK=1` (v1) | 11.43 | 87.5 | — |
+| **fixed tree** (HC M<=3 kernel byte-identical, NB>3 in own ext): `HC_FUSED_MAX_M=4` | **10.87** | **91.3** | 18.8 (207.5) |
+| fixed tree: + `QSA_STABLE_TOPK=1` (v2) | 11.37 | 87.3 | 19.0 (203) |
+| fixed tree: + `MOE_PREP_FOLD=1` | 11.24 | 88.4 | 18.7 (205.9) |
+
+* **HC fused range M<=4** (`VLLM_GFX908_HC_FUSED_MAX_M`, default 4): the
+  fused bf16/W8 mix-chain kernels now cover M<=8 (K-chunked LDS staging);
+  it only *pays* to M=4 because the kernels are GEMVs whose cost grows with
+  M while rocBLAS goes flat on MFMA at M>=5. W8 chain at M=4: 53.7 -> 36.9
+  us/module; c=4 +7-10% (185.7 -> 198 tok/s). Adopted.
+  Two hidden M<=3 regressions found on the way and fixed: (a) the chunked
+  loop kept 16 waves alive across per-chunk barriers (+2.6..4.2 us/module,
+  ~0.3 ms/step over 96 modules) -> HEAD's kernel is compiled in byte-identical
+  for M<=3; (b) merely *linking* the NB=4..8 kernels into the same code
+  object cost +1.1..2.0 us per M<=3 dispatch -> they live in a separate
+  extension (`gfx908_wv_fused_w8_big_ext`, `-DHW8_NB_BIG`) that is only
+  JIT-built when the range is > 3. Lesson: code-object size is a
+  per-dispatch cost on gfx908; keep hot GEMV kernels in small modules.
+* **MoE prep fold** (`VLLM_GFX908_MOE_PREP_FOLD`, default off): folds the
+  activation quantize/pack into the gate_up GEMV's LDS staging (5 -> 4
+  launches per MoE layer). Isolated real-op timing at M=1 says win (MoE
+  layer 22.8 -> 21.0 us int8, GDN in_proj 16.1 -> 13.5 us, bit-identical),
+  but the same-tree in-server pair says **+0.37 ms/step at c=1** (10.87 ->
+  11.24), c=4 neutral. Working hypothesis: the isolated bench replays
+  L2-resident weights, so the fused kernel's lower occupancy (72 VGPR, 3
+  waves) costs nothing there, while the server streams ~1.9 GB cold per step
+  and needs the waves for latency hiding. Kept in tree, off; cold-L2
+  re-measure pending. Rule: a GEMV microbench must evict L2 between calls.
+* **Stable top-k** (`VLLM_GFX908_QSA_STABLE_TOPK`): `topKPerRowDecode`
+  resolves ties and slot order via atomicAdd, so long-context greedy output
+  differed run-to-run at token 0 (3/4 prompts at 6K). A repair kernel
+  re-sorts each row's k indices deterministically; with a per-run
+  `cache_salt` this gives 4/4 bit-identical long-context outputs. Cost
+  ~0.2 ms/step in decode graphs (runs at the full column width) — being cut
+  to visible-bounded work before it becomes a default. Until then it is a
+  gate-time flag: turn it on for parity runs, off for throughput.
+* **MFMA W8 GEMM 5<=M<=64** (`VLLM_GFX908_W8A16_MFMA`): swizzled int8 MFMA
+  16x16x16 path for batched decode with a deterministic LDS reduce (the
+  first version used `ds_add_f32` atomics and failed cudagraph replay
+  parity). Numerics within bf16 half-ulp (a 3e-3 bound was the wrong test).
+  c>=4 win, c=1 -0.5% and a small greedy-parity shift; default pending a
+  same-overlay ablation.
+* **W4 at load time for GDN/HC** (`VLLM_GFX908_W4_LOADTIME`): +0.5% at
+  10x the RTN error of the GPTQ W4 experts. Kept in tree, off; the right
+  version is Quantizer-side GPTQ W4 for those weights.
+* **MoE Triton W4 config, M=8192 key** (`E=512,N=160 ... int4_w4a16.json`):
+  BLOCK_M 256 / BLOCK_N 64 / BLOCK_K 32 / 8 warps, from a 112-config sweep.
+  Real 7840-row prefill chunk 10.94 -> 9.22 ms per MoE layer per rank
+  (-15.7%), i.e. -82 ms per 16K prefill pass; M<=4096 keys were already
+  optimal and are unchanged. The dequant-to-bf16 MoE alternative was
+  measured and loses (dequant round-trip 3.55 ms/layer alone exceeds the
+  whole W4 call at M=2048; bf16 pair only 15% faster than the in-kernel
+  nibble path). Same-FLOP dense rocBLAS is ~2x faster than the W4 MoE kernel
+  at M=8192, so the remaining prefill headroom is the MoE GEMM structure
+  (gather/padding/tiling), not the weight format.

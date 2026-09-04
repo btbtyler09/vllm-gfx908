@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""gfx908 fused hyper-connection projections (M <= 3).
+"""gfx908 fused hyper-connection projections (M <= 3, or M <= 8 with
+``VLLM_GFX908_HC_FUSED_MAX_M``).
 
 A copy of vLLM's wvSplitK small-M skinny GEMM (csrc/rocm/skinny_gemms.cu) with
 two fused epilogues, JIT-built with torch.utils.cpp_extension:
@@ -32,6 +33,21 @@ master copies are released (``weight.data`` is rebound to a zero-stride stub
 that keeps shape/dtype/device but owns no memory).  ``M > 3`` then
 rematerialises each weight into a reusable bf16 scratch with a dequant kernel
 and runs the stock chain, exactly like the W8A16 phase-2 path.
+
+W4 variant (``VLLM_GFX908_W4_LOADTIME=hc|all``, default OFF)
+-----------------------------------------------------------
+The same two weights, RTN-quantized to the W4 GS32 layout instead of int8 (0.28x
+the bf16 bytes rather than 0.52x), served by ``layers/csrc/gfx908_w4_loadtime.hip``
+with the *same two epilogues* ported onto its output stage, so the chain is
+**two** launches instead of three: ``mix_down`` writes the silu'd lora straight
+out as fp16 in the permuted activation layout the ``mix_up`` GEMV reads (and the
+inject columns compactly, so nothing has to be made contiguous afterwards), and
+the bf16 -> fp16 cast of ``xn`` rides along with the kernel's LDS staging.  The
+fused range also widens from ``M <= 3`` (an LDS limit of the wvSplitK copy) to
+``M <= 8``.  Graph-timed at M=1 the chain is 15.8 us vs 17.1 for the W8 chain
+and 20.3 for bf16; at M = 4/8 it replaces a path that had fallen off the fused
+kernel entirely.  **RTN at 4 bits costs ~10% relative error on these tensors
+(agents/w4_loadtime), so this flag needs the PPL / GSM8K gate.**
 """
 
 import functools
@@ -44,11 +60,70 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
-HC_FUSED_MAX_M = 3
+HC_FUSED_MAX_M = 4
+# VLLM_GFX908_HC_FUSED_MAX_M: the fused chain (bf16 and W8) used to stop at M = 3 because
+# wvSplitK stages the whole [M, K] activation in the 64 KB of LDS and mix_down has K = 10240
+# (3 * 10240 * 2 B = 60 KB, 4 rows do not fit).  Both kernels now stage the activation in
+# K-chunks, so the range is a policy choice, not an LDS limit; above the cap the chain falls
+# back to the stock rocBLAS GEMMs (which the M = 4 measurement put at 51.8 us per module).
+# 1..3 reproduces the shipped behaviour exactly -- the single-chunk path is bit-identical.
+_MAX_M: int | None = None
+
+
+def hc_fused_max_m() -> int:
+    """Largest M the fused HC chain handles (``VLLM_GFX908_HC_FUSED_MAX_M``, default 4).
+
+    Graph-timed per module on an idle MI100 (agents/moe_prep_hc/bench_hc_cross.log), fused chain
+    vs the stock rocBLAS chain, us:
+
+        M          1      2      3      4      5      6      7      8
+        bf16    24.1   32.6   42.9   50.0   57.3   67.1   80.5   90.4
+        W8      19.8   26.8   30.8   37.3   45.6   59.9  112.4  131.6
+        stock   25.1   35.7   46.6   52.8   42.8   45.2   42.9   42.9
+
+    **4 is the measured crossover.** The fused kernels are GEMVs: their cost grows ~linearly in M
+    because the per-lane dot work scales with the batch, while rocBLAS switches to an MFMA kernel
+    at M >= 5 and is then flat (~43 us) to M = 8.  So `4` buys +2.7 us/module (bf16) or
+    +15.5 us/module (W8 -- the shipping HC configuration, i.e. ~1.5 ms/step over 96 modules) and
+    `5` already loses.  Higher values exist for the A/B, not for production.
+    """
+    global _MAX_M
+    if _MAX_M is None:
+        try:
+            v = int(os.environ.get("VLLM_GFX908_HC_FUSED_MAX_M", str(HC_FUSED_MAX_M)))
+        except ValueError:
+            v = HC_FUSED_MAX_M
+        if not 1 <= v <= 8:
+            logger.warning(
+                "gfx908: VLLM_GFX908_HC_FUSED_MAX_M=%s is outside 1..8; using %d",
+                os.environ.get("VLLM_GFX908_HC_FUSED_MAX_M"), HC_FUSED_MAX_M,
+            )
+            v = HC_FUSED_MAX_M
+        _MAX_M = v
+        if v != HC_FUSED_MAX_M:
+            logger.info_once("gfx908: fused HC chain widened to M <= %d", v)
+    return _MAX_M
+
+# The W4 chain is a GEMV: its cost grows ~linearly in M because every token re-reads the whole
+# weight, while the stock chain above M = 3 is a GEMM that is flat to M = 16 (occupancy bound).
+# Measured through _hc_mix_local itself (agents/w4_loadtime/hc_baseline.log, us per module):
+#   M      1      2      4      8     16
+#   stock 16.93  23.75  51.77  42.48  46.11
+#   W4    14.62  21.58  33.29  59.16  79.96
+# so the crossover is between 4 and 8.  Overridable for the A/B.
+HC_W4_MAX_M = int(os.environ.get("VLLM_GFX908_W4_LOADTIME_HC_MAX_M", "4"))
 _CSRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")
 _CSRC = os.path.join(_CSRC_DIR, "gfx908_wv_fused.hip")
+# Two W8 extensions, not one.  Linking the M = 4..8 kernels into the same code object as the
+# M <= 3 ones costs +1.1..2.0 us per HC module at M = 1..3 even though the M <= 3 kernel binary is
+# byte-identical to HEAD -- the same source with only nb1..3 linked in measures HEAD
+# (agents/moe_prep_hc/bench_modsize.log).  So the widened range lives in its own module, JIT-loaded
+# only when VLLM_GFX908_HC_FUSED_MAX_M > 3, and the M <= 3 decode path keeps HEAD's module.
 _CSRC_W8 = [os.path.join(_CSRC_DIR, "gfx908_wv_fused_w8.hip")] + [
     os.path.join(_CSRC_DIR, f"gfx908_wv_fused_w8_nb{i}.hip") for i in (1, 2, 3)
+]
+_CSRC_W8_BIG = [os.path.join(_CSRC_DIR, "gfx908_wv_fused_w8.hip")] + [
+    os.path.join(_CSRC_DIR, f"gfx908_wv_fused_w8_nb{i}.hip") for i in range(4, 9)
 ]
 _FLAG: bool | None = None
 _W8_FLAG: bool | None = None
@@ -92,6 +167,23 @@ def _ext_w8():
     )
 
 
+@functools.cache
+def _ext_w8_big():
+    """The M = 4..8 half of the W8 GEMV, in its own code object (see _CSRC_W8_BIG)."""
+    from torch.utils.cpp_extension import load
+
+    build_dir = os.path.join(_build_dir(), "w8big")
+    os.makedirs(build_dir, exist_ok=True)
+    logger.info_once("gfx908: building/loading fused HC W8 (M 4..8) extension in %s", build_dir)
+    return load(
+        name="gfx908_wv_fused_w8_big_ext",
+        sources=_CSRC_W8_BIG,
+        build_directory=build_dir,
+        extra_cuda_cflags=["-O3", "--offload-arch=gfx908", "-DHW8_NB_BIG"],
+        verbose=False,
+    )
+
+
 def hc_fused_enabled() -> bool:
     global _FLAG
     if _FLAG is None:
@@ -119,6 +211,8 @@ def hc_w8_enabled() -> bool:
         if _W8_FLAG:
             try:
                 _ext_w8()
+                if hc_fused_max_m() > HC_FUSED_MAX_M:
+                    _ext_w8_big()
             except Exception as exc:
                 logger.warning_once("gfx908: HC W8 extension unavailable (%s)", exc)
                 _W8_FLAG = False
@@ -134,6 +228,43 @@ def hc_w8_enabled() -> bool:
                 hc_w8_free(),
             )
     return _W8_FLAG
+
+
+_W4_FLAG: bool | None = None
+
+
+def hc_w4_enabled() -> bool:
+    """W4 (instead of int8) for the two HC mixes: ``VLLM_GFX908_W4_LOADTIME=hc|all``.
+
+    Requires the fused HC path (the freed weights are only ever read by the fused
+    custom op).  Takes precedence over ``VLLM_GFX908_HC_W8``.
+    """
+    global _W4_FLAG
+    if _W4_FLAG is None:
+        from vllm.model_executor.layers.gfx908_w8a16 import w4lt_available, w4lt_policy
+
+        _W4_FLAG = w4lt_policy() in ("hc", "all") and hc_fused_enabled() and w4lt_available()
+        if _W4_FLAG:
+            from vllm.model_executor.layers.gfx908_w8a16 import w4lt_free, w4lt_gs
+
+            logger.info_once(
+                "gfx908: HC W4 mixes enabled (gs=%d, free_bf16=%s); the chain is 2 launches "
+                "and covers M <= %d",
+                w4lt_gs(),
+                w4lt_free(),
+                HC_W4_MAX_M,
+            )
+    return _W4_FLAG
+
+
+def _reset_env_cache():
+    """Re-read the HC env flags and drop the weight caches (tests only)."""
+    global _W8_FLAG, _W4_FLAG, _SHARD_FLAG, _MAX_M
+    _W8_FLAG = _W4_FLAG = _SHARD_FLAG = _MAX_M = None
+    _W8_CACHE.clear()
+    _PERM_CACHE.clear()
+    hc_w8_gs.cache_clear()
+    hc_w8_free.cache_clear()
 
 
 @functools.cache
@@ -403,16 +534,22 @@ class _W8Entry:
     so ``q`` is the pin.
     """
 
-    __slots__ = ("owner", "q", "s", "gs", "kind", "freed")
+    __slots__ = ("owner", "q", "s", "gs", "kind", "freed", "q4", "s4", "gs4", "shape")
 
-    def __init__(self, owner, q, s, gs, kind, freed):
+    def __init__(self, owner, q, s, gs, kind, freed, q4=None, s4=None, gs4=32, shape=None):
         self.owner = owner
-        self.q = q
-        self.s = s
+        self.q = q            # int8 [N, K]; None when the W4 copy is the resident one
+        self.s = s            # fp32 [N, K/gs]
         self.gs = gs
         self.kind = kind
         self.freed = freed
+        self.q4 = q4          # W4 packed [N, K/8] int32
+        self.s4 = s4          # W4 scales [N, K/gs4] bf16
+        self.gs4 = gs4
+        self.shape = shape    # (N, K) of the (permuted, for "up") weight
 
+
+_W4E = _W8Entry
 
 _W8_CACHE: dict[tuple, _W8Entry] = {}
 _W8_SCRATCH: dict[int, torch.Tensor] = {}
@@ -459,13 +596,47 @@ def prepare_hc_w8_weight(
 
     Must run before torch.compile / cudagraph capture.
     """
-    if not hc_w8_enabled():
+    w4 = hc_w4_enabled()
+    if not w4 and not hc_w8_enabled():
         return False
     if weight.dim() != 2 or weight.dtype != torch.bfloat16 or weight.is_meta:
         return False
     if _w8_key(weight) in _W8_CACHE:
         return True
     from vllm.model_executor.layers.gfx908_w8a16 import quantize_w8
+
+    if w4:
+        from vllm.model_executor.layers.gfx908_w8a16 import (
+            quantize_w4,
+            w4lt_free,
+            w4lt_gs,
+        )
+
+        gs4 = w4lt_gs()
+        src = weight if kind == "down" else permute_up_weight(weight, hc_count, hidden)
+        if src.shape[1] % gs4:
+            logger.warning_once(
+                "gfx908 HC W4: skipping %s weight %s (K not a multiple of %d)",
+                kind, tuple(src.shape), gs4,
+            )
+            return False
+        q4, s4 = quantize_w4(src.contiguous(), gs4)
+        n, k = int(src.shape[0]), int(src.shape[1])
+        del src
+        if w4lt_free():
+            weight.data = _make_stub(q4, weight.shape)   # releases the bf16 storage
+            ent = _W4E(None, None, None, gs4, kind, True, q4, s4, gs4, (n, k))
+        else:
+            ent = _W4E(weight, None, None, gs4, kind, False, q4, s4, gs4, (n, k))
+        _W8_CACHE[_w8_key(weight)] = ent
+        _ensure_scratch(q4.device, n * k)
+        logger.info_once(
+            "gfx908 HC W4: quantized %s weight %dx%d to W4 gs%d (freed=%s); "
+            "%.1f MB -> %.1f MB; %d cached",
+            kind, n, k, gs4, ent.freed,
+            n * k * 2 / 2**20, (n * k / 2 + n * (k // gs4) * 2) / 2**20, len(_W8_CACHE),
+        )
+        return True
 
     gs = hc_w8_gs(kind)
     src = weight if kind == "down" else permute_up_weight(weight, hc_count, hidden)
@@ -479,9 +650,9 @@ def prepare_hc_w8_weight(
     if hc_w8_free():
         stub = _make_stub(q, weight.shape)
         weight.data = stub  # releases the bf16 storage
-        ent = _W8Entry(None, q, s, gs, kind, True)
+        ent = _W8Entry(None, q, s, gs, kind, True, shape=tuple(q.shape))
     else:
-        ent = _W8Entry(weight, q, s, gs, kind, False)
+        ent = _W8Entry(weight, q, s, gs, kind, False, shape=tuple(q.shape))
     _W8_CACHE[_w8_key(weight)] = ent
     _ensure_scratch(q.device, q.shape[0] * q.shape[1])
     logger.info_once(
@@ -531,13 +702,36 @@ def install_hc_w8_prepare(gated_residual) -> None:
 # mix_down (336 x 10240): few rows, long K -> intra-WG split-K so all 16 waves stream.
 # mix_up (10240 x 320): YTILE must be HC=4 for the gate-mix epilogue; K=320 -> two rows
 # per wave-step (LPR=32) keeps 62% of the lanes busy instead of 31%.
-_CFG_DOWN = {1: (2, 2, 64, 2), 2: (2, 2, 64, 2), 3: (1, 3, 64, 4)}
-_CFG_UP = {1: (4, 1, 32, 1), 2: (4, 1, 32, 1), 3: (4, 1, 32, 1)}
+# M = 4..8 must use ks = 1: the chunked LDS staging synchronises the whole WG per chunk, so a
+# split-K wave would sit idle in every chunk outside its own slice.
+# unrl also caps the LDS chunk: KCH must be a multiple of LPR*16*UNRL and NB*KCH*2 <= 62 KB, so
+# at M = 8 (31744/8 = 3968 columns of budget) unrl 4 (step 4096) has no legal chunk and unrl 2 has
+# one of 2048.  A config that cannot chunk returns false and the caller drops to the stock chain.
+# M = 4..8 picks (1, 2, 64, 1) from the sweep in agents/moe_prep_hc/bench.log ("W8 mix_down
+# config sweep"): unrl 2 beats unrl 4 at every M (18.4 vs 19.7 us at M=4, 24.6 vs 26.2 at M=6) --
+# a smaller step means a larger legal LDS chunk and so fewer staging passes -- and ytile 2 is far
+# worse (29-118 us) because 336 rows / 2 leaves too few row groups to fill 120 CUs.
+_CFG_DOWN = {1: (2, 2, 64, 2), 2: (2, 2, 64, 2), 3: (1, 3, 64, 4),
+             4: (1, 2, 64, 1), 5: (1, 2, 64, 1), 6: (1, 2, 64, 1),
+             7: (1, 2, 64, 1), 8: (1, 2, 64, 1)}
+_CFG_UP = {m: (4, 1, 32, 1) for m in range(1, 9)}
 _CFG_DOWN_DEFAULT = (2, 2, 64, 2)
 _CFG_UP_DEFAULT = (4, 1, 32, 1)
 
+# W4 chain configs (lpr, mode, wpb), from the graph-timed sweep in agents/w4_loadtime:
+# mix_down N=336 is far too narrow for 4 rows per wave (84 tiles), so one output row per wave
+# (lpr 64) is the only geometry with enough blocks; mix_up needs lpr 16 because the gate-mix
+# epilogue wants ROWS == HC == 4 rows of the permuted weight in one wave.
+_CFG_W4_DOWN = (64, 1, 4)
+_CFG_W4_UP = (16, 0, 1)
+
 
 def _w8_dequant_into(ent: _W8Entry, out: torch.Tensor) -> None:
+    if ent.q4 is not None:
+        from vllm.model_executor.layers.gfx908_w8a16 import _ext_w4lt
+
+        _ext_w4lt().w4lt_dequant(ent.q4, ent.s4, out, 0, ent.gs4)
+        return
     if not _ext_w8().hc_w8_dequant(ent.q, ent.s, out, ent.gs):
         r, k = ent.q.shape
         if ent.gs == 0:
@@ -551,8 +745,8 @@ def _w8_dequant_into(ent: _W8Entry, out: torch.Tensor) -> None:
 
 
 def _w8_scratch_view(ent: _W8Entry) -> torch.Tensor:
-    n, k = ent.q.shape
-    dev = ent.q.device
+    n, k = ent.shape if ent.shape is not None else tuple(ent.q.shape)
+    dev = (ent.q if ent.q is not None else ent.q4).device
     idx = dev.index if dev.index is not None else torch.cuda.current_device()
     sc = _W8_SCRATCH.get(idx)
     if sc is None or sc.numel() < n * k:
@@ -584,8 +778,27 @@ def _hc_mix_local(
         if ed is None or eu is None:
             ed = eu = None
 
-    if ed is not None and M <= HC_FUSED_MAX_M and xn.is_contiguous():
-        ext = _ext_w8()
+    if ed is not None and ed.q4 is not None and M <= HC_W4_MAX_M and xn.is_contiguous():
+        # W4 chain, TWO launches: mix_down + silu writes the lora straight out as fp16 in the
+        # permuted activation layout the mix_up GEMV reads (and the inject columns compactly),
+        # and the bf16 -> fp16 cast of xn rides along with the down kernel's LDS staging.
+        from vllm.model_executor.layers.gfx908_w8a16 import _ext_w4lt
+
+        ext = _ext_w4lt()
+        lora = torch.empty((M, lora_rank), dtype=torch.float16, device=xn.device)
+        injection = torch.empty((M, hc_count), dtype=xn.dtype, device=xn.device)
+        y = torch.empty((M, hidden), dtype=xn.dtype, device=xn.device)
+        try:
+            ext.w4lt_hc_down(ed.q4, ed.s4, xn, lora, injection, ed.gs4, hc_count, lora_rank,
+                             *_CFG_W4_DOWN, 2)
+            ext.w4lt_hc_up(eu.q4, eu.s4, lora, xn, y, eu.gs4, hc_count, *_CFG_W4_UP)
+            return y, injection
+        except Exception as exc:  # unsupported shape -> the paths below
+            logger.warning_once("gfx908 HC W4: chain declined (%s)", exc)
+            del lora, injection, y
+
+    if ed is not None and ed.q is not None and M <= hc_fused_max_m() and xn.is_contiguous():
+        ext = _ext_w8() if M <= HC_FUSED_MAX_M else _ext_w8_big()
         cu = _cu_count()
         yt, un, lpr, ks = _CFG_DOWN.get(M, _CFG_DOWN_DEFAULT)
         down = torch.empty((M, ed.q.shape[0]), dtype=xn.dtype, device=xn.device)
@@ -617,7 +830,7 @@ def _hc_mix_local(
         gate_perm = torch.ops.vllm.rocm_unquantized_gemm_gfx908(lora, wu, None)
         return _gate_mix_perm(xn, gate_perm, hc_count, hidden), injection
 
-    if M <= HC_FUSED_MAX_M and xn.is_contiguous():
+    if M <= hc_fused_max_m() and xn.is_contiguous():
         ext = _ext()
         cu = _cu_count()
         w_up_perm = _w_up_perm(w_up, hc_count, hidden)

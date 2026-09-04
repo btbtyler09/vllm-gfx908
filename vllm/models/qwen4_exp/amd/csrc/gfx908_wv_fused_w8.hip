@@ -5,7 +5,7 @@
 //     W    int8  [Nrows, K]  contiguous, K % 16 == 0
 //     S    fp32  [Nrows]              (gs == 0, per output channel)
 //          fp32  [Nrows, K/gs]        (gs a power of two >= 16 dividing K and K/ks)
-//     X    bf16  [M, K]      unit inner stride (row stride a multiple of 8), 1 <= M <= 3
+//     X    bf16  [M, K]      unit inner stride (row stride a multiple of 8), 1 <= M <= 8
 //     out  bf16  [M, Nrows]  (epi 0/1)   or  [M, HD] (epi 2)
 //     xn   bf16  [M, HC*HD]  (epi 2; ignored otherwise - pass any bf16 tensor)
 //     epi  0 plain / 1 mix_down silu on rows < r / 2 mix_up gate-mix (needs ytile == hc)
@@ -13,12 +13,34 @@
 //   to this shape; nothing is launched in that case.
 //
 //   hc_w8_dequant(W int8 [R,K], S fp32, O bf16 [R,K], gs) -> bool
-//     RNE dequantization into a scratch buffer for the M > 3 fallback (bit-identical to
+//     RNE dequantization into a scratch buffer for the M > MAX_M fallback (bit-identical to
 //     (W.float() * S).to(torch.bfloat16)).
 #include <torch/extension.h>
 #include <c10/hip/HIPStream.h>
 #include "gfx908_wv_fused_w8_launch.cuh"
 
+// Two modules, not one.  Measured: building the NB = 4..8 kernels into the SAME code
+// object as the NB <= 3 ones costs +1.1..2.0 us per HC module at M = 1..3 even though
+// the NB <= 3 kernel binary is byte-identical -- the identical source with only nb1..3
+// linked in measures HEAD (-0.39/+0.06/-0.03 us).  So M > 3 lives in its own extension,
+// JIT-loaded only when VLLM_GFX908_HC_FUSED_MAX_M > 3 (agents/moe_prep_hc).
+#ifdef HW8_NB_BIG
+extern template bool hw8_launch_nb<4, 1>(const HW8Args&, int, int, int, int);
+extern template bool hw8_launch_nb<5, 1>(const HW8Args&, int, int, int, int);
+extern template bool hw8_launch_nb<6, 1>(const HW8Args&, int, int, int, int);
+extern template bool hw8_launch_nb<7, 1>(const HW8Args&, int, int, int, int);
+extern template bool hw8_launch_nb<8, 1>(const HW8Args&, int, int, int, int);
+extern template bool hw8_launch_nb<4, 2>(const HW8Args&, int, int, int, int);
+extern template bool hw8_launch_nb<5, 2>(const HW8Args&, int, int, int, int);
+extern template bool hw8_launch_nb<6, 2>(const HW8Args&, int, int, int, int);
+extern template bool hw8_launch_nb<7, 2>(const HW8Args&, int, int, int, int);
+extern template bool hw8_launch_nb<8, 2>(const HW8Args&, int, int, int, int);
+extern template bool hw8_launch_nb<4, 0>(const HW8Args&, int, int, int, int);
+extern template bool hw8_launch_nb<5, 0>(const HW8Args&, int, int, int, int);
+extern template bool hw8_launch_nb<6, 0>(const HW8Args&, int, int, int, int);
+extern template bool hw8_launch_nb<7, 0>(const HW8Args&, int, int, int, int);
+extern template bool hw8_launch_nb<8, 0>(const HW8Args&, int, int, int, int);
+#else
 extern template bool hw8_launch_nb<1, 1>(const HW8Args&, int, int, int, int);
 extern template bool hw8_launch_nb<2, 1>(const HW8Args&, int, int, int, int);
 extern template bool hw8_launch_nb<3, 1>(const HW8Args&, int, int, int, int);
@@ -28,6 +50,7 @@ extern template bool hw8_launch_nb<3, 2>(const HW8Args&, int, int, int, int);
 extern template bool hw8_launch_nb<1, 0>(const HW8Args&, int, int, int, int);
 extern template bool hw8_launch_nb<2, 0>(const HW8Args&, int, int, int, int);
 extern template bool hw8_launch_nb<3, 0>(const HW8Args&, int, int, int, int);
+#endif
 
 bool hc_w8_gemv(at::Tensor W, at::Tensor S, at::Tensor X, at::Tensor out, at::Tensor xn,
                 int64_t epi, int64_t gs, int64_t ytile, int64_t unrl, int64_t lpr, int64_t ks,
@@ -43,7 +66,11 @@ bool hc_w8_gemv(at::Tensor W, at::Tensor S, at::Tensor X, at::Tensor out, at::Te
                   out.size(0) == NB,
               "out must be contiguous bf16 [M, *]");
   TORCH_CHECK(K % 16 == 0, "K % 16 == 0");
-  TORCH_CHECK(NB >= 1 && NB <= 3, "M (batch) must be 1..3");
+  #ifdef HW8_NB_BIG
+  TORCH_CHECK(NB >= 4 && NB <= 8, "this module handles M 4..8");
+#else
+  TORCH_CHECK(NB >= 1 && NB <= 3, "this module handles M 1..3");
+#endif
   int G = 1, gshift = 0;
   if (gs == 0) {
     TORCH_CHECK(S.numel() == Nrows, "S must be [Nrows] for gs == 0");
@@ -80,24 +107,27 @@ bool hc_w8_gemv(at::Tensor W, at::Tensor S, at::Tensor X, at::Tensor out, at::Te
             (int)hc,
             (int)X.stride(0)};
   const int yt = (int)ytile, un = (int)unrl, lp = (int)lpr, k = (int)ks;
-  if (epi == 2) {
-    switch (NB) {
-      case 1: return hw8_launch_nb<1, 2>(a, yt, un, lp, k);
-      case 2: return hw8_launch_nb<2, 2>(a, yt, un, lp, k);
-      default: return hw8_launch_nb<3, 2>(a, yt, un, lp, k);
-    }
-  } else if (epi == 1) {
-    switch (NB) {
-      case 1: return hw8_launch_nb<1, 1>(a, yt, un, lp, k);
-      case 2: return hw8_launch_nb<2, 1>(a, yt, un, lp, k);
-      default: return hw8_launch_nb<3, 1>(a, yt, un, lp, k);
-    }
+#ifdef HW8_NB_BIG
+#define HW8_NB_SWITCH(EPIv)                                          \
+  switch (NB) {                                                      \
+    case 4: return hw8_launch_nb<4, EPIv>(a, yt, un, lp, k);          \
+    case 5: return hw8_launch_nb<5, EPIv>(a, yt, un, lp, k);          \
+    case 6: return hw8_launch_nb<6, EPIv>(a, yt, un, lp, k);          \
+    case 7: return hw8_launch_nb<7, EPIv>(a, yt, un, lp, k);          \
+    default: return hw8_launch_nb<8, EPIv>(a, yt, un, lp, k);         \
   }
-  switch (NB) {
-    case 1: return hw8_launch_nb<1, 0>(a, yt, un, lp, k);
-    case 2: return hw8_launch_nb<2, 0>(a, yt, un, lp, k);
-    default: return hw8_launch_nb<3, 0>(a, yt, un, lp, k);
+#else
+#define HW8_NB_SWITCH(EPIv)                                          \
+  switch (NB) {                                                      \
+    case 1: return hw8_launch_nb<1, EPIv>(a, yt, un, lp, k);          \
+    case 2: return hw8_launch_nb<2, EPIv>(a, yt, un, lp, k);          \
+    default: return hw8_launch_nb<3, EPIv>(a, yt, un, lp, k);         \
   }
+#endif
+  if (epi == 2) { HW8_NB_SWITCH(2) }
+  if (epi == 1) { HW8_NB_SWITCH(1) }
+  HW8_NB_SWITCH(0)
+#undef HW8_NB_SWITCH
 }
 
 // ---------------------------------------------------------------------------

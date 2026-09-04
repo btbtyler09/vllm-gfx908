@@ -310,6 +310,92 @@ __global__ void __launch_bounds__(256) w4f16_slab_lds_kernel(
 }
 
 // ---------------------------------------------------------------------------------------------
+// bf16 -> fp16 cast + per-8 permutation of ONE group of 32 (64 B) -- exactly the arithmetic of
+// cast_f16_kernel<0, 0>, factored out so the fused-prep kernel below is bit-identical to it.
+__device__ __forceinline__ void cast_group(const uint4* __restrict__ src, uint4 o[4]) {
+  uint4 v[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) v[i] = src[i];
+  // one packed dword-quad at a time (8 fp16 in flight) rather than 32 fp32 + 32 fp16: same values,
+  // same order, ~20 fewer VGPRs live next to the weight registers.
+#pragma unroll
+  for (int b = 0; b < 4; ++b) {
+    const uint32_t dw[4] = {v[b].x, v[b].y, v[b].z, v[b].w};
+    _Float16 h[8];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      h[2 * j] = (_Float16)__uint_as_float(dw[j] << 16);
+      h[2 * j + 1] = (_Float16)__uint_as_float(dw[j] & 0xFFFF0000u);
+    }
+    uint32_t p[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      union { _Float16 hh; uint16_t u; } a, c;
+      a.hh = h[j]; c.hh = h[j + 4];
+      p[j] = (uint32_t)a.u | ((uint32_t)c.u << 16);
+    }
+    o[b] = make_uint4(p[0], p[1], p[2], p[3]);
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// D5-slab-LDS with the ACTIVATION PREP FOLDED IN (VLLM_GFX908_MOE_PREP_FOLD=1): the block reads
+// the pair's activation as raw bf16 and does the fp16 cast + per-8 permutation while staging it in
+// LDS, so the separate cast_f16 launch disappears.  Same geometry / block-uniformity requirements
+// as w4f16_slab_lds_kernel ((N / ROWS) % 4 == 0), and bit-identical to cast_f16 + gemv_slab_f16
+// (mode 1) because the staged bytes and the read order are the same.
+template <int K, int LPR>
+__global__ void __launch_bounds__(256) w4f16_slab_prep_kernel(
+    const uint32_t* __restrict__ w, const uint16_t* __restrict__ s, const uint32_t* __restrict__ x,
+    const int* __restrict__ row_tok, const int* __restrict__ row_exp, float* __restrict__ out,
+    int N, int P, int E, long stride_we, long stride_se,
+    const uint32_t* __restrict__ w_extra, const uint16_t* __restrict__ s_extra) {
+  constexpr int ROWS = 64 / LPR, G = K / 32, GPL = (G + LPR - 1) / LPR;
+  __shared__ __align__(16) uint16_t xl[K];
+  const int lane = threadIdx.x & 63, r = lane / LPR, l = lane % LPR, wv = threadIdx.x >> 6;
+  const int tiles_per_p = N / ROWS;
+  const int tile0 = __builtin_amdgcn_readfirstlane(blockIdx.x * 4);
+  const int p = tile0 / tiles_per_p;
+  const int n = ((tile0 + wv) % tiles_per_p) * ROWS + r;
+  const int e = row_exp[p], t = row_tok[p];
+  const uint32_t* wb;
+  const uint16_t* sb;
+  if (!pick_expert(e, E, w, s, stride_we, stride_se, w_extra, s_extra, wb, sb)) {  // block-uniform
+    if (l == LPR - 1) out[(long)p * N + n] = 0.f;
+    return;
+  }
+  // Weight loads are issued AFTER the staging barrier: holding q[GPL] + sc[GPL] live across
+  // the cast code costs a wave of occupancy (see the int8 kernel's note).
+  const uint4* xg = reinterpret_cast<const uint4*>(x) + (long)t * (K / 8);   // K bf16 = K/8 uint4
+  for (int g = threadIdx.x; g < G; g += 256) {
+    uint4 o[4];
+    cast_group(xg + (long)g * 4, o);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) reinterpret_cast<uint4*>(xl)[4 * g + i] = o[i];
+  }
+  __syncthreads();
+  const uint4* wp = reinterpret_cast<const uint4*>(wb + (long)n * (K / 8)) + l;
+  const uint16_t* sp = sb + (long)n * G + l;
+  uint4 q[GPL];
+  uint32_t sc[GPL];
+#pragma unroll
+  for (int j = 0; j < GPL; ++j) {
+    if (G % LPR == 0 || l + LPR * j < G) { q[j] = wp[LPR * j]; sc[j] = sp[LPR * j]; }
+    else { q[j] = make_uint4(0, 0, 0, 0); sc[j] = 0; }
+  }
+  __builtin_amdgcn_sched_barrier(0);
+  float acc = 0.f;
+#pragma unroll
+  for (int j = 0; j < GPL; ++j) {
+    const int g = l + LPR * j;
+    if (G % LPR == 0 || g < G)
+      acc = fmaf(bf2f(sc[j]), group_dot(q[j], reinterpret_cast<const uint4*>(xl) + 4 * g), acc);
+  }
+  acc = reduce_lpr<LPR>(acc);
+  if (l == LPR - 1) out[(long)p * N + n] = acc;
+}
+
+// ---------------------------------------------------------------------------------------------
 // D5-rowlane (D2 geometry): one thread per output row, for small K (K=160 -> 5 groups, 320 B of
 // fp16 activation per pair).  One pair per wave, so the activation is wave-uniform (SGPRs).
 template <int K, int WPB>
@@ -495,6 +581,47 @@ void gemv_slab_f16(at::Tensor w, at::Tensor s, at::Tensor xh, at::Tensor row_tok
   TORCH_CHECK(false, "gemv_slab_f16: unsupported K/lpr/mode/wpb ", K, "/", lpr, "/", mode, "/", wpb);
 }
 
+template <int K, int LPR>
+static void launch_slab_prep(const at::Tensor& w, const at::Tensor& s, const at::Tensor& x,
+                             const at::Tensor& row_tok, const at::Tensor& row_exp, at::Tensor& out,
+                             const at::Tensor& w_extra, const at::Tensor& s_extra) {
+  constexpr int ROWS = 64 / LPR;
+  const int P = row_tok.numel(), N = w.size(1), E = w.size(0);
+  TORCH_CHECK(N % ROWS == 0, "gemv_slab_f16_prep: N must be a multiple of ", ROWS);
+  TORCH_CHECK((N / ROWS) % 4 == 0, "gemv_slab_f16_prep: (N/ROWS) % 4 != 0");
+  check_extra(w_extra, s_extra, N, K);
+  const long tiles = (long)P * (N / ROWS);
+  auto stream = c10::hip::getCurrentHIPStream().stream();
+  if (tiles > 0) {
+    w4f16_slab_prep_kernel<K, LPR><<<(tiles + 3) / 4, 256, 0, stream>>>(
+        reinterpret_cast<const uint32_t*>(w.data_ptr()), reinterpret_cast<const uint16_t*>(s.data_ptr()),
+        reinterpret_cast<const uint32_t*>(x.data_ptr()),
+        row_tok.data_ptr<int32_t>(), row_exp.data_ptr<int32_t>(), out.data_ptr<float>(), N, P, E,
+        (long)N * (K / 8), (long)N * (K / 32),
+        w_extra.numel() ? reinterpret_cast<const uint32_t*>(w_extra.data_ptr()) : nullptr,
+        w_extra.numel() ? reinterpret_cast<const uint16_t*>(s_extra.data_ptr()) : nullptr);
+  }
+}
+
+// D5 slab with the bf16 -> fp16 cast + permutation folded into the LDS staging (no cast_f16
+// launch).  x is the raw bf16 activation [R, K]; everything else matches gemv_slab_f16 (mode 1).
+void gemv_slab_f16_prep(at::Tensor w, at::Tensor s, at::Tensor x, at::Tensor row_tok,
+                        at::Tensor row_exp, at::Tensor out, int64_t lpr, at::Tensor w_extra,
+                        at::Tensor s_extra) {
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.is_contiguous() && x.dim() == 2,
+              "gemv_slab_f16_prep: x must be contiguous bf16 [R, K]");
+  const int K = x.size(1);
+  check_gemv(w, s, row_tok, row_exp, out, K);
+  TORCH_CHECK((w.scalar_type() == at::kInt && w.size(2) * 8 == K) ||
+                  (w.scalar_type() == at::kByte && w.size(2) * 2 == K),
+              "gemv_slab_f16_prep: w K mismatch");
+#define SLABP_CASE(KK, L) \
+  if (K == KK && lpr == L) { launch_slab_prep<KK, L>(w, s, x, row_tok, row_exp, out, w_extra, s_extra); return; }
+  SLABP_CASE(2560, 16) SLABP_CASE(1536, 16)
+#undef SLABP_CASE
+  TORCH_CHECK(false, "gemv_slab_f16_prep: unsupported K/lpr ", K, "/", lpr);
+}
+
 // D5 rowlane. K == 160 only; N % 64 == 0; out fp32 [P, N]; wpb in {1, 4}.
 void gemv_rowlane_f16(at::Tensor w, at::Tensor s, at::Tensor xh, at::Tensor row_tok,
                       at::Tensor row_exp, at::Tensor out, int64_t wpb, at::Tensor w_extra,
@@ -535,6 +662,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "cast_f16 + M extra blocks: row_exp/wcomb [M,topk+1] from topk_ids/topk_w and sigmoid(x.wg)");
   m.def("gemv_slab_f16", &gemv_slab_f16,
         "w, s, xh, row_tok, row_exp, out fp32 [P,N], lpr(16), mode(0|1), wpb(1|4), w_extra, s_extra");
+  m.def("gemv_slab_f16_prep", &gemv_slab_f16_prep,
+        "w, s, x bf16 [R,K], row_tok, row_exp, out fp32 [P,N], lpr(16), w_extra, s_extra "
+        "(bf16->fp16 cast + permute folded into the LDS staging)");
   m.def("gemv_rowlane_f16", &gemv_rowlane_f16,
         "w, s, xh, row_tok, row_exp, out fp32 [P,N], wpb(1|4), w_extra, s_extra  (K=160)");
 }

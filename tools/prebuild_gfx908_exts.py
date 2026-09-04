@@ -27,7 +27,7 @@ failed = []
 for name in MODULES:
     try:
         mod = importlib.import_module(name)
-        for fn in ("_ext", "_ext_f16", "_ext_w8"):
+        for fn in ("_ext", "_ext_f16", "_ext_w8", "_ext_w8_big", "_ext_w4lt"):
             if hasattr(mod, fn):
                 ext = getattr(mod, fn)()
                 print(f"built {name}.{fn}: {getattr(ext, '__file__', ext)}")

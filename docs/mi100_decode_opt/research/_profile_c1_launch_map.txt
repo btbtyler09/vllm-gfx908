@@ -1,0 +1,57 @@
+steps>1500 kernels: 60; using last: 1896 kernels, span 16.29 ms, busy 16.21 ms
+
+== kernels by total time (count, mean us, total ms) ==
+  365    11.9   4.34  wvSplitK_hf_sml_
+   96    23.9   2.30  w4gemv3_kernel
+   48    23.5   1.13  vllm::moe::topkGating
+   96    10.3   0.99  vllm::cross_device_reduce_1stage
+  120     8.0   0.96  triton_w4a16_gemv_partial_kernel.kd
+  187     4.0   0.74  __amd_rocclr_copyBuffer.kd
+   95     6.4   0.61  _hc_combine_norm_kernel.kd
+   36    14.2   0.51  fused_recurrent_gated_delta_rule_packed_decode_kernel.kd
+   48     9.1   0.43  _reduce_silu_mul_kernel.kd
+   97     4.3   0.41  _hc_gate_mix_kernel.kd
+   97     3.8   0.37  _hc_silu_kernel.kd
+   48     7.1   0.34  _reduce_gate_kernel.kd
+   53     4.3   0.23  at::native::elementwise_kernel_manual_unroll
+   55     4.1   0.22  at::native::vectorized_elementwise_kernel
+   12    16.4   0.20  _qsa_sparse_paged_gqa_splitk_kernel.kd
+   13    14.7   0.19  triton_poi_fused_0.kd
+   36     4.4   0.16  _causal_conv1d_update_kernel.kd
+   36     3.9   0.14  _store_qsa_rows_kernel.kd
+   12    11.7   0.14  triton_poi_fused_6.kd
+   36     3.8   0.14  triton_poi_fused__to_copy_add_mean_mul_pow_rocm_unquantized_
+   12    11.1   0.13  _qsa_merge_splitk_kernel.kd
+   23     5.6   0.13  triton_per_fused__to_copy_add_mean_mul_pow_rsqrt_sigmoid_vie
+   24     4.8   0.12  triton_w4a16_splitk_reduce_kernel.kd
+   16     6.8   0.11  at::native::index_elementwise_kernel
+   26     4.1   0.11  _grouped_gemma_rmsnorm_kernel.kd
+   24     3.9   0.09  _triton_mrope_forward.kd
+   12     7.3   0.09  vllm::reshape_and_cache_flash_kernel
+   12     7.3   0.09  _compress_qsa_groups_kernel.kd
+   12     7.2   0.09  _qsa_mqa_paged_kernel.kd
+   23     3.7   0.09  triton_poi_fused_add_2.kd
+   13     6.3   0.08  triton_per_fused_1.kd
+    1    57.8   0.06  ncclDevKernel_Generic_2
+   13     3.7   0.05  triton_poi_fused_add_3.kd
+   12     4.0   0.05  vllm::topKPerRowDecode
+   12     4.0   0.05  at::native::vectorized_gather_kernel
+   12     4.0   0.05  triton_poi_fused_mul_sigmoid_view_0.kd
+   12     3.9   0.05  _expand_qsa_indices_kernel.kd
+   12     3.9   0.05  triton_red_fused_5.kd
+   12     3.9   0.05  triton_poi_fused_4.kd
+   12     3.7   0.04  triton_poi_fused_add_1.kd
+    1    16.3   0.02  at::native::reduce_kernel
+    2     7.0   0.01  at::native::
+    1    12.2   0.01  triton_red_fused__to_copy_abs_add_clamp_min_div_mean_mul_pow
+    2     5.7   0.01  at::native::_scatter_gather_elementwise_kernel
+    1    10.4   0.01  _gumbel_sample_kernel.kd
+
+kernels with mean <12us: 1688 launches, 11.80 ms
+inter-kernel gaps: sum 0.08 ms, mean 0.04 us, >20us: 1 (sum 0.06 ms)
+
+NOTE (2026-09-03): the torch profiler inflates every kernel by ~2.4 us on gfx908 (tiny kernels read 3.75 us
+but really cost 1.33 us in a graph). Un-profiled c=1 step is 16.7 ms: ~14 ms GPU + ~2.5 ms host chain
+(being removed by the PLE zero-copy path). wvSplitK (bf16 GEMMs) and w4gemv (MoE) numbers are ~real.
+Model: Qwen3.8-Flash-Next (qwen4_exp), 48 layers (36 GDN + 12 QSA), 512 experts top-10 + shared expert,
+hidden 2560, hyper-connections hc=4, TP4 on 4x MI100, W4 GPTQ GS32 body, bf16 GDN/HC/router weights.
