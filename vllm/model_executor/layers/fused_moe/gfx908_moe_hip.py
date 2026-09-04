@@ -21,6 +21,11 @@ import os
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.gfx908_w4a8 import (
+    moe_w4a8,
+    moe_w4a8_applies,
+    w4a8_enabled,
+)
 from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
@@ -168,6 +173,13 @@ def gfx908_moe_hip(
     row_token, row_self = _row_index(M, topk, dev)
     w1_i = w1.view(torch.int32)
     w2_i = w2.view(torch.int32)
+
+    if w4a8_enabled() and moe_w4a8_applies(K, N1, group_size, hidden_states.dtype):
+        # VLLM_GFX908_W4A8=1: int8-activation dot4 GEMVs, no split-K (gfx908_w4a8.py)
+        return moe_w4a8(
+            output, hidden_states, w1_i, w2_i, w1_scale, w2_scale, topk_weights,
+            row_token, row_self, row_expert, mul_routed_weight,
+        )
 
     part1 = torch.empty((sk1, P, N1), dtype=torch.float32, device=dev)
     ext.w4gemv(hidden_states, w1_i, w1_scale, row_token, row_expert, part1, group_size, 1, bn1)

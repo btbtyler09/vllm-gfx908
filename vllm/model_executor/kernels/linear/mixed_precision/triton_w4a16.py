@@ -277,6 +277,18 @@ def _gfx908_gemv_config(M, K, N, k_tiles):
 def _gfx908_w4a16_gemv(a, b_q, scales, group_size, zp_bias):
     M, K = a.shape
     N = b_q.shape[1] * 8
+    if M <= 8 and group_size == 32 and zp_bias == 8:
+        # VLLM_GFX908_W4A8=1: int8-activation dot4 GEMV for K in {2560, 1536}
+        # (fused_moe/gfx908_w4a8.py); None -> not applicable / weight not yet repacked
+        from vllm.model_executor.layers.fused_moe.gfx908_w4a8 import (
+            dense_w4a8_gemv,
+            w4a8_enabled,
+        )
+
+        if w4a8_enabled():
+            c = dense_w4a8_gemv(a, b_q, scales)
+            if c is not None:
+                return c
     BLOCK_K = min(32, group_size)
     BLOCK_M = 1 if M == 1 else 16
     k_tiles = triton.cdiv(K, BLOCK_K)
