@@ -125,9 +125,18 @@ class GatedResidual(nn.Module):
         )
         self._gfx908_hc_fused = False
         if use_combine:
-            from .gfx908_hc_fused import hc_fused_enabled
+            from .gfx908_hc_fused import (
+                hc_fused_enabled,
+                hc_w8_enabled,
+                install_hc_w8_prepare,
+            )
 
             self._gfx908_hc_fused = hc_fused_enabled()
+            if self._gfx908_hc_fused and hc_w8_enabled():
+                # Wraps the two mix Linears' process_weights_after_loading so the
+                # int8 copies are built (and the bf16 masters released) at load
+                # time, before torch.compile and before any cudagraph capture.
+                install_hc_w8_prepare(self)
 
     def mix(
         self, hidden_states: torch.Tensor

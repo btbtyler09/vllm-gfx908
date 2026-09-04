@@ -1529,6 +1529,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)
+            _gfx908_step_begin(self)
             self.update_requests(scheduler_output)
             self.block_tables.apply_staged_writes()
             if scheduler_output.total_num_scheduled_tokens == 0:
@@ -1980,6 +1981,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         model_runner_output.kv_connector_output = kv_connector_output
         model_runner_output.ec_connector_output = ec_connector_output
 
+        _gfx908_step_end(self)
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
@@ -2143,3 +2145,68 @@ def sort_batch_req_ids(
         num,
     )
     return sorted(num_tokens_per_req, key=key)
+
+# ---------------------------------------------------------------------------
+# gfx908 step timing (VLLM_GFX908_STEP_TIMING=1): GPU stream time from the
+# start of execute_model to the end of sampling (CUDA events, queried lazily,
+# never synchronized) and host wall time between consecutive steps, logged
+# every 200 steps. Ground truth for "is the step GPU-bound", which the torch
+# profiler cannot give on this GPU (it inflates tiny kernels ~3x).
+# ---------------------------------------------------------------------------
+import collections as _collections
+import os as _os
+import time as _time
+
+_GFX908_STEP_TIMING = _os.environ.get("VLLM_GFX908_STEP_TIMING", "0") == "1"
+
+
+def _gfx908_step_begin(runner) -> None:
+    if not _GFX908_STEP_TIMING:
+        return
+    st = getattr(runner, "_gfx908_st", None)
+    if st is None:
+        st = runner._gfx908_st = {
+            "pending": _collections.deque(), "gpu_ms": 0.0, "wall_ms": 0.0,
+            "n": 0, "last_wall": None, "cur": None, "hist": _collections.Counter(),
+        }
+    now = _time.perf_counter()
+    wall = (now - st["last_wall"]) * 1000.0 if st["last_wall"] is not None else None
+    st["last_wall"] = now
+    ev = torch.cuda.Event(enable_timing=True)
+    ev.record()
+    st["cur"] = (ev, wall)
+
+
+def _gfx908_step_end(runner) -> None:
+    if not _GFX908_STEP_TIMING:
+        return
+    st = getattr(runner, "_gfx908_st", None)
+    if st is None or st["cur"] is None:
+        return
+    ev_s, wall = st["cur"]
+    st["cur"] = None
+    ev_e = torch.cuda.Event(enable_timing=True)
+    ev_e.record()
+    st["pending"].append((ev_s, ev_e, wall))
+    # Drain finished steps without blocking.
+    while st["pending"] and st["pending"][0][1].query():
+        s, e, w = st["pending"].popleft()
+        if w is None or w > 1000.0:  # first step / idle gap
+            continue
+        g = s.elapsed_time(e)
+        st["gpu_ms"] += g
+        st["wall_ms"] += w
+        st["n"] += 1
+        st["hist"][round(w - g, 1)] += 1
+        if st["n"] % 200 == 0:
+            n = st["n"]
+            common = st["hist"].most_common(3)
+            logger.info(
+                "gfx908 step timing: %d steps, GPU %.2f ms/step, wall %.2f ms/step, "
+                "host gap %.2f ms/step (mode %s)",
+                n, st["gpu_ms"] / n, st["wall_ms"] / n,
+                (st["wall_ms"] - st["gpu_ms"]) / n, common,
+            )
+            st["gpu_ms"] = st["wall_ms"] = 0.0
+            st["n"] = 0
+            st["hist"].clear()
