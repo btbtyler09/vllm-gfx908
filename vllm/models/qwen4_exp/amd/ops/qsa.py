@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
@@ -1201,11 +1202,535 @@ def qsa_compress_groups_with_ratio(
     return pooled, first_positions
 
 
+@triton.jit
+def _qsa_prefill_selection_words_kernel(
+    indices_ptr,
+    words_ptr,
+    stride_indices_row,
+    stride_words_row,
+    num_rows,
+    num_entries,
+    num_words,
+    COMPRESS_RATIO: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+) -> None:
+    """Pack the expanded QSA selection into a per-row compressed-block bitmap.
+
+    ``logical_indices`` lists ``token_topk + compress_ratio - 1`` token ids per
+    query: ``compress_ratio`` consecutive columns per selected compressed block
+    followed by the ragged tail of the open group.  Both runs start on a column
+    that is a multiple of ``compress_ratio`` (``expanded_count`` is
+    ``complete_blocks * compress_ratio``), so reading every ``compress_ratio``-th
+    column visits each selected block exactly once.
+
+    A block is marked; the attention kernel re-applies the causal bound, which
+    is what clips the open block back to the ragged tail.  The scorer only ever
+    makes complete causal blocks visible (``columns < visible`` in
+    ``_qsa_mqa_paged_kernel``), so block-granular marking plus a causal mask
+    reproduces the expanded token set exactly.
+    """
+
+    row = tl.program_id(0)
+    entries = tl.program_id(1) * BLOCK_E + tl.arange(0, BLOCK_E)
+    valid = (row < num_rows) & (entries < num_entries)
+    token = tl.load(
+        indices_ptr + row * stride_indices_row + entries * COMPRESS_RATIO,
+        mask=valid,
+        other=-1,
+    )
+    valid &= token >= 0
+    block = token // COMPRESS_RATIO
+    word = block // 32
+    bit = block % 32
+    valid &= word < num_words
+    ones = tl.full(bit.shape, 1, dtype=tl.int32)
+    tl.atomic_or(
+        words_ptr + row * stride_words_row + word,
+        ones << bit,
+        mask=valid,
+    )
+
+
+@triton.jit
+def _qsa_prefill_block_mask_kernel(
+    indices_ptr,
+    mask_ptr,
+    stride_indices_row,
+    stride_mask_row,
+    num_rows,
+    num_entries,
+    num_blocks,
+    COMPRESS_RATIO: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+) -> None:
+    """Scatter the selected compressed blocks of each row into a byte mask.
+
+    The ``compress_ratio`` block ids a row selects are distinct, so every store
+    lands on its own byte and no atomic is needed -- the atomic-``or`` variant
+    of this serialises ~8-way inside a wave because one program's lanes all
+    target the same row's handful of bitmap words.
+    """
+
+    row = tl.program_id(0)
+    entries = tl.program_id(1) * BLOCK_E + tl.arange(0, BLOCK_E)
+    valid = (row < num_rows) & (entries < num_entries)
+    token = tl.load(
+        indices_ptr + row * stride_indices_row + entries * COMPRESS_RATIO,
+        mask=valid,
+        other=-1,
+    )
+    block = token // COMPRESS_RATIO
+    valid &= (token >= 0) & (block < num_blocks)
+    tl.store(
+        mask_ptr + row * stride_mask_row + block,
+        tl.full(block.shape, 1, dtype=tl.int8),
+        mask=valid,
+    )
+
+
+@triton.jit
+def _qsa_prefill_pack_mask_kernel(
+    mask_ptr,
+    words_ptr,
+    stride_mask_row,
+    stride_words_row,
+    num_rows,
+    num_blocks,
+    num_words,
+    BLOCK_W: tl.constexpr,
+) -> None:
+    """Pack the byte mask into 32-blocks-per-word bitmap words.
+
+    The attention kernel then needs one ``int32`` per query row per key tile
+    instead of a ``BLOCK_M x BLOCK_N`` byte gather.
+    """
+
+    row = tl.program_id(0)
+    words = tl.program_id(1) * BLOCK_W + tl.arange(0, BLOCK_W)
+    lanes = tl.arange(0, 32)
+    block = words[:, None] * 32 + lanes[None, :]
+    valid = (row < num_rows) & (words[:, None] < num_words) & (block < num_blocks)
+    bits = tl.load(mask_ptr + row * stride_mask_row + block, mask=valid, other=0)
+    ones = tl.full(block.shape, 1, dtype=tl.int32)
+    packed = tl.sum(tl.where(bits != 0, ones << lanes[None, :], 0), axis=1)
+    tl.store(
+        words_ptr + row * stride_words_row + words,
+        packed,
+        mask=(row < num_rows) & (words < num_words),
+    )
+
+
+@triton.jit
+def _qsa_prefill_tile_starts_kernel(
+    query_start_loc_ptr,
+    tile_starts_ptr,
+    num_requests,
+    BLOCK_Q: tl.constexpr,
+    NUM_REQ_POW2: tl.constexpr,
+) -> None:
+    """Exclusive prefix sum of per-request query-tile counts (one program).
+
+    ``tile_starts[r]`` is the first tile id of request ``r`` and
+    ``tile_starts[num_requests]`` the total tile count, so the attention kernel
+    can map a flat tile id back to its request without a host sync.
+    """
+
+    request = tl.arange(0, NUM_REQ_POW2)
+    in_range = request < num_requests
+    start = tl.load(query_start_loc_ptr + request, mask=in_range, other=0)
+    end = tl.load(query_start_loc_ptr + request + 1, mask=in_range, other=0)
+    query_len = tl.where(in_range, end - start, 0)
+    tiles = (query_len + BLOCK_Q - 1) // BLOCK_Q
+    exclusive = tl.cumsum(tiles, axis=0) - tiles
+    tl.store(tile_starts_ptr + request, exclusive, mask=in_range)
+    tl.store(tile_starts_ptr + num_requests, tl.sum(tiles, axis=0))
+
+
+@triton.jit
+def _qsa_prefill_tiled_kernel(
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    sel_words_ptr,
+    query_positions_ptr,
+    query_start_loc_ptr,
+    tile_starts_ptr,
+    block_table_ptr,
+    output_ptr,
+    stride_q_row,
+    stride_q_head,
+    stride_k_block,
+    stride_k_token,
+    stride_k_head,
+    stride_v_block,
+    stride_v_token,
+    stride_v_head,
+    stride_words_row,
+    stride_table_req,
+    stride_output_row,
+    stride_output_head,
+    num_cache_blocks,
+    num_requests,
+    PAGE_SIZE: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    NUM_REQ_POW2: tl.constexpr,
+) -> None:
+    """Query-tiled sparse GQA for prefill-shaped batches.
+
+    One program owns ``BLOCK_Q`` consecutive queries of one request across all
+    ``GROUP_SIZE`` query heads of one KV head, so the MFMA M dimension is
+    ``BLOCK_Q * GROUP_SIZE`` instead of the 6-of-16 padding the per-token
+    kernel feeds it.  The tile walks its shared causal key range once (a
+    contiguous token run, so the page gather is two block-table entries rather
+    than a 2051-wide scatter) and applies the per-row selection as a bitmap
+    test; a key tile no row selects is skipped entirely.
+    """
+
+    tile = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    total_tiles = tl.load(tile_starts_ptr + num_requests)
+    if tile >= total_tiles:
+        return
+
+    requests = tl.arange(0, NUM_REQ_POW2)
+    in_range = requests < num_requests
+    starts = tl.load(tile_starts_ptr + requests, mask=in_range, other=0x7FFFFFFF)
+    request = tl.sum(((starts <= tile) & in_range).to(tl.int32), axis=0) - 1
+    request_first_tile = tl.load(tile_starts_ptr + request)
+    row_begin = tl.load(query_start_loc_ptr + request)
+    row_end = tl.load(query_start_loc_ptr + request + 1)
+    row_base = row_begin + (tile - request_first_tile) * BLOCK_Q
+
+    lanes = tl.arange(0, BLOCK_M)
+    query_index = lanes // GROUP_SIZE
+    head_index = lanes % GROUP_SIZE
+    row = row_base + query_index
+    row_valid = (query_index < BLOCK_Q) & (row < row_end)
+    safe_row = tl.where(row_valid, row, row_begin)
+    positions = tl.load(query_positions_ptr + safe_row, mask=row_valid, other=-1)
+    last_position = tl.max(positions, axis=0)
+
+    dim_offsets = tl.arange(0, HEAD_DIM)
+    column_offsets = tl.arange(0, BLOCK_N)
+    first_head = kv_head * GROUP_SIZE
+    query = tl.load(
+        q_ptr
+        + safe_row[:, None] * stride_q_row
+        + (first_head + head_index)[:, None] * stride_q_head
+        + dim_offsets[None, :],
+        mask=row_valid[:, None],
+        other=0.0,
+    )
+
+    max_value = tl.full((BLOCK_M,), -1.0e20, dtype=tl.float32)
+    normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+    softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
+
+    num_tiles = (last_position + BLOCK_N) // BLOCK_N
+    for tile_id in range(0, num_tiles):
+        tokens = tile_id * BLOCK_N + column_offsets
+        blocks = tokens // COMPRESS_RATIO
+        # BLOCK_N // COMPRESS_RATIO divides 32, so one bitmap word per row
+        # covers the whole key tile and the load stays wave-uniform in N.
+        word = tile_id * (BLOCK_N // COMPRESS_RATIO) // 32
+        bits = blocks - word * 32
+        words = tl.load(
+            sel_words_ptr + safe_row * stride_words_row + word,
+            mask=row_valid,
+            other=0,
+        )
+        selected = ((words[:, None] >> bits[None, :]) & 1) != 0
+        valid = row_valid[:, None] & (tokens[None, :] <= positions[:, None]) & selected
+        if tl.max(valid.to(tl.int32)) > 0:
+            logical_page = tokens // PAGE_SIZE
+            page_offset = tokens % PAGE_SIZE
+            page_valid = logical_page < PAGE_TABLE_WIDTH
+            physical_page = tl.load(
+                block_table_ptr
+                + request * stride_table_req
+                + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
+                mask=page_valid,
+                other=-1,
+            )
+            page_valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
+            # physical_page * block stride can overflow int32 for large caches.
+            safe_page = tl.maximum(physical_page, 0).to(tl.int64)
+            keys = tl.load(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + dim_offsets[:, None],
+                mask=page_valid[None, :],
+                other=0.0,
+            )
+            values = tl.load(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + dim_offsets[None, :],
+                mask=page_valid[:, None],
+                other=0.0,
+            )
+            valid &= page_valid[None, :]
+            scores = tl.dot(query, keys)
+            # Scaling scores avoids re-quantizing a scaled query to BF16.
+            scores *= softmax_scale_log2
+            scores = tl.where(valid, scores, -1.0e20)
+            next_max = tl.maximum(max_value, tl.max(scores, axis=1))
+            alpha = tl.math.exp2(max_value - next_max)
+            probabilities = tl.where(
+                valid, tl.math.exp2(scores - next_max[:, None]), 0.0
+            )
+            accumulator = tl.dot(
+                probabilities.to(values.dtype),
+                values,
+                acc=accumulator * alpha[:, None],
+            )
+            normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
+            max_value = next_max
+
+    has_values = normalizer > 0
+    normalized_output = tl.where(
+        has_values[:, None],
+        accumulator / tl.maximum(normalizer[:, None], 1.0e-20),
+        0.0,
+    )
+    tl.store(
+        output_ptr
+        + safe_row[:, None] * stride_output_row
+        + (first_head + head_index)[:, None] * stride_output_head
+        + dim_offsets[None, :],
+        normalized_output,
+        mask=row_valid[:, None],
+    )
+
+def _qsa_tiled_env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
+def qsa_prefill_tiled_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    logical_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    query_positions: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    max_seq_len: int,
+    compress_ratio: int,
+    out: torch.Tensor,
+    selection_words: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Query-tiled sparse GQA over the paged BF16 K/V cache (prefill shapes).
+
+    Computes exactly what ``qsa_sparse_paged_attention`` computes for the same
+    ``logical_indices`` (up to fp32 summation order), but tiles the query
+    dimension: ``BLOCK_Q`` consecutive queries of one request share one pass
+    over their common causal key range, with the per-query selection applied as
+    a compressed-block bitmap.  That removes the per-token 2051-wide index
+    gather and the ``6``-of-``16`` MFMA row padding of the decode-shaped kernel.
+
+    Requires a prefill-shaped batch: ``query_positions`` must be the logical
+    position of every row and ``query_start_loc`` the per-request row offsets.
+    ``max_seq_len`` bounds the batch's contexts and sizes the bitmap.
+    """
+
+    if not q.is_cuda or not HAS_TRITON:
+        raise RuntimeError("paged QSA tiled attention requires a GPU and Triton")
+    if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
+        raise ValueError("QSA tiled attention received invalid Q/K/V shapes")
+    if logical_indices.ndim != 2 or logical_indices.shape[0] != q.shape[0]:
+        raise ValueError("QSA indices must have one row per query")
+    if query_positions.shape != (q.shape[0],) or block_table.ndim != 2:
+        raise ValueError("QSA tiled attention metadata has invalid shapes")
+    if query_start_loc.ndim != 1 or query_start_loc.shape[0] < 2:
+        raise ValueError("QSA tiled attention needs a query_start_loc")
+    if not all(k_cache.shape[:3]) or not all(block_table.shape):
+        raise ValueError("QSA tiled attention cache and block table must be nonempty")
+    if q.shape[2] != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
+        raise ValueError("QSA tiled attention requires valid grouped-query heads")
+    if compress_ratio < 1 or logical_indices.shape[1] < compress_ratio:
+        raise ValueError("QSA tiled attention requires a valid compression ratio")
+    if max_seq_len <= 0:
+        raise ValueError("QSA tiled attention requires a positive max_seq_len")
+    head_dim = q.shape[2]
+    assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
+    assert q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
+    assert logical_indices.dtype == block_table.dtype == torch.int32
+    assert q.device == k_cache.device == v_cache.device
+    assert q.stride(2) == k_cache.stride(3) == v_cache.stride(3) == 1
+    assert logical_indices.stride(1) == block_table.stride(1) == 1
+    if out.shape != q.shape:
+        raise ValueError("QSA tiled output must match its query")
+    assert out.dtype == q.dtype and out.stride(2) == 1
+    num_rows = q.shape[0]
+    if not num_rows:
+        return out
+
+    group_size = q.shape[1] // k_cache.shape[2]
+    block_m = _qsa_tiled_env_int("VLLM_GFX908_QSA_TILED_BM", 128)
+    block_m = max(block_m, triton.next_power_of_2(group_size), 16)
+    block_n = _qsa_tiled_env_int("VLLM_GFX908_QSA_TILED_BN", 32)
+    num_warps = _qsa_tiled_env_int("VLLM_GFX908_QSA_TILED_WARPS", 4)
+    blocks_per_tile = block_n // compress_ratio
+    if block_n % compress_ratio or blocks_per_tile < 1 or 32 % blocks_per_tile:
+        raise ValueError("QSA tiled BLOCK_N must cover 1..32 compressed blocks")
+    block_q = max(block_m // group_size, 1)
+
+    if query_positions.dtype != torch.int32:
+        query_positions = query_positions.to(torch.int32)
+    if query_start_loc.dtype != torch.int32:
+        query_start_loc = query_start_loc.to(torch.int32)
+    query_positions = query_positions.contiguous()
+    query_start_loc = query_start_loc.contiguous()
+
+    num_requests = query_start_loc.shape[0] - 1
+    num_words = triton.cdiv(triton.cdiv(max_seq_len, compress_ratio), 32)
+    if selection_words is None:
+        selection_words = torch.zeros(
+            (num_rows, num_words), dtype=torch.int32, device=q.device
+        )
+    else:
+        if selection_words.shape[0] < num_rows or selection_words.shape[1] < num_words:
+            raise ValueError("QSA tiled selection workspace is too small")
+        selection_words = selection_words[:num_rows, :num_words]
+        selection_words.zero_()
+
+    num_entries = triton.cdiv(logical_indices.shape[1], compress_ratio)
+    entry_block = 256
+    num_blocks = triton.cdiv(max_seq_len, compress_ratio)
+    # The scatter+pack build is ~6x faster than the atomic one (measured 94 us
+    # vs 604 us at 4096 rows: one program's lanes all target the same row's
+    # handful of bitmap words, so atomic_or serialises ~8-way inside a wave),
+    # but it needs a [rows, blocks] int8 scratch.  Fall back to atomics when
+    # that scratch would be large.
+    mask_mode = os.environ.get("VLLM_GFX908_QSA_TILED_MASK", "auto")
+    if mask_mode == "auto":
+        mask_mode = "atomic" if num_rows * num_blocks > (64 << 20) else "scatter"
+    if mask_mode == "atomic":
+        _qsa_prefill_selection_words_kernel[
+            (num_rows, triton.cdiv(num_entries, entry_block))
+        ](
+            logical_indices,
+            selection_words,
+            logical_indices.stride(0),
+            selection_words.stride(0),
+            num_rows,
+            num_entries,
+            num_words,
+            COMPRESS_RATIO=compress_ratio,
+            BLOCK_E=entry_block,
+            num_warps=4,
+        )
+    else:
+        block_mask = torch.zeros(
+            (num_rows, num_blocks), dtype=torch.int8, device=q.device
+        )
+        _qsa_prefill_block_mask_kernel[
+            (num_rows, triton.cdiv(num_entries, entry_block))
+        ](
+            logical_indices,
+            block_mask,
+            logical_indices.stride(0),
+            block_mask.stride(0),
+            num_rows,
+            num_entries,
+            num_blocks,
+            COMPRESS_RATIO=compress_ratio,
+            BLOCK_E=entry_block,
+            num_warps=4,
+        )
+        word_block = 8
+        _qsa_prefill_pack_mask_kernel[
+            (num_rows, triton.cdiv(num_words, word_block))
+        ](
+            block_mask,
+            selection_words,
+            block_mask.stride(0),
+            selection_words.stride(0),
+            num_rows,
+            num_blocks,
+            num_words,
+            BLOCK_W=word_block,
+            num_warps=4,
+        )
+
+    num_req_pow2 = triton.next_power_of_2(max(num_requests, 1))
+    tile_starts = torch.empty(
+        (num_requests + 1,), dtype=torch.int32, device=q.device
+    )
+    _qsa_prefill_tile_starts_kernel[(1,)](
+        query_start_loc,
+        tile_starts,
+        num_requests,
+        BLOCK_Q=block_q,
+        NUM_REQ_POW2=num_req_pow2,
+        num_warps=1,
+    )
+
+    max_tiles = triton.cdiv(num_rows, block_q) + num_requests
+    _qsa_prefill_tiled_kernel[(max_tiles, k_cache.shape[2])](
+        q,
+        k_cache,
+        v_cache,
+        selection_words,
+        query_positions,
+        query_start_loc,
+        tile_starts,
+        block_table,
+        out,
+        q.stride(0),
+        q.stride(1),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        v_cache.stride(2),
+        selection_words.stride(0),
+        block_table.stride(0),
+        out.stride(0),
+        out.stride(1),
+        k_cache.shape[0],
+        num_requests,
+        PAGE_SIZE=k_cache.shape[1],
+        PAGE_TABLE_WIDTH=block_table.shape[1],
+        GROUP_SIZE=group_size,
+        HEAD_DIM=head_dim,
+        COMPRESS_RATIO=compress_ratio,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_Q=block_q,
+        NUM_REQ_POW2=num_req_pow2,
+        num_warps=num_warps,
+        num_stages=1,
+    )
+    return out
+
+
+
 __all__ = [
     "expand_qsa_block_indices_cuda",
     "qsa_compress_groups_with_ratio",
     "qsa_dense_causal_paged_attention",
     "qsa_mqa_paged",
+    "qsa_prefill_tiled_attention",
     "qsa_select_paged_tokens",
     "qsa_sparse_paged_attention",
     "qsa_store_cache_rows",

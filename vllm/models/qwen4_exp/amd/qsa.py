@@ -74,6 +74,21 @@ def _dense_short_enabled() -> bool:
     )
 
 
+def _prefill_tiled_enabled() -> bool:
+    """``VLLM_GFX908_QSA_PREFILL_TILED=1`` opts into the tiled prefill kernel.
+
+    Covers the range the dense-short path cannot: contexts *above* the indexer
+    budget, where the selection is genuinely sparse and still has to be built.
+    Read per call (one dict lookup); the default is off.
+    """
+
+    return os.environ.get("VLLM_GFX908_QSA_PREFILL_TILED", "0").strip() in (
+        "1",
+        "true",
+        "True",
+    )
+
+
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
     """Flash metadata supporting uniform decode and target-verify graphs."""
 
@@ -166,6 +181,55 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             attn_metadata.max_query_len,
             attn_metadata.max_seq_len,
             self.scale,
+            output[:num_tokens],
+        )
+        return output
+
+    def forward_qsa_tiled(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        output: torch.Tensor,
+        query_positions: torch.Tensor,
+        compress_ratio: int,
+    ) -> torch.Tensor:
+        """Sparse QSA with the query dimension tiled (prefill-shaped batches).
+
+        Same selection and same math as :meth:`forward_qsa`; the kernel tiles
+        ``BLOCK_Q`` consecutive queries of a request into the MFMA M dimension
+        and walks their shared causal key range once instead of re-gathering a
+        2051-wide index list per token.  Only valid when every row's logical
+        position is known (prefill), which is why the gate requires
+        ``max_query_len > 1``.
+        """
+
+        num_tokens = attn_metadata.num_actual_tokens
+        output.zero_()
+        if num_tokens == 0:
+            return output
+        topk_buffer = getattr(layer, "topk_indices_buffer", None)
+        if topk_buffer is None:
+            raise RuntimeError("QSA owner did not provide its top-k buffer")
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        key_cache = canonicalize_singleton_dim_strides(key_cache)
+        value_cache = canonicalize_singleton_dim_strides(value_cache)
+        if key_cache.dtype != torch.bfloat16 or query.dtype != torch.bfloat16:
+            raise NotImplementedError("Qwen4Exp QSA requires BF16 Q/K/V")
+
+        from .ops.qsa import qsa_prefill_tiled_attention
+
+        qsa_prefill_tiled_attention(
+            query[:num_tokens],
+            key_cache,
+            value_cache,
+            topk_buffer[:num_tokens],
+            attn_metadata.block_table,
+            query_positions[:num_tokens],
+            attn_metadata.query_start_loc,
+            int(attn_metadata.max_seq_len),
+            compress_ratio,
             output[:num_tokens],
         )
         return output
@@ -414,6 +478,27 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             return False
         return get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.NONE
 
+    def _prefill_tiled_eligible(self, main_metadata: FlashAttentionMetadata) -> bool:
+        """True when the tiled prefill attention kernel may replace the sparse one.
+
+        Complement of ``_dense_short_eligible``: the batch is prefill-shaped
+        (``max_query_len > 1``) but its context is *above* the indexer budget,
+        so the selection is real and the sparse kernel is the one running.  The
+        tiled kernel needs a logical position per row, which only a
+        prefill-shaped batch's side metadata provides, and it is an eager-only
+        path for the same reason the dense-short one is.
+        """
+
+        if not _prefill_tiled_enabled():
+            return False
+        if self.indexer.skip_topk:
+            return False
+        if int(getattr(main_metadata, "max_query_len", 1) or 1) <= 1:
+            return False
+        if int(getattr(main_metadata, "max_seq_len", 0) or 0) <= self.indexer.token_topk:
+            return False
+        return get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.NONE
+
     def _run_qsa(
         self,
         hidden_states: torch.Tensor,
@@ -471,6 +556,17 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 self.kv_cache,
                 main_metadata,
                 output,
+            )
+            return
+        if self._prefill_tiled_eligible(main_metadata):
+            impl.forward_qsa_tiled(
+                self,
+                query,
+                self.kv_cache,
+                main_metadata,
+                output,
+                side_metadata.logical_positions,
+                self.indexer.compress_ratio,
             )
             return
         impl.forward_qsa(
