@@ -11,6 +11,9 @@
 #include "gfx908_w8a16_launch.cuh"
 
 bool w8a16_dequant(at::Tensor W, at::Tensor S, at::Tensor O, int64_t gs);
+bool mfma_w8_gemm(at::Tensor Wsw, at::Tensor Ssw, at::Tensor X, at::Tensor C, int64_t tile,
+                  int64_t nw, int64_t sk, int64_t ug, int64_t dbg);
+bool mfma_w8_dequant(at::Tensor Wsw, at::Tensor Ssw, at::Tensor O, int64_t r0, int64_t Nfull);
 
 extern template bool w8_launch_nb<1>(const W8Args&, int, int, int, int, int);
 extern template bool w8_launch_nb<2>(const W8Args&, int, int, int, int, int);
@@ -54,4 +57,6 @@ bool w8a16_gemv(at::Tensor W, at::Tensor S, at::Tensor X, at::Tensor C, int64_t 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("w8a16_gemv", &w8a16_gemv);
   m.def("w8a16_dequant", &w8a16_dequant);
+  m.def("mfma_w8_gemm", &mfma_w8_gemm);
+  m.def("mfma_w8_dequant", &mfma_w8_dequant);
 }

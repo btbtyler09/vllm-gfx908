@@ -133,6 +133,7 @@ class GatedResidual(nn.Module):
         self._gfx908_hc_shard = hc_shard_enabled()
         if use_combine:
             from .gfx908_hc_fused import (
+                hc_w4_enabled,
                 hc_w8_enabled,
                 install_hc_w8_prepare,
             )
@@ -145,10 +146,11 @@ class GatedResidual(nn.Module):
                     "gfx908: VLLM_GFX908_HC_SHARD=1 has no effect on the "
                     "combining HC modules while the fused HC path is off"
                 )
-            if self._gfx908_hc_fused and hc_w8_enabled():
+            if self._gfx908_hc_fused and (hc_w4_enabled() or hc_w8_enabled()):
                 # Wraps the two mix Linears' process_weights_after_loading so the
-                # int8 copies are built (and the bf16 masters released) at load
-                # time, before torch.compile and before any cudagraph capture.
+                # int8 (or W4, under VLLM_GFX908_W4_LOADTIME) copies are built and
+                # the bf16 masters released at load time, before torch.compile and
+                # before any cudagraph capture.
                 install_hc_w8_prepare(self)
 
     def mix(
