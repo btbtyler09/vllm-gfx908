@@ -217,3 +217,34 @@ prebuilt in `/opt/vllm-gfx908-ext` (`tools/prebuild_gfx908_exts.py`, `docker/Doc
 validated env defaults baked in (`docker run ... env | grep GFX908`), so the canonical serve line
 needs no flags beyond the base command in this doc's first section. Validation: boots in ~9 min
 (no JIT), c=1 88.7-89.0 tok/s, greedy fingerprints bit-identical to the overlay build (16/16).
+
+## Round 7 (2026-09-04, later): prefill
+
+Profile of a 7840-token pass (torch profiler is fine for kernels this large): MoE W4 GEMM 19.5%,
+RCCL all-reduce 18.9% (575 ms — the decode-era `NCCL_ALGO=Tree,PROTO=LL` pin applied to 40 MB
+messages), QSA sparse + indexer 24%, rocBLAS bf16 GEMMs ~15% (hyper-connection mixes, replicated
+on all ranks), GDN chunk ~4%. At 2K the custom 2-stage all-reduce takes 15% (10 MB messages at
+~12 GB/s) and QSA 17%. Research: `research/prefill_gfx908.md`.
+
+Shipped (commit `gfx908 prefill round 1`), same-tree A/B with `ttft_probe.sh`:
+
+| prompt | before | after |
+|---|---|---|
+| 1,597 tokens | 535-551 ms | 439-451 ms (-18%) |
+| 12,780 tokens (single request) | 3.50 s | 2.75 s (-21%) |
+
+Levers: RCCL unpin + custom-AR cap at 2 MB; indexer scorer bounded to the batch's context
+(4485 -> 360 us/layer at 2K); dense causal attention when every context fits the indexer budget
+(the top-2048 selection is then the identity — exact; 12 layers 105 -> 19 ms at 2K); W4 large-M
+dequant-to-rocBLAS escape (-8.8 ms/pass at 2K). Greedy parity vs rc3 16/16 bit-identical; PPL 3.145.
+
+Still open for prefill: the MoE config for 8192-token chunks (borrows the 4096 entry, ~54 ms per
+chunk), hyper-connection mixes sharded over TP with one all-gather (M-split, staged), the QSA
+prefill kernel itself for contexts above the budget (per-token programs, 5.5x issued/useful), and
+the 784-token "align" block that turns a 16K prompt into 3 passes (9 at c=4).
+
+MTP (n=2) on this stack accepts 58% of draft tokens (2.16 tokens/step) but nets only +4% at c=1:
+the spec step adds ~5 ms of uncaptured proposer glue, sampler cumsum/sorts over (n+1) rows and
+copies. Parked; needs a captured proposer, a sampler fix and a W4 drafter. Loading required a fix
+(`9fc17890e4`: the checkpoint's mtp.* weights are unquantized) and memory headroom
+(`--max-num-batched-tokens 4096`, the spec profile run's logits peak).
