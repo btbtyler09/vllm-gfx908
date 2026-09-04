@@ -115,7 +115,7 @@ def _qsa_mqa_paged_kernel(
 
 
 @triton.jit
-def _expand_qsa_indices_kernel(
+def _expand_qsa_indices_tile(
     block_indices_ptr,
     query_positions_ptr,
     sequence_lengths_ptr,
@@ -127,14 +127,21 @@ def _expand_qsa_indices_kernel(
     stride_output_column,
     rows,
     num_requests,
+    row,
+    columns,
     BLOCK_TOPK: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     TOKEN_TOPK: tl.constexpr,
     OUTPUT_WIDTH: tl.constexpr,
-    COLUMN_BLOCK: tl.constexpr,
 ) -> None:
-    row = tl.program_id(0)
-    columns = tl.program_id(1) * COLUMN_BLOCK + tl.arange(0, COLUMN_BLOCK)
+    """Expand one tile of one row's selection into token ids.
+
+    Factored out of ``_expand_qsa_indices_kernel`` so the fused
+    stable-top-k-plus-expand kernel runs the *same* code rather than a copy
+    that could drift.  ``row`` and ``columns`` are supplied by the caller
+    instead of being read from ``program_id``.
+    """
+
     query_position = tl.load(query_positions_ptr + row)
     request = tl.load(token_to_req_ptr + row)
     safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
@@ -182,6 +189,46 @@ def _expand_qsa_indices_kernel(
         output_ptr + row * stride_output_row + columns * stride_output_column,
         tl.where(valid, token, -1),
         mask=(row < rows) & (columns < OUTPUT_WIDTH),
+    )
+
+
+@triton.jit
+def _expand_qsa_indices_kernel(
+    block_indices_ptr,
+    query_positions_ptr,
+    sequence_lengths_ptr,
+    token_to_req_ptr,
+    output_ptr,
+    stride_blocks_row,
+    stride_blocks_column,
+    stride_output_row,
+    stride_output_column,
+    rows,
+    num_requests,
+    BLOCK_TOPK: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    TOKEN_TOPK: tl.constexpr,
+    OUTPUT_WIDTH: tl.constexpr,
+    COLUMN_BLOCK: tl.constexpr,
+) -> None:
+    _expand_qsa_indices_tile(
+        block_indices_ptr,
+        query_positions_ptr,
+        sequence_lengths_ptr,
+        token_to_req_ptr,
+        output_ptr,
+        stride_blocks_row,
+        stride_blocks_column,
+        stride_output_row,
+        stride_output_column,
+        rows,
+        num_requests,
+        tl.program_id(0),
+        tl.program_id(1) * COLUMN_BLOCK + tl.arange(0, COLUMN_BLOCK),
+        BLOCK_TOPK=BLOCK_TOPK,
+        COMPRESS_RATIO=COMPRESS_RATIO,
+        TOKEN_TOPK=TOKEN_TOPK,
+        OUTPUT_WIDTH=OUTPUT_WIDTH,
     )
 
 
@@ -669,6 +716,344 @@ def qsa_mqa_paged(
     return logits, visible_blocks
 
 
+def _stable_topk_enabled() -> bool:
+    """``VLLM_GFX908_QSA_STABLE_TOPK=1`` opts into a reproducible selection.
+
+    ``vllm::topKPerRowDecode`` writes each selected column at its wave-arrival
+    slot (``atomicAdd(&smemFoundTopKValues[0], 1)``) and drains the threshold
+    bin -- whose members are bit-identical floats -- with another atomic.  The
+    *values* it selects are therefore always the true top-k, but neither the
+    output order nor, when the k-th largest logit is duplicated, the selected
+    set is reproducible.  QSA logits are a sum of ``index_n_heads`` ReLU'd dot
+    products, so ~6% of them are exactly ``0.0``; whenever a query's budget cut
+    lands in that atom the selection changes run to run.
+
+    Read per call (one dict lookup); the default is off.
+    """
+
+    return os.environ.get("VLLM_GFX908_QSA_STABLE_TOPK", "0").strip() in (
+        "1",
+        "true",
+        "True",
+    )
+
+
+@triton.jit
+def _qsa_stable_topk_row(
+    logits_ptr,
+    visible_ptr,
+    blocks_ptr,
+    stride_logits_row,
+    stride_blocks_row,
+    num_columns,
+    row,
+    TOPK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+) -> None:
+    """Rewrite one row of ``blocks`` as the deterministic top-k of ``logits``.
+
+    ``blocks`` arrives holding *a* correct top-k: the multiset of selected
+    logit values is unique, so its smallest member is the k-th largest logit of
+    the row no matter which tied column the atomic race handed out.  That value
+    is the only thing this kernel takes from the input; it then rebuilds the
+    row from scratch as
+
+        {c : logit[c] > t}  U  the first (k - |{c : logit[c] > t}|)
+                                columns with logit[c] == t
+
+    written in ascending column order.  For a row whose k-th largest logit is
+    unique the second set is a single column and the result is exactly today's
+    selection; otherwise ties resolve to the lowest block index.  The rebuild
+    is a plain per-row scan with no atomics, so both the set and the order are
+    reproducible.
+    """
+
+    visible = tl.load(visible_ptr + row)
+    visible = tl.minimum(tl.maximum(visible, 0), num_columns)
+
+    logits_row = logits_ptr + row * stride_logits_row
+    blocks_row = blocks_ptr + row * stride_blocks_row
+    ranks = tl.arange(0, BLOCK_K)
+
+    # A row with no more visible blocks than budget selects *every* visible
+    # block, so the answer is ``0..visible-1`` ascending then -1 padding with
+    # no reference to the logits at all -- one store, and out.  This is the
+    # whole batch for any context at or below the token budget
+    # (``TOPK * compress_ratio`` = 2048 tokens), where the selection is the
+    # identity, and it is also every prefill row below that position.  It is
+    # the case short-context decode spends its whole life in, so it must not
+    # touch the 8192-column capture-time logits buffer at all.  Writing the
+    # returning early keeps the kernel independent of whether the top-k
+    # backend's own short-row shortcut happens to be ordered.
+    if visible <= TOPK:
+        tl.store(
+            blocks_row + ranks,
+            tl.where(ranks < visible, ranks, -1).to(tl.int32),
+            mask=ranks < TOPK,
+        )
+        return
+
+    # Phase 0: the threshold, read back from the incoming selection.
+    keep = ranks < TOPK
+    picked = tl.load(blocks_row + ranks, mask=keep, other=0)
+    picked = tl.minimum(tl.maximum(picked, 0), num_columns - 1)
+    values = tl.load(logits_row + picked, mask=keep, other=float("inf"))
+    threshold = tl.min(tl.where(keep, values, float("inf")), axis=0)
+
+    num_tiles = (visible + BLOCK_N - 1) // BLOCK_N
+    offsets = tl.arange(0, BLOCK_N)
+
+    # Phase 1: how many logits are strictly above the threshold.
+    greater = 0
+    for tile in range(0, num_tiles):
+        columns = tile * BLOCK_N + offsets
+        in_range = columns < visible
+        value = tl.load(logits_row + columns, mask=in_range, other=-float("inf"))
+        greater += tl.sum(tl.where(in_range & (value > threshold), 1, 0), axis=0)
+    needed = tl.maximum(TOPK - greater, 0)
+
+    # Phase 2: ascending-column placement of the strict set plus the first
+    # ``needed`` members of the tie set.
+    ties_seen = 0
+    written = 0
+    for tile in range(0, num_tiles):
+        columns = tile * BLOCK_N + offsets
+        in_range = columns < visible
+        value = tl.load(logits_row + columns, mask=in_range, other=-float("inf"))
+        above = in_range & (value > threshold)
+        tied = tl.where(in_range & (value == threshold), 1, 0)
+        tie_rank = ties_seen + tl.cumsum(tied, axis=0) - tied
+        take = tl.where(above | ((tied == 1) & (tie_rank < needed)), 1, 0)
+        position = written + tl.cumsum(take, axis=0) - take
+        tl.store(
+            blocks_row + position,
+            columns.to(tl.int32),
+            mask=(take == 1) & (position < TOPK),
+        )
+        ties_seen += tl.sum(tied, axis=0)
+        written += tl.sum(take, axis=0)
+
+    # Phase 3: pad a row that could not fill its budget.  ``visible > TOPK``
+    # here, so this only fires if the incoming selection was malformed.
+    if written < TOPK:
+        tl.store(
+            blocks_row + ranks,
+            tl.full((BLOCK_K,), -1, tl.int32),
+            mask=(ranks < TOPK) & (ranks >= written),
+        )
+
+
+@triton.jit
+def _qsa_stable_topk_kernel(
+    logits_ptr,
+    visible_ptr,
+    blocks_ptr,
+    stride_logits_row,
+    stride_blocks_row,
+    num_columns,
+    TOPK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+) -> None:
+    _qsa_stable_topk_row(
+        logits_ptr,
+        visible_ptr,
+        blocks_ptr,
+        stride_logits_row,
+        stride_blocks_row,
+        num_columns,
+        tl.program_id(0).to(tl.int64),
+        TOPK=TOPK,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+
+
+@triton.jit
+def _qsa_stable_topk_expand_kernel(
+    logits_ptr,
+    visible_ptr,
+    blocks_ptr,
+    query_positions_ptr,
+    sequence_lengths_ptr,
+    token_to_req_ptr,
+    output_ptr,
+    stride_logits_row,
+    stride_blocks_row,
+    stride_blocks_column,
+    stride_output_row,
+    stride_output_column,
+    num_columns,
+    rows,
+    num_requests,
+    TOPK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    TOKEN_TOPK: tl.constexpr,
+    OUTPUT_WIDTH: tl.constexpr,
+    COLUMN_BLOCK: tl.constexpr,
+    NUM_COLUMN_TILES: tl.constexpr,
+) -> None:
+    """Repair one row's selection and expand it, in a single launch.
+
+    Decode is launch-bound: the repair is ~1.8 us of work but a separate graph
+    node between ``top_k_per_row_decode`` and the expand costs several times
+    that once it is a real dependency in a real graph.  Folding the repair into
+    the front of the expand means the flag adds *zero* nodes to the captured
+    decode graph.
+
+    The row's own program writes ``blocks`` and then reads it back, so a
+    barrier is needed between the two -- which is exactly why this shape is
+    decode-only: it forces one program per row, and prefill wants the expand
+    spread over ``OUTPUT_WIDTH / COLUMN_BLOCK`` programs per row instead.
+    """
+
+    row = tl.program_id(0).to(tl.int64)
+    _qsa_stable_topk_row(
+        logits_ptr,
+        visible_ptr,
+        blocks_ptr,
+        stride_logits_row,
+        stride_blocks_row,
+        num_columns,
+        row,
+        TOPK=TOPK,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+    # Order this program's stores to ``blocks`` before its own reloads below.
+    tl.debug_barrier()
+    for tile in tl.static_range(0, NUM_COLUMN_TILES):
+        _expand_qsa_indices_tile(
+            blocks_ptr,
+            query_positions_ptr,
+            sequence_lengths_ptr,
+            token_to_req_ptr,
+            output_ptr,
+            stride_blocks_row,
+            stride_blocks_column,
+            stride_output_row,
+            stride_output_column,
+            rows,
+            num_requests,
+            row,
+            tile * COLUMN_BLOCK + tl.arange(0, COLUMN_BLOCK),
+            BLOCK_TOPK=TOPK,
+            COMPRESS_RATIO=COMPRESS_RATIO,
+            TOKEN_TOPK=TOKEN_TOPK,
+            OUTPUT_WIDTH=OUTPUT_WIDTH,
+        )
+
+
+def qsa_stable_topk_(
+    logits: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    blocks: torch.Tensor,
+    block_n: int | None = None,
+    num_warps: int | None = None,
+) -> torch.Tensor:
+    """Make an already-computed compressed-block top-k reproducible, in place.
+
+    ``block_n`` / ``num_warps`` exist for the microbenchmark; the defaults are
+    the measured ones.  Decode launches only a handful of workgroups, so it is
+    latency- rather than throughput-bound and wants a wider block; prefill has
+    thousands of rows in flight and wants the narrow, high-occupancy one.
+    """
+
+    if blocks.ndim != 2 or logits.ndim != 2:
+        raise ValueError("QSA stable top-k needs 2-D logits and selections")
+    if blocks.shape[0] != logits.shape[0]:
+        raise ValueError("QSA stable top-k row counts must match")
+    if visible_blocks.shape[0] < blocks.shape[0]:
+        raise ValueError("QSA stable top-k needs one visible count per row")
+    if blocks.stride(1) != 1 or logits.stride(1) != 1:
+        raise ValueError("QSA stable top-k needs row-contiguous inputs")
+    rows, topk = blocks.shape
+    if not rows or not topk:
+        return blocks
+    if block_n is None:
+        block_n = 2048 if rows <= 64 else 1024
+    if num_warps is None:
+        num_warps = 8 if rows <= 64 else 4
+    _qsa_stable_topk_kernel[(rows,)](
+        logits,
+        visible_blocks,
+        blocks,
+        logits.stride(0),
+        blocks.stride(0),
+        logits.shape[1],
+        TOPK=topk,
+        BLOCK_N=block_n,
+        BLOCK_K=triton.next_power_of_2(topk),
+        num_warps=num_warps,
+    )
+    return blocks
+
+
+# Row count at or below which the repair is fused into the expand.  Decode
+# batches are launch-bound and want one kernel; prefill wants the expand spread
+# over many programs per row (measured: fusing costs prefill far more than the
+# launch it saves).
+_STABLE_TOPK_FUSED_MAX_ROWS = 64
+
+
+def qsa_stable_topk_expand(
+    logits: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    blocks: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    token_to_req: torch.Tensor,
+    compress_ratio: int,
+    token_topk: int,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Deterministic repair + index expansion in one launch (decode shapes)."""
+
+    rows, topk = blocks.shape
+    if token_topk % compress_ratio:
+        raise ValueError("QSA token top-k must be divisible by compression ratio")
+    if topk != token_topk // compress_ratio:
+        raise ValueError("QSA fused stable top-k has an invalid selection width")
+    output_width = token_topk + compress_ratio - 1
+    if out.shape != (rows, output_width):
+        raise ValueError("QSA fused stable expansion output has an invalid shape")
+    if blocks.stride(1) != 1 or logits.stride(1) != 1:
+        raise ValueError("QSA fused stable top-k needs row-contiguous inputs")
+    if not rows or not topk:
+        return out
+    column_block = 256
+    _qsa_stable_topk_expand_kernel[(rows,)](
+        logits,
+        visible_blocks,
+        blocks,
+        query_positions,
+        sequence_lengths,
+        token_to_req,
+        out,
+        logits.stride(0),
+        blocks.stride(0),
+        blocks.stride(1),
+        out.stride(0),
+        out.stride(1),
+        logits.shape[1],
+        rows,
+        sequence_lengths.shape[0],
+        TOPK=topk,
+        BLOCK_N=2048,
+        BLOCK_K=triton.next_power_of_2(topk),
+        COMPRESS_RATIO=compress_ratio,
+        TOKEN_TOPK=token_topk,
+        OUTPUT_WIDTH=output_width,
+        COLUMN_BLOCK=column_block,
+        NUM_COLUMN_TILES=triton.cdiv(output_width, column_block),
+        num_warps=8,
+    )
+    return out
+
+
 def expand_qsa_block_indices_cuda(
     block_indices: torch.Tensor,
     query_positions: torch.Tensor,
@@ -810,6 +1195,23 @@ def qsa_select_paged_tokens(
                 logits.stride(1),
                 block_topk,
             )
+        if _stable_topk_enabled():
+            if blocks.shape[0] <= _STABLE_TOPK_FUSED_MAX_ROWS:
+                # Decode: repair inside the expand so the flag adds no node to
+                # the captured graph.
+                qsa_stable_topk_expand(
+                    logits,
+                    visible_blocks,
+                    blocks,
+                    query_positions[row_slice],
+                    sequence_lengths,
+                    token_to_req[row_slice],
+                    compress_ratio,
+                    token_topk,
+                    out[row_slice],
+                )
+                continue
+            qsa_stable_topk_(logits, visible_blocks, blocks)
         expand_qsa_block_indices_cuda(
             blocks,
             query_positions[row_slice],
