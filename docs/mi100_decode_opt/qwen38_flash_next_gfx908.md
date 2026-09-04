@@ -248,3 +248,11 @@ the spec step adds ~5 ms of uncaptured proposer glue, sampler cumsum/sorts over 
 copies. Parked; needs a captured proposer, a sampler fix and a W4 drafter. Loading required a fix
 (`9fc17890e4`: the checkpoint's mtp.* weights are unquantized) and memory headroom
 (`--max-num-batched-tokens 4096`, the spec profile run's logits peak).
+
+### Release rc4 (2026-09-04, later)
+
+`btbtyler09/vllm-rocm-gfx908:v0.28.0rc4.dev-q38fn` = tree `636b8047cd` (rc3 + W8 hyper-connection mixes
++ prefill round 1), extensions prebuilt, validated env baked (note `VLLM_GFX908_HC_W8_FREE=0`: freeing the
+HC bf16 masters costs ~90 ms per 2K prefill through the M>3 dequant fallback). 12-tier vs rc3: single-user
+TTFT 850 -> 663 ms (TPOT 11.2), 16K c=4 TTFT 12.1 -> 9.4 s, c=32/64/128 337/301/337 -> 360/338/379 tok/s.
+Report + start script in mi100-llm-testing (`scripts/serve_qwen38_flash_next_rc4.sh`).
