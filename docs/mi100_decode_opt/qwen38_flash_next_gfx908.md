@@ -401,3 +401,27 @@ bandwidth-bound. Closing half of that gap is ~-0.35 ms/step across 48 layers,
 the largest single lever left at c=1. Next agent: bytes-in-flight per lane in
 the W4A8 slab kernel (deeper unroll / more outstanding buffer loads, wider
 per-lane vectors, expert-slice-aware tiling), cold-L2, same bit-exactness gate.
+
+## Round 9 (2026-09-04/05): three-boot protocol results
+
+Each arm = pure rc5 image, three separate boots, step timer on 1200-token c=1
+decode windows, three c=1 probes + one c=4 probe per boot (`ablate.sh`).
+
+| arm | c=1 ms/step (3 boots) | c=1 tok/s | c=4 tok/s | verdict |
+|---|---|---|---|---|
+| base (rc5 defaults) | 11.05 / 11.11 / 11.17 | 88.7-89.9 | 208 | control |
+| `VLLM_GFX908_W8A16_MFMA=1` | 11.18 / 11.26 / 11.29 | 88.0-88.9 | 215-219 | c=4 +4%, c=1 +0.15 ms: M<=4 also runs through the padded MFMA kernel because the swizzled copy is the only resident int8; swizzled-read GEMV for M<=4 in progress, then default on |
+| `VLLM_GFX908_MOE_PREP_FOLD=1` (shared-as-expert fold) | 11.02 / 10.94 / 10.95 | 89.8-90.7 | 205-207 | every boot faster than every base boot (-0.16 ms median, the predicted -3 us x 48 layers); c=4 neutral. **Default on.** |
+
+Also from the gemv_flight study (agents/gemv_flight/REPORT.md), applied as
+plain parameter changes, `torch.equal` to the shipping kernels: MoE reduce
+`BLOCK` 1024 -> 256 (3 -> 10 workgroups, 3.13 -> 1.98 us at M=1), slab and
+rowlane `wpb` 4 -> 1 on the non-fold path (-0.34 / -0.06 us). The study also
+refuted the "latency-bound GEMV" reading of the megakernel baseline: load
+latency is ~210 ns flat, the kernels already keep 10-20x the Little's-law
+bytes in flight, and against a size-matched cold floor the slab / rowlane
+GEMVs sit at 78% / 84% (the GDN/HC "44-55%" figures were an L2-warm floor
+artifact; they are at 77-97%). What remains per launch is a fixed
+1.8-2.3 us, so the only lever left in the MoE layer is one fewer launch
+without a cross-workgroup wait (silu fold into the down GEMV prologue,
+in progress).

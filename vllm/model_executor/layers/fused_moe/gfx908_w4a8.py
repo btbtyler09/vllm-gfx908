@@ -151,7 +151,7 @@ def shared_as_expert_enabled() -> bool:
 
 
 def prep_fold_enabled() -> bool:
-    """VLLM_GFX908_MOE_PREP_FOLD=1 (default off): fold the gate_up projection's activation
+    """VLLM_GFX908_MOE_PREP_FOLD (default on since round 9; 0 disables): fold the gate_up projection's activation
     preparation (Q8_1 quant in ``int8`` mode, fp16 cast + per-8 permutation in ``f16`` mode) into
     the slab GEMV's LDS staging, so the separate ``quant_q8`` / ``cast_f16`` launch disappears.
 
@@ -166,7 +166,7 @@ def prep_fold_enabled() -> bool:
     """
     global _PREP_FOLD
     if _PREP_FOLD is None:
-        _PREP_FOLD = os.environ.get("VLLM_GFX908_MOE_PREP_FOLD", "0") == "1" and w4a8_enabled()
+        _PREP_FOLD = os.environ.get("VLLM_GFX908_MOE_PREP_FOLD", "1") == "1" and w4a8_enabled()
         if _PREP_FOLD:
             logger.info_once(
                 "gfx908: MoE gate_up activation prep folded into the slab GEMV "
@@ -605,10 +605,10 @@ def moe_w4a8(
         elif fold:
             part1 = gemv_slab_prep(w1_i, w1_scale, hidden_states, row_token, row_expert)
         else:
-            part1 = gemv_slab(w1_i, w1_scale, x8, xs, xsum, row_token, row_expert, wpb=4, extra=extra1)
+            part1 = gemv_slab(w1_i, w1_scale, x8, xs, xsum, row_token, row_expert, wpb=1, extra=extra1)
         i8, isc, isum = silu_mul_quant(part1)
-        part2 = gemv_rowlane(w2_i, w2_scale, i8, isc, isum, row_self, row_expert, wpb=4, extra=extra2)
-    rb2 = 1024
+        part2 = gemv_rowlane(w2_i, w2_scale, i8, isc, isum, row_self, row_expert, wpb=1, extra=extra2)
+    rb2 = 256  # 3 -> 10 workgroups; 3.13 -> 1.98 us at M=1 (agents/gemv_flight), same per-element order
     _moe_reduce_weighted_sum_kernel[(triton.cdiv(K, rb2), M)](
         part2, wsum, output, K,
         0, part2.stride(0), output.stride(0),
