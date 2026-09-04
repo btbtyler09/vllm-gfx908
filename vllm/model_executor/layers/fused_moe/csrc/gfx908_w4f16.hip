@@ -344,29 +344,16 @@ __device__ __forceinline__ void cast_group(const uint4* __restrict__ src, uint4 
 // LDS, so the separate cast_f16 launch disappears.  Same geometry / block-uniformity requirements
 // as w4f16_slab_lds_kernel ((N / ROWS) % 4 == 0), and bit-identical to cast_f16 + gemv_slab_f16
 // (mode 1) because the staged bytes and the read order are the same.
+// The folded slab's per-block work, shared by the plain and the shared-as-expert kernels so the
+// two can never drift.
 template <int K, int LPR>
-__global__ void __launch_bounds__(256) w4f16_slab_prep_kernel(
-    const uint32_t* __restrict__ w, const uint16_t* __restrict__ s, const uint32_t* __restrict__ x,
-    const int* __restrict__ row_tok, const int* __restrict__ row_exp, float* __restrict__ out,
-    int N, int P, int E, long stride_we, long stride_se,
-    const uint32_t* __restrict__ w_extra, const uint16_t* __restrict__ s_extra) {
-  constexpr int ROWS = 64 / LPR, G = K / 32, GPL = (G + LPR - 1) / LPR;
-  __shared__ __align__(16) uint16_t xl[K];
-  const int lane = threadIdx.x & 63, r = lane / LPR, l = lane % LPR, wv = threadIdx.x >> 6;
-  const int tiles_per_p = N / ROWS;
-  const int tile0 = __builtin_amdgcn_readfirstlane(blockIdx.x * 4);
-  const int p = tile0 / tiles_per_p;
-  const int n = ((tile0 + wv) % tiles_per_p) * ROWS + r;
-  const int e = row_exp[p], t = row_tok[p];
-  const uint32_t* wb;
-  const uint16_t* sb;
-  if (!pick_expert(e, E, w, s, stride_we, stride_se, w_extra, s_extra, wb, sb)) {  // block-uniform
-    if (l == LPR - 1) out[(long)p * N + n] = 0.f;
-    return;
-  }
-  // Weight loads are issued AFTER the staging barrier: holding q[GPL] + sc[GPL] live across
-  // the cast code costs a wave of occupancy (see the int8 kernel's note).
-  const uint4* xg = reinterpret_cast<const uint4*>(x) + (long)t * (K / 8);   // K bf16 = K/8 uint4
+__device__ __forceinline__ float w4f16_slab_prep_body(
+    const uint32_t* __restrict__ wb, const uint16_t* __restrict__ sb,
+    const uint32_t* __restrict__ x, int tok, int n, int l, uint16_t* __restrict__ xl) {
+  constexpr int G = K / 32, GPL = (G + LPR - 1) / LPR;
+  // Weight loads are issued AFTER the staging barrier: holding q[GPL] + sc[GPL] live across the
+  // cast code costs a wave of occupancy (see the int8 kernel's note).
+  const uint4* xg = reinterpret_cast<const uint4*>(x) + (long)tok * (K / 8);   // K bf16 = K/8 uint4
   for (int g = threadIdx.x; g < G; g += 256) {
     uint4 o[4];
     cast_group(xg + (long)g * 4, o);
@@ -391,7 +378,68 @@ __global__ void __launch_bounds__(256) w4f16_slab_prep_kernel(
     if (G % LPR == 0 || g < G)
       acc = fmaf(bf2f(sc[j]), group_dot(q[j], reinterpret_cast<const uint4*>(xl) + 4 * g), acc);
   }
-  acc = reduce_lpr<LPR>(acc);
+  return reduce_lpr<LPR>(acc);
+}
+
+// ---------------------------------------------------------------------------------------------
+// D5-slab-LDS with the ACTIVATION PREP FOLDED IN (VLLM_GFX908_MOE_PREP_FOLD=1): the block reads
+// the pair's activation as raw bf16 and does the fp16 cast + per-8 permutation while staging it in
+// LDS, so the separate cast_f16 launch disappears.  Bit-identical to cast_f16 + gemv_slab_f16
+// (mode 1) because the staged bytes and the read order are the same.
+template <int K, int LPR>
+__global__ void __launch_bounds__(256) w4f16_slab_prep_kernel(
+    const uint32_t* __restrict__ w, const uint16_t* __restrict__ s, const uint32_t* __restrict__ x,
+    const int* __restrict__ row_tok, const int* __restrict__ row_exp, float* __restrict__ out,
+    int N, int P, int E, long stride_we, long stride_se,
+    const uint32_t* __restrict__ w_extra, const uint16_t* __restrict__ s_extra) {
+  constexpr int ROWS = 64 / LPR;
+  __shared__ __align__(16) uint16_t xl[K];
+  const int lane = threadIdx.x & 63, r = lane / LPR, l = lane % LPR, wv = threadIdx.x >> 6;
+  const int tiles_per_p = N / ROWS;
+  const int tile0 = __builtin_amdgcn_readfirstlane(blockIdx.x * 4);
+  const int p = tile0 / tiles_per_p;
+  const int n = ((tile0 + wv) % tiles_per_p) * ROWS + r;
+  const int e = row_exp[p], t = row_tok[p];
+  const uint32_t* wb;
+  const uint16_t* sb;
+  if (!pick_expert(e, E, w, s, stride_we, stride_se, w_extra, s_extra, wb, sb)) {  // block-uniform
+    if (l == LPR - 1) out[(long)p * N + n] = 0.f;
+    return;
+  }
+  const float acc = w4f16_slab_prep_body<K, LPR>(wb, sb, x, t, n, l, xl);
+  if (l == LPR - 1) out[(long)p * N + n] = acc;
+}
+
+// ---------------------------------------------------------------------------------------------
+// D5 prep fold for the "shared expert as expert #E" flow: the fp16 cast AND the row-list / gate
+// preparation both ride along with the gate_up slab, so cast_f16_gate disappears too.  The slab
+// blocks derive the expert from topk_ids (row p = m*(topk+1) + slot, m = row_tok[p]) because the
+// gate blocks of this same launch are the ones writing row_exp -- see the int8 kernel's note.
+template <int K, int LPR>
+__global__ void __launch_bounds__(256) w4f16_slab_prep_gate_kernel(
+    const uint32_t* __restrict__ w, const uint16_t* __restrict__ s, const uint32_t* __restrict__ x,
+    const int* __restrict__ row_tok, float* __restrict__ out,
+    int N, int P, int E, long stride_we, long stride_se,
+    const uint32_t* __restrict__ w_extra, const uint16_t* __restrict__ s_extra,
+    int nbase, GateArgs ga) {
+  if ((int)blockIdx.x >= nbase) { gate_row(ga, (int)blockIdx.x - nbase); return; }
+  constexpr int ROWS = 64 / LPR;
+  __shared__ __align__(16) uint16_t xl[K];
+  const int lane = threadIdx.x & 63, r = lane / LPR, l = lane % LPR, wv = threadIdx.x >> 6;
+  const int tiles_per_p = N / ROWS;
+  const int tile0 = __builtin_amdgcn_readfirstlane(blockIdx.x * 4);
+  const int p = tile0 / tiles_per_p;
+  const int n = ((tile0 + wv) % tiles_per_p) * ROWS + r;
+  const int t = row_tok[p];
+  const int slot = p - t * (ga.topk + 1);
+  const int e = (slot == ga.topk) ? E : ga.topk_ids[t * ga.topk + slot];
+  const uint32_t* wb;
+  const uint16_t* sb;
+  if (!pick_expert(e, E, w, s, stride_we, stride_se, w_extra, s_extra, wb, sb)) {
+    if (l == LPR - 1) out[(long)p * N + n] = 0.f;
+    return;
+  }
+  const float acc = w4f16_slab_prep_body<K, LPR>(wb, sb, x, t, n, l, xl);
   if (l == LPR - 1) out[(long)p * N + n] = acc;
 }
 
@@ -622,6 +670,56 @@ void gemv_slab_f16_prep(at::Tensor w, at::Tensor s, at::Tensor x, at::Tensor row
   TORCH_CHECK(false, "gemv_slab_f16_prep: unsupported K/lpr ", K, "/", lpr);
 }
 
+template <int K, int LPR>
+static void launch_slab_prep_gate(const at::Tensor& w, const at::Tensor& s, const at::Tensor& x,
+                                  const at::Tensor& row_tok, at::Tensor& out,
+                                  const at::Tensor& w_extra, const at::Tensor& s_extra,
+                                  const GateArgs& ga, int mrows) {
+  constexpr int ROWS = 64 / LPR;
+  const int P = row_tok.numel(), N = w.size(1), E = w.size(0);
+  TORCH_CHECK(N % ROWS == 0, "gemv_slab_f16_prep_gate: N must be a multiple of ", ROWS);
+  TORCH_CHECK((N / ROWS) % 4 == 0, "gemv_slab_f16_prep_gate: (N/ROWS) % 4 != 0");
+  TORCH_CHECK(w_extra.numel() != 0, "gemv_slab_f16_prep_gate: needs the shared expert's slab");
+  check_extra(w_extra, s_extra, N, K);
+  const long tiles = (long)P * (N / ROWS);
+  const int nbase = (int)((tiles + 3) / 4);
+  auto stream = c10::hip::getCurrentHIPStream().stream();
+  if (nbase > 0) {
+    w4f16_slab_prep_gate_kernel<K, LPR><<<nbase + mrows, 256, 0, stream>>>(
+        reinterpret_cast<const uint32_t*>(w.data_ptr()), reinterpret_cast<const uint16_t*>(s.data_ptr()),
+        reinterpret_cast<const uint32_t*>(x.data_ptr()),
+        row_tok.data_ptr<int32_t>(), out.data_ptr<float>(), N, P, E,
+        (long)N * (K / 8), (long)N * (K / 32),
+        reinterpret_cast<const uint32_t*>(w_extra.data_ptr()),
+        reinterpret_cast<const uint16_t*>(s_extra.data_ptr()), nbase, ga);
+  }
+}
+
+// D5 slab with BOTH the bf16 -> fp16 cast and the shared-as-expert row/gate prep folded in, so the
+// cast_f16_gate launch disappears.  row_exp / wcomb are OUTPUTS (the M extra blocks write them).
+void gemv_slab_f16_prep_gate(at::Tensor w, at::Tensor s, at::Tensor x, at::Tensor row_tok,
+                             at::Tensor out, int64_t lpr, at::Tensor w_extra, at::Tensor s_extra,
+                             at::Tensor wg, at::Tensor topk_ids, at::Tensor topk_w,
+                             at::Tensor row_exp, at::Tensor wcomb, int64_t E) {
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.is_contiguous() && x.dim() == 2,
+              "gemv_slab_f16_prep_gate: x must be contiguous bf16 [M, K]");
+  const int K = x.size(1);
+  check_gemv(w, s, row_tok, row_exp, out, K);
+  TORCH_CHECK((w.scalar_type() == at::kInt && w.size(2) * 8 == K) ||
+                  (w.scalar_type() == at::kByte && w.size(2) * 2 == K),
+              "gemv_slab_f16_prep_gate: w K mismatch");
+  const GateArgs ga = make_gate_args(x, wg, topk_ids, topk_w, row_exp, wcomb, E);
+  const int M = x.size(0);
+  TORCH_CHECK(row_tok.numel() == (long)M * (ga.topk + 1),
+              "gemv_slab_f16_prep_gate: row_tok must have M*(topk+1) entries");
+#define SLABPG_CASE(KK, L) \
+  if (K == KK && lpr == L) { \
+    launch_slab_prep_gate<KK, L>(w, s, x, row_tok, out, w_extra, s_extra, ga, M); return; }
+  SLABPG_CASE(2560, 16) SLABPG_CASE(1536, 16)
+#undef SLABPG_CASE
+  TORCH_CHECK(false, "gemv_slab_f16_prep_gate: unsupported K/lpr ", K, "/", lpr);
+}
+
 // D5 rowlane. K == 160 only; N % 64 == 0; out fp32 [P, N]; wpb in {1, 4}.
 void gemv_rowlane_f16(at::Tensor w, at::Tensor s, at::Tensor xh, at::Tensor row_tok,
                       at::Tensor row_exp, at::Tensor out, int64_t wpb, at::Tensor w_extra,
@@ -665,6 +763,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gemv_slab_f16_prep", &gemv_slab_f16_prep,
         "w, s, x bf16 [R,K], row_tok, row_exp, out fp32 [P,N], lpr(16), w_extra, s_extra "
         "(bf16->fp16 cast + permute folded into the LDS staging)");
+  m.def("gemv_slab_f16_prep_gate", &gemv_slab_f16_prep_gate,
+        "w, s, x bf16 [M,K], row_tok, out fp32 [P,N], lpr(16), w_extra, s_extra, wg, topk_ids, "
+        "topk_w, row_exp(out), wcomb(out), E  (fp16 cast + shared-as-expert row/gate prep folded "
+        "into the slab GEMV)");
   m.def("gemv_rowlane_f16", &gemv_rowlane_f16,
         "w, s, xh, row_tok, row_exp, out fp32 [P,N], wpb(1|4), w_extra, s_extra  (K=160)");
 }

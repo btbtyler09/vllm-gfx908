@@ -269,38 +269,18 @@ __device__ __forceinline__ void q8_group(const uint4* __restrict__ src, uint32_t
 // The staged bytes / scales are bit-identical to what quant_q8 writes (q8_group above is the same
 // code), and the dot product then reads them in the same order, so the result is bit-identical to
 // quant_q8 + gemv_slab.
+// The folded slab's per-block work, shared by the plain and the shared-as-expert kernels so the
+// two can never drift: stage+quantize the pair's token into LDS, then the usual dot product.
 template <int K, int LPR>
-__global__ void __launch_bounds__(256) w4a8_slab_prep_kernel(
-    const uint32_t* __restrict__ w, const uint16_t* __restrict__ s, const uint32_t* __restrict__ x,
-    const int* __restrict__ row_tok, const int* __restrict__ row_exp, float* __restrict__ out,
-    int N, int P, int E, long stride_we, long stride_se,
-    const uint32_t* __restrict__ w_extra, const uint16_t* __restrict__ s_extra) {
-  constexpr int ROWS = 64 / LPR, G = K / 32, GPL = (G + LPR - 1) / LPR;
-  __shared__ __align__(16) uint32_t xl[K / 4];    // K int8, de-interleaved per 8
-  __shared__ float xsl[G], xsuml[G];
-  const int lane = threadIdx.x & 63, r = lane / LPR, l = lane % LPR, wv = threadIdx.x >> 6;
-  const int tiles_per_p = N / ROWS;
-  const int tile0 = __builtin_amdgcn_readfirstlane(blockIdx.x * 4);
-  const int p = tile0 / tiles_per_p;
-  const int n = ((tile0 + wv) % tiles_per_p) * ROWS + r;
-  const int e = row_exp[p], t = row_tok[p];
-  const uint32_t* wbase;
-  const uint16_t* sbase;
-  if (!pick_expert(e, E, w, s, stride_we, stride_se, w_extra, s_extra, wbase, sbase)) {
-    if (l == LPR - 1) out[(long)p * N + n] = 0.f;   // block-uniform: no barrier below is reached
-    return;
-  }
-  const uint4* wp = reinterpret_cast<const uint4*>(wbase + (long)n * (K / 8)) + l;
-  const uint16_t* sp = sbase + (long)n * G + l;
-  uint4 q[GPL];
-  uint32_t sc[GPL];
-#pragma unroll
-  for (int j = 0; j < GPL; ++j) {
-    if (G % LPR == 0 || l + LPR * j < G) { q[j] = wp[LPR * j]; sc[j] = sp[LPR * j]; }
-    else { q[j] = make_uint4(0, 0, 0, 0); sc[j] = 0; }
-  }
-  // --- fold: quantize the pair's token straight into LDS (one thread per group of 32)
-  const uint4* xg = reinterpret_cast<const uint4*>(x) + (long)t * (K / 8);   // K bf16 = K/8 uint4
+__device__ __forceinline__ float w4a8_slab_prep_body(
+    const uint32_t* __restrict__ wbase, const uint16_t* __restrict__ sbase,
+    const uint32_t* __restrict__ x, int tok, int n, int l,
+    uint32_t* __restrict__ xl, float* __restrict__ xsl, float* __restrict__ xsuml) {
+  constexpr int G = K / 32, GPL = (G + LPR - 1) / LPR;
+  // The weight loads are issued AFTER the barrier on purpose: keeping q[GPL] + sc[GPL] (25 VGPRs
+  // at K = 2560) live across the staging code costs a whole wave of occupancy, and the staging is
+  // LDS-write bound, not latency bound.
+  const uint4* xg = reinterpret_cast<const uint4*>(x) + (long)tok * (K / 8);   // K bf16 = K/8 uint4
   for (int g = threadIdx.x; g < G; g += 256) {
     uint32_t o[8];
     float d, dsum;
@@ -311,6 +291,17 @@ __global__ void __launch_bounds__(256) w4a8_slab_prep_kernel(
     xsuml[g] = dsum;
   }
   __syncthreads();
+  const uint32_t* wp = wbase + (long)n * (K / 8);
+  const uint16_t* sp = sbase + (long)n * G + l;
+  const uint4* wp4 = reinterpret_cast<const uint4*>(wp) + l;
+  uint4 q[GPL];
+  uint32_t sc[GPL];
+#pragma unroll
+  for (int j = 0; j < GPL; ++j) {
+    if (G % LPR == 0 || l + LPR * j < G) { q[j] = wp4[LPR * j]; sc[j] = sp[LPR * j]; }
+    else { q[j] = make_uint4(0, 0, 0, 0); sc[j] = 0; }
+  }
+  __builtin_amdgcn_sched_barrier(0);   // all weight loads above the first use
   float acc = 0.f;
 #pragma unroll
   for (int j = 0; j < GPL; ++j) {
@@ -330,7 +321,84 @@ __global__ void __launch_bounds__(256) w4a8_slab_prep_kernel(
       acc += bf2f(sc[j]) * (xsl[g] * (float)sumi - 8.f * xsuml[g]);
     }
   }
-  acc = reduce_lpr<LPR>(acc);
+  return reduce_lpr<LPR>(acc);
+}
+
+// ---------------------------------------------------------------------------------------------
+// D1 with the ACTIVATION PREP FOLDED IN (VLLM_GFX908_MOE_PREP_FOLD=1).
+//
+// Same geometry and same math as w4a8_slab_kernel, but the block reads the pair's activation as
+// bf16 and does the Q8_1 quantization while staging it in LDS, so the separate quant_q8 launch
+// disappears.  One block = 4 waves = 4 consecutive tiles of the SAME pair (needs (N/ROWS) % 4 == 0,
+// exactly like the fp16 LDS kernel), so `t` is block-uniform and the zero-row branch is
+// block-uniform too (no __syncthreads hazard).
+//
+// The staged bytes / scales are bit-identical to what quant_q8 writes (q8_group above is the same
+// code), and the dot product then reads them in the same order, so the result is bit-identical to
+// quant_q8 + gemv_slab.
+template <int K, int LPR>
+__global__ void __launch_bounds__(256) w4a8_slab_prep_kernel(
+    const uint32_t* __restrict__ w, const uint16_t* __restrict__ s, const uint32_t* __restrict__ x,
+    const int* __restrict__ row_tok, const int* __restrict__ row_exp, float* __restrict__ out,
+    int N, int P, int E, long stride_we, long stride_se,
+    const uint32_t* __restrict__ w_extra, const uint16_t* __restrict__ s_extra) {
+  constexpr int ROWS = 64 / LPR, G = K / 32;
+  __shared__ __align__(16) uint32_t xl[K / 4];    // K int8, de-interleaved per 8
+  __shared__ float xsl[G], xsuml[G];
+  const int lane = threadIdx.x & 63, r = lane / LPR, l = lane % LPR, wv = threadIdx.x >> 6;
+  const int tiles_per_p = N / ROWS;
+  const int tile0 = __builtin_amdgcn_readfirstlane(blockIdx.x * 4);
+  const int p = tile0 / tiles_per_p;
+  const int n = ((tile0 + wv) % tiles_per_p) * ROWS + r;
+  const int e = row_exp[p], t = row_tok[p];
+  const uint32_t* wbase;
+  const uint16_t* sbase;
+  if (!pick_expert(e, E, w, s, stride_we, stride_se, w_extra, s_extra, wbase, sbase)) {
+    if (l == LPR - 1) out[(long)p * N + n] = 0.f;   // block-uniform: no barrier below is reached
+    return;
+  }
+  const float acc = w4a8_slab_prep_body<K, LPR>(wbase, sbase, x, t, n, l, xl, xsl, xsuml);
+  if (l == LPR - 1) out[(long)p * N + n] = acc;
+}
+
+// ---------------------------------------------------------------------------------------------
+// D1 prep fold for the "shared expert as expert #E" flow (VLLM_GFX908_SHARED_AS_EXPERT=1): the
+// activation quant AND the row-list / gate preparation both ride along with the gate_up slab, so
+// quant_q8_gate disappears as well and the layer keeps its four launches.
+//
+// The slab blocks must NOT read `row_exp`: the gate blocks of this same launch write it.  They do
+// not need to -- the expert of a pair is a pure function of topk_ids given the interleaved row
+// layout (row p = m*(topk+1) + slot, m = row_tok[p]):
+//     slot == topk  ->  E (the shared expert)      slot < topk  ->  topk_ids[m*topk + slot]
+// which is exactly the value gate_row writes.  `row_exp` / `wcomb` are still produced, by the M
+// extra blocks at the end of the grid, for the later rowlane GEMV and the weighted-sum reduce --
+// both separate launches, so there is no intra-launch dependency.
+template <int K, int LPR>
+__global__ void __launch_bounds__(256) w4a8_slab_prep_gate_kernel(
+    const uint32_t* __restrict__ w, const uint16_t* __restrict__ s, const uint32_t* __restrict__ x,
+    const int* __restrict__ row_tok, float* __restrict__ out,
+    int N, int P, int E, long stride_we, long stride_se,
+    const uint32_t* __restrict__ w_extra, const uint16_t* __restrict__ s_extra,
+    int nbase, GateArgs ga) {
+  if ((int)blockIdx.x >= nbase) { gate_row(ga, (int)blockIdx.x - nbase); return; }
+  constexpr int ROWS = 64 / LPR, G = K / 32;
+  __shared__ __align__(16) uint32_t xl[K / 4];
+  __shared__ float xsl[G], xsuml[G];
+  const int lane = threadIdx.x & 63, r = lane / LPR, l = lane % LPR, wv = threadIdx.x >> 6;
+  const int tiles_per_p = N / ROWS;
+  const int tile0 = __builtin_amdgcn_readfirstlane(blockIdx.x * 4);
+  const int p = tile0 / tiles_per_p;
+  const int n = ((tile0 + wv) % tiles_per_p) * ROWS + r;
+  const int t = row_tok[p];
+  const int slot = p - t * (ga.topk + 1);
+  const int e = (slot == ga.topk) ? E : ga.topk_ids[t * ga.topk + slot];
+  const uint32_t* wbase;
+  const uint16_t* sbase;
+  if (!pick_expert(e, E, w, s, stride_we, stride_se, w_extra, s_extra, wbase, sbase)) {
+    if (l == LPR - 1) out[(long)p * N + n] = 0.f;
+    return;
+  }
+  const float acc = w4a8_slab_prep_body<K, LPR>(wbase, sbase, x, t, n, l, xl, xsl, xsuml);
   if (l == LPR - 1) out[(long)p * N + n] = acc;
 }
 
@@ -423,9 +491,9 @@ void quant_q8(at::Tensor x, at::Tensor x8, at::Tensor xs, at::Tensor xsum) {
 // Shared expert as expert #E: the row lists / weights for M*(topk+1) pairs, prepared by M extra
 // blocks of the quant kernel (no extra launch).  wg bf16 [K], topk_ids int32 [M, topk],
 // topk_w fp32 [M, topk] -> row_exp int32 [M, topk+1], wcomb fp32 [M, topk+1].
-void quant_q8_gate(at::Tensor x, at::Tensor x8, at::Tensor xs, at::Tensor xsum, at::Tensor wg,
-                   at::Tensor topk_ids, at::Tensor topk_w, at::Tensor row_exp, at::Tensor wcomb,
-                   int64_t E) {
+static GateArgs make_gate_args(const at::Tensor& x, const at::Tensor& wg,
+                               const at::Tensor& topk_ids, const at::Tensor& topk_w,
+                               at::Tensor& row_exp, at::Tensor& wcomb, int64_t E) {
   const int M = x.size(0), K = x.size(1);
   TORCH_CHECK(K % 2 == 0, "gate: K % 2 != 0");
   TORCH_CHECK(wg.scalar_type() == at::kBFloat16 && wg.is_contiguous() && wg.numel() == K);
@@ -447,7 +515,14 @@ void quant_q8_gate(at::Tensor x, at::Tensor x8, at::Tensor xs, at::Tensor xsum, 
   g.khalf = K / 2;
   g.topk = topk;
   g.E = (int)E;
-  launch_quant(x, x8, xs, xsum, &g, M);
+  return g;
+}
+
+void quant_q8_gate(at::Tensor x, at::Tensor x8, at::Tensor xs, at::Tensor xsum, at::Tensor wg,
+                   at::Tensor topk_ids, at::Tensor topk_w, at::Tensor row_exp, at::Tensor wcomb,
+                   int64_t E) {
+  const GateArgs g = make_gate_args(x, wg, topk_ids, topk_w, row_exp, wcomb, E);
+  launch_quant(x, x8, xs, xsum, &g, (int)x.size(0));
 }
 
 // Optional "extra expert" (row_exp == E) weight slab: [1, N, K/8] int32 + [1, N, K/32] bf16.
@@ -559,6 +634,57 @@ void gemv_slab_prep(at::Tensor w, at::Tensor s, at::Tensor x, at::Tensor row_tok
   TORCH_CHECK(false, "gemv_slab_prep: unsupported K/lpr ", K, "/", lpr);
 }
 
+template <int K, int LPR>
+static void launch_slab_prep_gate(const at::Tensor& w, const at::Tensor& s, const at::Tensor& x,
+                                  const at::Tensor& row_tok, at::Tensor& out,
+                                  const at::Tensor& w_extra, const at::Tensor& s_extra,
+                                  const GateArgs& ga, int mrows) {
+  constexpr int ROWS = 64 / LPR;
+  const int P = row_tok.numel(), N = w.size(1), E = w.size(0);
+  TORCH_CHECK(N % ROWS == 0, "gemv_slab_prep_gate: N must be a multiple of ", ROWS);
+  TORCH_CHECK((N / ROWS) % 4 == 0, "gemv_slab_prep_gate: (N/ROWS) % 4 != 0");
+  TORCH_CHECK(w_extra.numel() != 0, "gemv_slab_prep_gate: needs the shared expert's slab");
+  check_extra(w_extra, s_extra, N, K);
+  const long tiles = (long)P * (N / ROWS);
+  const int nbase = (int)((tiles + 3) / 4);
+  auto stream = c10::hip::getCurrentHIPStream().stream();
+  if (nbase > 0) {
+    w4a8_slab_prep_gate_kernel<K, LPR><<<nbase + mrows, 256, 0, stream>>>(
+        reinterpret_cast<const uint32_t*>(w.data_ptr()), reinterpret_cast<const uint16_t*>(s.data_ptr()),
+        reinterpret_cast<const uint32_t*>(x.data_ptr()),
+        row_tok.data_ptr<int32_t>(), out.data_ptr<float>(), N, P, E,
+        (long)N * (K / 8), (long)N * (K / 32),
+        reinterpret_cast<const uint32_t*>(w_extra.data_ptr()),
+        reinterpret_cast<const uint16_t*>(s_extra.data_ptr()), nbase, ga);
+  }
+}
+
+// D1 with BOTH the Q8_1 activation prep and the shared-as-expert row/gate prep folded in, so the
+// quant_q8_gate launch disappears.  x is the raw bf16 activation [M, K]; row_tok is the
+// M*(topk+1) token list; row_exp / wcomb are OUTPUTS (written by the M extra blocks).
+void gemv_slab_prep_gate(at::Tensor w, at::Tensor s, at::Tensor x, at::Tensor row_tok,
+                         at::Tensor out, int64_t lpr, at::Tensor w_extra, at::Tensor s_extra,
+                         at::Tensor wg, at::Tensor topk_ids, at::Tensor topk_w,
+                         at::Tensor row_exp, at::Tensor wcomb, int64_t E) {
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.is_contiguous() && x.dim() == 2,
+              "gemv_slab_prep_gate: x must be contiguous bf16 [M, K]");
+  const int K = x.size(1);
+  check_gemv(w, s, row_tok, row_exp, out, K);
+  TORCH_CHECK((w.scalar_type() == at::kInt && w.size(2) * 8 == K) ||
+                  (w.scalar_type() == at::kByte && w.size(2) * 2 == K),
+              "gemv_slab_prep_gate: w K mismatch");
+  const GateArgs ga = make_gate_args(x, wg, topk_ids, topk_w, row_exp, wcomb, E);
+  const int M = x.size(0);
+  TORCH_CHECK(row_tok.numel() == (long)M * (ga.topk + 1),
+              "gemv_slab_prep_gate: row_tok must have M*(topk+1) entries");
+#define SLABPG_CASE(KK, L) \
+  if (K == KK && lpr == L) { \
+    launch_slab_prep_gate<KK, L>(w, s, x, row_tok, out, w_extra, s_extra, ga, M); return; }
+  SLABPG_CASE(2560, 16) SLABPG_CASE(1536, 16) SLABPG_CASE(160, 16)
+#undef SLABPG_CASE
+  TORCH_CHECK(false, "gemv_slab_prep_gate: unsupported K/lpr ", K, "/", lpr);
+}
+
 // D2. K == 160 only; N % 64 == 0; out fp32 [P, N]; wpb in {1, 4}.
 void gemv_rowlane(at::Tensor w, at::Tensor s, at::Tensor x8, at::Tensor xs, at::Tensor xsum,
                   at::Tensor row_tok, at::Tensor row_exp, at::Tensor out, int64_t wpb,
@@ -599,6 +725,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gemv_slab_prep", &gemv_slab_prep,
         "w, s, x bf16 [R,K], row_tok, row_exp, out fp32 [P,N], lpr(16), w_extra, s_extra "
         "(Q8_1 prep folded into the LDS staging)");
+  m.def("gemv_slab_prep_gate", &gemv_slab_prep_gate,
+        "w, s, x bf16 [M,K], row_tok, out fp32 [P,N], lpr(16), w_extra, s_extra, wg, topk_ids, "
+        "topk_w, row_exp(out), wcomb(out), E  (Q8_1 prep + shared-as-expert row/gate prep folded "
+        "into the slab GEMV)");
   m.def("gemv_rowlane", &gemv_rowlane,
         "w, s, x8, xs, xsum, row_tok, row_exp, out fp32 [P,N], wpb(1|4), w_extra, s_extra  (K=160)");
 }

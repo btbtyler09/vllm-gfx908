@@ -259,6 +259,16 @@ def gemv_slab_prep(w, s, x, row_tok, row_exp, extra=None) -> torch.Tensor:
     return out
 
 
+def gemv_slab_prep_gate(w, s, x, row_tok, row_exp, wcomb, wg, topk_ids, topk_w, E, extra):
+    """D1 with BOTH the Q8_1 prep and the shared-as-expert row/gate prep folded in (no quant_q8_gate
+    launch).  ``row_exp`` / ``wcomb`` are written by M extra blocks of this same launch; the slab
+    blocks derive their expert from ``topk_ids`` instead of reading ``row_exp``."""
+    out = torch.empty((row_tok.numel(), w.shape[1]), dtype=torch.float32, device=x.device)
+    _ext().gemv_slab_prep_gate(w, s, x, row_tok, out, 16, extra[0], extra[1],
+                               wg, topk_ids, topk_w, row_exp, wcomb, E)
+    return out
+
+
 def gemv_rowlane(w, s, x8, xs, xsum, row_tok, row_exp, wpb: int = 4, extra=None) -> torch.Tensor:
     """D2 (K == 160): w [E, N, 20] int32, s [E, N, 5] bf16 -> fp32 [P, N]."""
     out = torch.empty((row_tok.numel(), w.shape[1]), dtype=torch.float32, device=x8.device)
@@ -316,6 +326,14 @@ def gemv_slab_f16_prep(w, s, x, row_tok, row_exp, extra=None) -> torch.Tensor:
     out = torch.empty((row_tok.numel(), w.shape[1]), dtype=torch.float32, device=x.device)
     wx, sx = _extra_pair(extra, x.device)
     _ext_f16().gemv_slab_f16_prep(w, s, x, row_tok, row_exp, out, 16, wx, sx)
+    return out
+
+
+def gemv_slab_f16_prep_gate(w, s, x, row_tok, row_exp, wcomb, wg, topk_ids, topk_w, E, extra):
+    """D5 slab with BOTH the fp16 cast and the shared-as-expert row/gate prep folded in."""
+    out = torch.empty((row_tok.numel(), w.shape[1]), dtype=torch.float32, device=x.device)
+    _ext_f16().gemv_slab_f16_prep_gate(w, s, x, row_tok, out, 16, extra[0], extra[1],
+                                       wg, topk_ids, topk_w, row_exp, wcomb, E)
     return out
 
 
@@ -536,8 +554,11 @@ def moe_w4a8(
     extra1 = extra2 = None
     wsum = topk_weights.reshape(-1).to(torch.float32)
     rows = topk
-    # the gate_up activation prep rides along with the slab kernel's LDS staging (-1 launch)
+    # the gate_up activation prep rides along with the slab kernel's LDS staging (-1 launch).
+    # With the shared expert folded in as expert #E the row-list / gate prep rides along too
+    # (fold_gate), so that flow also drops from five launches to four.
     fold = shared is None and prep_fold_applies(N1, K, P)
+    fold_gate = False
 
     if shared is not None:
         if not (mul_routed_weight and shared_pack_applies(shared, E, N1, K, K2)):
@@ -550,7 +571,10 @@ def moe_w4a8(
         tkw = topk_weights.reshape(M, topk).to(torch.float32).contiguous()
         w1x, s1x, w2x, s2x, wg = shared
         extra1, extra2 = (w1x, s1x), (w2x, s2x)
-        if w4a8_mode() == "f16":
+        fold_gate = prep_fold_applies(N1, K, row_token.numel())
+        if fold_gate:
+            pass                              # folded into the gate_up slab below
+        elif w4a8_mode() == "f16":
             xh = cast_f16_gate(hidden_states, wg, ids, tkw, row_expert_f, wcomb, E)
         else:
             x8, xs, xsum = quant_q8_gate(hidden_states, wg, ids, tkw, row_expert_f, wcomb, E)
@@ -565,19 +589,23 @@ def moe_w4a8(
         x8, xs, xsum = quant_q8(hidden_states)
 
     if w4a8_mode() == "f16":
-        part1 = (
-            gemv_slab_f16_prep(w1_i, w1_scale, hidden_states, row_token, row_expert)
-            if fold
-            else gemv_slab_f16(w1_i, w1_scale, xh, row_token, row_expert, extra=extra1)
-        )
+        if fold_gate:
+            part1 = gemv_slab_f16_prep_gate(w1_i, w1_scale, hidden_states, row_token, row_expert,
+                                            wcomb, wg, ids, tkw, E, extra1)
+        elif fold:
+            part1 = gemv_slab_f16_prep(w1_i, w1_scale, hidden_states, row_token, row_expert)
+        else:
+            part1 = gemv_slab_f16(w1_i, w1_scale, xh, row_token, row_expert, extra=extra1)
         ih = silu_mul_cast(part1)
         part2 = gemv_rowlane_f16(w2_i, w2_scale, ih, row_self, row_expert, wpb=4, extra=extra2)
     else:
-        part1 = (
-            gemv_slab_prep(w1_i, w1_scale, hidden_states, row_token, row_expert)
-            if fold
-            else gemv_slab(w1_i, w1_scale, x8, xs, xsum, row_token, row_expert, wpb=4, extra=extra1)
-        )
+        if fold_gate:
+            part1 = gemv_slab_prep_gate(w1_i, w1_scale, hidden_states, row_token, row_expert,
+                                        wcomb, wg, ids, tkw, E, extra1)
+        elif fold:
+            part1 = gemv_slab_prep(w1_i, w1_scale, hidden_states, row_token, row_expert)
+        else:
+            part1 = gemv_slab(w1_i, w1_scale, x8, xs, xsum, row_token, row_expert, wpb=4, extra=extra1)
         i8, isc, isum = silu_mul_quant(part1)
         part2 = gemv_rowlane(w2_i, w2_scale, i8, isc, isum, row_self, row_expert, wpb=4, extra=extra2)
     rb2 = 1024
