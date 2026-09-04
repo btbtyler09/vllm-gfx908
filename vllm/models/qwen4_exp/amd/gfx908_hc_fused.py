@@ -61,6 +61,9 @@ from vllm.utils.torch_utils import direct_register_custom_op
 logger = init_logger(__name__)
 
 HC_FUSED_MAX_M = 4
+# The M <= 3 kernels (HEAD's, byte-identical) live in the small W8 module; NB = 4..8 are in
+# gfx908_wv_fused_w8_big_ext.  This boundary is fixed by the kernel set, not by the default range.
+_W8_SMALL_MAX_M = 3
 # VLLM_GFX908_HC_FUSED_MAX_M: the fused chain (bf16 and W8) used to stop at M = 3 because
 # wvSplitK stages the whole [M, K] activation in the 64 KB of LDS and mix_down has K = 10240
 # (3 * 10240 * 2 B = 60 KB, 4 rows do not fit).  Both kernels now stage the activation in
@@ -211,7 +214,7 @@ def hc_w8_enabled() -> bool:
         if _W8_FLAG:
             try:
                 _ext_w8()
-                if hc_fused_max_m() > HC_FUSED_MAX_M:
+                if hc_fused_max_m() > _W8_SMALL_MAX_M:
                     _ext_w8_big()
             except Exception as exc:
                 logger.warning_once("gfx908: HC W8 extension unavailable (%s)", exc)
@@ -798,7 +801,7 @@ def _hc_mix_local(
             del lora, injection, y
 
     if ed is not None and ed.q is not None and M <= hc_fused_max_m() and xn.is_contiguous():
-        ext = _ext_w8() if M <= HC_FUSED_MAX_M else _ext_w8_big()
+        ext = _ext_w8() if M <= _W8_SMALL_MAX_M else _ext_w8_big()
         cu = _cu_count()
         yt, un, lpr, ks = _CFG_DOWN.get(M, _CFG_DOWN_DEFAULT)
         down = torch.empty((M, ed.q.shape[0]), dtype=xn.dtype, device=xn.device)
