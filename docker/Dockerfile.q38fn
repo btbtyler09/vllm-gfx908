@@ -1,0 +1,16 @@
+# Qwen3.8-Flash-Next serving image for 4xMI100: validated base + current vllm tree,
+# with every gfx908 HIP extension prebuilt (no GPU needed at build time).
+FROM btbtyler09/vllm-rocm-gfx908:latest
+COPY overlay/vllm/ /usr/local/lib/python3.12/dist-packages/vllm/
+COPY prebuild_gfx908_exts.py /opt/prebuild_gfx908_exts.py
+ENV VLLM_GFX908_HIP_BUILD_DIR=/opt/vllm-gfx908-ext
+RUN python3 /opt/prebuild_gfx908_exts.py && ls -R /opt/vllm-gfx908-ext | grep -c '\.so$'
+# Validated gfx908 decode-path defaults (2026-09-04, rounds 4-6): every flag is a kernel path
+# that passed greedy-logprob parity, PPL and GSM8K on 4x MI100; override at `docker run` to A/B.
+ENV VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_CUSTOM_AR=0 VLLM_MI100_TORCH_COMPILE=1 \
+    VLLM_PLE_MMAP=1 VLLM_PLE_MMAP_PINNED=1 VLLM_PLE_MMAP_PREWARM=1 VLLM_PLE_MMAP_SERIAL=4096 \
+    VLLM_PLE_ZEROCOPY=1 VLLM_DISABLED_KERNELS=ConchLinearKernel \
+    VLLM_GFX908_W4_GEMV=1 VLLM_GFX908_MIDM_GEMM=1 VLLM_GFX908_W4A8=1 VLLM_GFX908_W4A8_MODE=int8 \
+    VLLM_GFX908_ROUTER_FUSED=1 VLLM_GFX908_ROUTER_FUSED_BF16=1 \
+    VLLM_GFX908_W8A16=1 VLLM_GFX908_W8A16_GS=128 VLLM_GFX908_W8A16_FREE=gdn \
+    VLLM_GFX908_SHARED_AS_EXPERT=1 VLLM_GFX908_GDN_FUSED=1

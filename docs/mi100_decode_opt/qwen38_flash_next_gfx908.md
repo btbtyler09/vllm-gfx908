@@ -209,3 +209,11 @@ Working method that got here: research agents (read-only, one bottleneck each) -
 agents (env-gated, unit test in the container) -> the orchestrator's server gate (3 probes,
 greedy parity at c=1/c=16, PPL, GSM8K at a concurrency that actually exercises the new path).
 Two integration bugs were caught only by the parity gate (router on zero logits; UVA ring).
+
+### Release rc3 (2026-09-04)
+
+`btbtyler09/vllm-rocm-gfx908:v0.28.0rc3.dev-q38fn` = tree `e79c3b2f49` + every gfx908 HIP extension
+prebuilt in `/opt/vllm-gfx908-ext` (`tools/prebuild_gfx908_exts.py`, `docker/Dockerfile.q38fn`) + the
+validated env defaults baked in (`docker run ... env | grep GFX908`), so the canonical serve line
+needs no flags beyond the base command in this doc's first section. Validation: boots in ~9 min
+(no JIT), c=1 88.7-89.0 tok/s, greedy fingerprints bit-identical to the overlay build (16/16).
