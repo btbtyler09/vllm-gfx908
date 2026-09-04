@@ -372,3 +372,32 @@ round already in rc4 measured warm.
 c=1 decode is unchanged within the boot floor; the gains are TTFT (-18%
 single user), c=4..16 decode (+7..10%, HC range 4) and the 16K tier (+8%,
 MoE M=8192 key + tiled QSA measured warm).
+
+## Round 9 scoping (2026-09-04, night): megakernel = no; the GEMVs are latency-bound
+
+Feasibility study on gfx908 (agents/megakernel/REPORT.md), all graph-captured:
+
+| quantity | measured |
+|---|---|
+| graph node cost (empty kernel) | 1.52 us @ grid 1, 1.6 @ 120-220 WGs, 2.0 @ 480, 2.8 @ 960 |
+| co-residency, 256-thread WGs | 3 blocks/CU at 69..100 VGPR (360 resident); 8 at <=25 VGPR |
+| grid barrier (sense-reversing atomic + s_sleep) | 1.31 us @ 120 WGs, 1.36 @ 240, 2.31 @ 480, 5.65 @ 960 |
+| per-row dataflow counter waits (440) | 0.3-0.9 us aggregate |
+| bandwidth stolen by 60..360 spinning WGs | <= 1.3% (deadlock above residency) |
+| MoE layer M=1 shared-as-expert int8, cold | 23.5 us, 5 nodes, 7.25 MiB -> byte floor 7.95 us (2.95x) |
+| prototype persistent MoE layer (slab -> silu/quant -> rowlane, counters) | 21.3 us vs 16.2 us for the 3-node chain (+31%); 15.9 us with the waits removed (-2%) |
+
+So synchronization is cheap on this GPU; what loses is any fusion that makes
+part of the grid wait while the rest works, because a workgroup's CU slot is
+bound at dispatch and a kernel boundary is a free machine-wide re-pack. That
+is why the shipped fusions (shared-as-expert, GDN glue, fused router, HC
+chain) work: none adds a cross-workgroup dependency. Ceiling of a perfect
+non-blocking scheduler here: ~1.8% of the MoE layer. Dropped.
+
+The number that matters from the study is the baseline: the M=1 MoE layer
+streams 7.25 MiB in 23.5 us, a third of HBM bandwidth. The per-expert slices
+are small (~22 KB per workgroup), so the GEMV is latency-bound, not
+bandwidth-bound. Closing half of that gap is ~-0.35 ms/step across 48 layers,
+the largest single lever left at c=1. Next agent: bytes-in-flight per lane in
+the W4A8 slab kernel (deeper unroll / more outstanding buffer loads, wider
+per-lane vectors, expert-slice-aware tiling), cold-L2, same bit-exactness gate.
