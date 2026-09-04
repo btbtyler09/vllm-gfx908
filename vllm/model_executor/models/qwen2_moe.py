@@ -114,6 +114,12 @@ class Qwen2MoeMLP(nn.Module):
         self.expert_gate = expert_gate
 
     def forward(self, x):
+        # gfx908 decode (M <= 16): the fused shared-expert MLP.  With
+        # VLLM_GFX908_SHARED_AS_EXPERT=1 and M <= 8 this op does NOT compute the shared expert:
+        # it hands its input and (repacked) weights to the routed W4 MoE GEMVs, which run
+        # immediately after it and emit routed + shared in one pass, and returns zeros here so
+        # the runner's `shared_output + fused_output` is a no-op add.  Prefill / M > 8 / env off
+        # take the stock path below or the unfused fast path inside the op.
         if self.expert_gate is not None and _gfx908_shared_expert_applies(self, x):
             return _gfx908_shared_expert_forward(self, x)
         gate_up, _ = self.gate_up_proj(x)

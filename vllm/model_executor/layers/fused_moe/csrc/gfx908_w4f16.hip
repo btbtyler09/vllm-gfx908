@@ -98,12 +98,72 @@ __device__ __forceinline__ float group_dot(const uint4& q, const uint4* x) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// "shared expert as expert #E" row preparation (VLLM_GFX908_SHARED_AS_EXPERT=1).  One block of
+// 256 threads per token m, launched as EXTRA BLOCKS of the activation prep kernel so it costs no
+// extra launch and needs no sync (the consumers are later kernels).  For token m it writes
+//   row_exp[m, 0:topk] = topk_ids[m, :]   row_exp[m, topk] = E   (the shared-expert row)
+//   wcomb [m, 0:topk] = topk_w  [m, :]    wcomb [m, topk] = sigmoid(x[m] . w_gate)
+// so the existing weighted-sum reduce produces routed + shared in one pass.
+struct GateArgs {
+  const uint32_t* x2;    // bf16 [M, K] viewed as uint32 [M, K/2]
+  const uint32_t* wg2;   // bf16 [K]    viewed as uint32 [K/2]
+  const int* topk_ids;   // int32 [M, topk]
+  const float* topk_w;   // fp32  [M, topk]
+  int* row_exp;          // int32 [M, topk+1]  (written)
+  float* wcomb;          // fp32  [M, topk+1]  (written)
+  int khalf, topk, E;
+};
+
+__device__ __forceinline__ void gate_row(const GateArgs& g, int m) {
+  __shared__ float red[256];
+  const int tid = threadIdx.x, stride = g.topk + 1;
+  for (int i = tid; i < g.topk; i += 256) {
+    g.row_exp[m * stride + i] = g.topk_ids[m * g.topk + i];
+    g.wcomb[m * stride + i] = g.topk_w[m * g.topk + i];
+  }
+  const uint32_t* xr = g.x2 + (long)m * g.khalf;
+  float acc = 0.f;
+  for (int k = tid; k < g.khalf; k += 256) {
+    const uint32_t a = xr[k], b = g.wg2[k];
+    acc = fmaf(bf2f(a & 0xFFFFu), bf2f(b & 0xFFFFu), acc);
+    acc = fmaf(__uint_as_float(a & 0xFFFF0000u), __uint_as_float(b & 0xFFFF0000u), acc);
+  }
+  red[tid] = acc;
+  __syncthreads();
+  for (int o = 128; o > 0; o >>= 1) {
+    if (tid < o) red[tid] += red[tid + o];
+    __syncthreads();
+  }
+  if (tid == 0) {
+    g.row_exp[m * stride + g.topk] = g.E;
+    g.wcomb[m * stride + g.topk] = 1.f / (1.f + expf(-red[0]));
+  }
+}
+
+// Pick the weight/scale base row for pair p: the "extra expert" slab when row_exp[p] == E and an
+// extra pointer was given, the routed expert e when 0 <= e < E, otherwise "zero this row".
+__device__ __forceinline__ bool pick_expert(
+    int e, int E, const uint32_t* w, const uint16_t* s, long stride_we, long stride_se,
+    const uint32_t* w_extra, const uint16_t* s_extra, const uint32_t*& wb, const uint16_t*& sb) {
+  if (w_extra != nullptr && e == E) { wb = w_extra; sb = s_extra; return true; }
+  if (e < 0 || e >= E) return false;
+  wb = w + (long)e * stride_we;
+  sb = s + (long)e * stride_se;
+  return true;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Activation cast: one thread per (row, group of 32). x bf16 [R, K] -> xh fp16 [R, K], per-8
 // permuted to [k0 k4 k1 k5 k2 k6 k3 k7].  CHECK=1 also reports fp16 overflow / flush-to-zero
 // counts and max|x| in ovf[0..2] (the fp16 range audit; CHECK=0 is the production path).
-template <int CHECK>
+// GATE=1 appends the M row-prep blocks described above.
+template <int CHECK, int GATE>
 __global__ void __launch_bounds__(256) cast_f16_kernel(
-    const uint32_t* __restrict__ x, uint4* __restrict__ xh, uint32_t* __restrict__ ovf, int total) {
+    const uint32_t* __restrict__ x, uint4* __restrict__ xh, uint32_t* __restrict__ ovf, int total,
+    int nbase, GateArgs ga) {
+  if constexpr (GATE) {
+    if ((int)blockIdx.x >= nbase) { gate_row(ga, (int)blockIdx.x - nbase); return; }
+  }
   const int gid = blockIdx.x * 256 + threadIdx.x;
   if (gid >= total) return;
   const uint4* xp = reinterpret_cast<const uint4*>(x) + (long)gid * 4;   // 64 B = 32 bf16
@@ -160,7 +220,8 @@ template <int K, int LPR, int WPB>
 __global__ void __launch_bounds__(64 * WPB) w4f16_slab_kernel(
     const uint32_t* __restrict__ w, const uint16_t* __restrict__ s, const uint16_t* __restrict__ xh,
     const int* __restrict__ row_tok, const int* __restrict__ row_exp, float* __restrict__ out,
-    int N, int P, int E, long stride_we, long stride_se) {
+    int N, int P, int E, long stride_we, long stride_se,
+    const uint32_t* __restrict__ w_extra, const uint16_t* __restrict__ s_extra) {
   constexpr int ROWS = 64 / LPR, G = K / 32, GPL = (G + LPR - 1) / LPR;
   const int lane = threadIdx.x & 63, r = lane / LPR, l = lane % LPR;
   const int tiles_per_p = N / ROWS;
@@ -168,12 +229,14 @@ __global__ void __launch_bounds__(64 * WPB) w4f16_slab_kernel(
   if (tile >= P * tiles_per_p) return;
   const int p = tile / tiles_per_p, n = (tile % tiles_per_p) * ROWS + r;
   const int e = row_exp[p], t = row_tok[p];
-  if (e < 0 || e >= E) {
+  const uint32_t* wb;
+  const uint16_t* sb;
+  if (!pick_expert(e, E, w, s, stride_we, stride_se, w_extra, s_extra, wb, sb)) {
     if (l == LPR - 1) out[(long)p * N + n] = 0.f;
     return;
   }
-  const uint4* wp = reinterpret_cast<const uint4*>(w + e * stride_we + (long)n * (K / 8)) + l;
-  const uint16_t* sp = s + e * stride_se + (long)n * G + l;
+  const uint4* wp = reinterpret_cast<const uint4*>(wb + (long)n * (K / 8)) + l;
+  const uint16_t* sp = sb + (long)n * G + l;
   const uint4* xp = reinterpret_cast<const uint4*>(xh + (long)t * K) + 4 * l;  // 4 uint4 per group
   uint4 q[GPL], xv[GPL * 4];
   uint32_t sc[GPL];
@@ -207,7 +270,8 @@ template <int K, int LPR>
 __global__ void __launch_bounds__(256) w4f16_slab_lds_kernel(
     const uint32_t* __restrict__ w, const uint16_t* __restrict__ s, const uint16_t* __restrict__ xh,
     const int* __restrict__ row_tok, const int* __restrict__ row_exp, float* __restrict__ out,
-    int N, int P, int E, long stride_we, long stride_se) {
+    int N, int P, int E, long stride_we, long stride_se,
+    const uint32_t* __restrict__ w_extra, const uint16_t* __restrict__ s_extra) {
   constexpr int ROWS = 64 / LPR, G = K / 32, GPL = (G + LPR - 1) / LPR;
   __shared__ __align__(16) uint16_t xl[K];
   const int lane = threadIdx.x & 63, r = lane / LPR, l = lane % LPR, wv = threadIdx.x >> 6;
@@ -216,12 +280,14 @@ __global__ void __launch_bounds__(256) w4f16_slab_lds_kernel(
   const int p = tile0 / tiles_per_p;
   const int n = ((tile0 + wv) % tiles_per_p) * ROWS + r;
   const int e = row_exp[p], t = row_tok[p];
-  if (e < 0 || e >= E) {                       // block-uniform
+  const uint32_t* wb;
+  const uint16_t* sb;
+  if (!pick_expert(e, E, w, s, stride_we, stride_se, w_extra, s_extra, wb, sb)) {  // block-uniform
     if (l == LPR - 1) out[(long)p * N + n] = 0.f;
     return;
   }
-  const uint4* wp = reinterpret_cast<const uint4*>(w + e * stride_we + (long)n * (K / 8)) + l;
-  const uint16_t* sp = s + e * stride_se + (long)n * G + l;
+  const uint4* wp = reinterpret_cast<const uint4*>(wb + (long)n * (K / 8)) + l;
+  const uint16_t* sp = sb + (long)n * G + l;
   uint4 q[GPL];
   uint32_t sc[GPL];
 #pragma unroll
@@ -250,7 +316,8 @@ template <int K, int WPB>
 __global__ void __launch_bounds__(64 * WPB) w4f16_rowlane_kernel(
     const uint32_t* __restrict__ w, const uint16_t* __restrict__ s, const uint16_t* __restrict__ xh,
     const int* __restrict__ row_tok, const int* __restrict__ row_exp, float* __restrict__ out,
-    int N, int P, int E, long stride_we, long stride_se) {
+    int N, int P, int E, long stride_we, long stride_se,
+    const uint32_t* __restrict__ w_extra, const uint16_t* __restrict__ s_extra) {
   constexpr int G = K / 32;
   const int lane = threadIdx.x & 63;
   const int waves_per_p = N / 64;
@@ -258,9 +325,14 @@ __global__ void __launch_bounds__(64 * WPB) w4f16_rowlane_kernel(
   if (wave >= P * waves_per_p) return;
   const int p = wave / waves_per_p, n = (wave % waves_per_p) * 64 + lane;
   const int e = row_exp[p], t = row_tok[p];
-  if (e < 0 || e >= E) { out[(long)p * N + n] = 0.f; return; }
-  const uint4* wp = reinterpret_cast<const uint4*>(w + e * stride_we + (long)n * (K / 8));
-  const uint16_t* sp = s + e * stride_se + (long)n * G;
+  const uint32_t* wb;
+  const uint16_t* sb;
+  if (!pick_expert(e, E, w, s, stride_we, stride_se, w_extra, s_extra, wb, sb)) {
+    out[(long)p * N + n] = 0.f;
+    return;
+  }
+  const uint4* wp = reinterpret_cast<const uint4*>(wb + (long)n * (K / 8));
+  const uint16_t* sp = sb + (long)n * G;
   uint4 q[G];
   uint32_t sc[G];
 #pragma unroll
@@ -293,7 +365,8 @@ static void check_gemv(const at::Tensor& w, const at::Tensor& s, const at::Tenso
   TORCH_CHECK(out.size(0) == row_tok.numel() && out.size(1) == w.size(1));
 }
 
-static void launch_cast(const at::Tensor& x, at::Tensor& xh, uint32_t* ovf, bool check) {
+static void launch_cast(const at::Tensor& x, at::Tensor& xh, uint32_t* ovf, bool check,
+                        const GateArgs* ga, int mrows) {
   TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.is_contiguous() && x.dim() == 2);
   const int R = x.size(0), K = x.size(1);
   TORCH_CHECK(K % 32 == 0, "cast_f16: K % 32 != 0");
@@ -304,50 +377,109 @@ static void launch_cast(const at::Tensor& x, at::Tensor& xh, uint32_t* ovf, bool
   if (total <= 0) return;
   const uint32_t* xp = reinterpret_cast<const uint32_t*>(x.data_ptr());
   uint4* hp = reinterpret_cast<uint4*>(xh.data_ptr());
-  if (check) {
-    cast_f16_kernel<1><<<(total + 255) / 256, 256, 0, stream>>>(xp, hp, ovf, total);
+  const int nbase = (total + 255) / 256;
+  if (ga != nullptr) {
+    cast_f16_kernel<0, 1><<<nbase + mrows, 256, 0, stream>>>(xp, hp, nullptr, total, nbase, *ga);
+  } else if (check) {
+    cast_f16_kernel<1, 0><<<nbase, 256, 0, stream>>>(xp, hp, ovf, total, nbase, GateArgs{});
   } else {
-    cast_f16_kernel<0><<<(total + 255) / 256, 256, 0, stream>>>(xp, hp, nullptr, total);
+    cast_f16_kernel<0, 0><<<nbase, 256, 0, stream>>>(xp, hp, nullptr, total, nbase, GateArgs{});
   }
 }
 
 // x bf16 [R, K] (K % 32 == 0) -> xh fp16 [R, K], per-8 permuted [k0 k4 k1 k5 k2 k6 k3 k7]
-void cast_f16(at::Tensor x, at::Tensor xh) { launch_cast(x, xh, nullptr, false); }
+void cast_f16(at::Tensor x, at::Tensor xh) { launch_cast(x, xh, nullptr, false, nullptr, 0); }
 
 // same, plus the fp16 range audit: ovf int32 [>=3] = {#overflows, #flush-to-zero, bits(max|x|)}
 void cast_f16_audit(at::Tensor x, at::Tensor xh, at::Tensor ovf) {
   TORCH_CHECK(ovf.numel() >= 3 && ovf.scalar_type() == at::kInt && ovf.is_contiguous());
-  launch_cast(x, xh, reinterpret_cast<uint32_t*>(ovf.data_ptr()), true);
+  launch_cast(x, xh, reinterpret_cast<uint32_t*>(ovf.data_ptr()), true, nullptr, 0);
+}
+
+// Shared expert as expert #E: the row lists / weights for M*(topk+1) pairs, prepared by M extra
+// blocks of the cast kernel (no extra launch).  wg bf16 [K], topk_ids int32 [M, topk],
+// topk_w fp32 [M, topk] -> row_exp int32 [M, topk+1], wcomb fp32 [M, topk+1].
+static GateArgs make_gate_args(const at::Tensor& x, const at::Tensor& wg, const at::Tensor& topk_ids,
+                               const at::Tensor& topk_w, at::Tensor& row_exp, at::Tensor& wcomb,
+                               int64_t E) {
+  const int M = x.size(0), K = x.size(1);
+  TORCH_CHECK(K % 2 == 0, "gate: K % 2 != 0");
+  TORCH_CHECK(wg.scalar_type() == at::kBFloat16 && wg.is_contiguous() && wg.numel() == K);
+  TORCH_CHECK(topk_ids.scalar_type() == at::kInt && topk_ids.is_contiguous() && topk_ids.dim() == 2);
+  TORCH_CHECK(topk_w.scalar_type() == at::kFloat && topk_w.is_contiguous() && topk_w.dim() == 2);
+  TORCH_CHECK(topk_ids.size(0) == M && topk_w.size(0) == M && topk_ids.size(1) == topk_w.size(1));
+  const int topk = topk_ids.size(1);
+  TORCH_CHECK(row_exp.scalar_type() == at::kInt && row_exp.is_contiguous() &&
+              row_exp.numel() == (long)M * (topk + 1));
+  TORCH_CHECK(wcomb.scalar_type() == at::kFloat && wcomb.is_contiguous() &&
+              wcomb.numel() == (long)M * (topk + 1));
+  GateArgs g;
+  g.x2 = reinterpret_cast<const uint32_t*>(x.data_ptr());
+  g.wg2 = reinterpret_cast<const uint32_t*>(wg.data_ptr());
+  g.topk_ids = topk_ids.data_ptr<int32_t>();
+  g.topk_w = topk_w.data_ptr<float>();
+  g.row_exp = row_exp.data_ptr<int32_t>();
+  g.wcomb = wcomb.data_ptr<float>();
+  g.khalf = K / 2;
+  g.topk = topk;
+  g.E = (int)E;
+  return g;
+}
+
+void cast_f16_gate(at::Tensor x, at::Tensor xh, at::Tensor wg, at::Tensor topk_ids,
+                   at::Tensor topk_w, at::Tensor row_exp, at::Tensor wcomb, int64_t E) {
+  GateArgs g = make_gate_args(x, wg, topk_ids, topk_w, row_exp, wcomb, E);
+  launch_cast(x, xh, nullptr, false, &g, (int)x.size(0));
+}
+
+// Optional "extra expert" (row_exp == E) weight slab: [1, N, K/8] int32 + [1, N, K/32] bf16.
+// An empty tensor means "no extra expert" (the pre-fusion behaviour: row_exp >= E -> zero row).
+static void check_extra(const at::Tensor& w_extra, const at::Tensor& s_extra, int N, int K) {
+  if (w_extra.numel() == 0) {
+    TORCH_CHECK(s_extra.numel() == 0, "extra: w/s must both be empty or both given");
+    return;
+  }
+  TORCH_CHECK(w_extra.is_contiguous() && s_extra.is_contiguous());
+  TORCH_CHECK(w_extra.dim() == 3 && s_extra.dim() == 3 && w_extra.size(0) == 1 && s_extra.size(0) == 1);
+  TORCH_CHECK(w_extra.size(1) == N && s_extra.size(1) == N && s_extra.size(2) == K / 32);
+  TORCH_CHECK(s_extra.scalar_type() == at::kBFloat16);
+  TORCH_CHECK((w_extra.scalar_type() == at::kInt && w_extra.size(2) * 8 == K) ||
+              (w_extra.scalar_type() == at::kByte && w_extra.size(2) * 2 == K));
 }
 
 template <int K, int LPR, int WPB, int MODE>
 static void launch_slab(const at::Tensor& w, const at::Tensor& s, const at::Tensor& xh,
-                        const at::Tensor& row_tok, const at::Tensor& row_exp, at::Tensor& out) {
+                        const at::Tensor& row_tok, const at::Tensor& row_exp, at::Tensor& out,
+                        const at::Tensor& w_extra, const at::Tensor& s_extra) {
   constexpr int ROWS = 64 / LPR;
   const int P = row_tok.numel(), N = w.size(1), E = w.size(0);
   TORCH_CHECK(N % ROWS == 0, "gemv_slab_f16: N must be a multiple of ", ROWS);
+  check_extra(w_extra, s_extra, N, K);
   const long tiles = (long)P * (N / ROWS);
   auto stream = c10::hip::getCurrentHIPStream().stream();
   if (tiles <= 0) return;
   const uint32_t* wp = reinterpret_cast<const uint32_t*>(w.data_ptr());
   const uint16_t* sp = reinterpret_cast<const uint16_t*>(s.data_ptr());
   const uint16_t* xp = reinterpret_cast<const uint16_t*>(xh.data_ptr());
+  const uint32_t* wx = w_extra.numel() ? reinterpret_cast<const uint32_t*>(w_extra.data_ptr()) : nullptr;
+  const uint16_t* sx = w_extra.numel() ? reinterpret_cast<const uint16_t*>(s_extra.data_ptr()) : nullptr;
   if constexpr (MODE == 1) {
     TORCH_CHECK(WPB == 4 && (N / ROWS) % 4 == 0, "gemv_slab_f16: LDS mode needs wpb=4 and (N/ROWS) % 4 == 0");
     w4f16_slab_lds_kernel<K, LPR><<<(tiles + 3) / 4, 256, 0, stream>>>(
         wp, sp, xp, row_tok.data_ptr<int32_t>(), row_exp.data_ptr<int32_t>(), out.data_ptr<float>(),
-        N, P, E, (long)N * (K / 8), (long)N * (K / 32));
+        N, P, E, (long)N * (K / 8), (long)N * (K / 32), wx, sx);
   } else {
     w4f16_slab_kernel<K, LPR, WPB><<<(tiles + WPB - 1) / WPB, 64 * WPB, 0, stream>>>(
         wp, sp, xp, row_tok.data_ptr<int32_t>(), row_exp.data_ptr<int32_t>(), out.data_ptr<float>(),
-        N, P, E, (long)N * (K / 8), (long)N * (K / 32));
+        N, P, E, (long)N * (K / 8), (long)N * (K / 32), wx, sx);
   }
 }
 
 // D5 slab. w [E, N, K/8] int32 (or uint8 [E, N, K/2] viewed), s [E, N, K/32] bf16, out fp32 [P, N].
 // K in {2560, 1536}; lpr = 16; mode 0 = x in VGPRs, 1 = x staged in LDS (needs wpb = 4).
 void gemv_slab_f16(at::Tensor w, at::Tensor s, at::Tensor xh, at::Tensor row_tok,
-                   at::Tensor row_exp, at::Tensor out, int64_t lpr, int64_t mode, int64_t wpb) {
+                   at::Tensor row_exp, at::Tensor out, int64_t lpr, int64_t mode, int64_t wpb,
+                   at::Tensor w_extra, at::Tensor s_extra) {
   const int K = xh.size(1);
   check_act(xh, K);
   check_gemv(w, s, row_tok, row_exp, out, K);
@@ -356,7 +488,7 @@ void gemv_slab_f16(at::Tensor w, at::Tensor s, at::Tensor xh, at::Tensor row_tok
               "gemv_slab_f16: w K mismatch");
 #define SLAB_CASE(KK, L, W, MO)                                                       \
   if (K == KK && lpr == L && wpb == W && mode == MO) {                                \
-    launch_slab<KK, L, W, MO>(w, s, xh, row_tok, row_exp, out); return; }
+    launch_slab<KK, L, W, MO>(w, s, xh, row_tok, row_exp, out, w_extra, s_extra); return; }
   SLAB_CASE(2560, 16, 4, 1) SLAB_CASE(2560, 16, 4, 0) SLAB_CASE(2560, 16, 1, 0)
   SLAB_CASE(1536, 16, 4, 1) SLAB_CASE(1536, 16, 4, 0) SLAB_CASE(1536, 16, 1, 0)
 #undef SLAB_CASE
@@ -365,7 +497,8 @@ void gemv_slab_f16(at::Tensor w, at::Tensor s, at::Tensor xh, at::Tensor row_tok
 
 // D5 rowlane. K == 160 only; N % 64 == 0; out fp32 [P, N]; wpb in {1, 4}.
 void gemv_rowlane_f16(at::Tensor w, at::Tensor s, at::Tensor xh, at::Tensor row_tok,
-                      at::Tensor row_exp, at::Tensor out, int64_t wpb) {
+                      at::Tensor row_exp, at::Tensor out, int64_t wpb, at::Tensor w_extra,
+                      at::Tensor s_extra) {
   const int K = xh.size(1);
   check_act(xh, K);
   check_gemv(w, s, row_tok, row_exp, out, K);
@@ -374,17 +507,20 @@ void gemv_rowlane_f16(at::Tensor w, at::Tensor s, at::Tensor xh, at::Tensor row_
               (w.scalar_type() == at::kByte && w.size(2) == 80));
   const int P = row_tok.numel(), N = w.size(1), E = w.size(0);
   TORCH_CHECK(N % 64 == 0, "gemv_rowlane_f16: N % 64 != 0");
+  check_extra(w_extra, s_extra, N, 160);
   const long waves = (long)P * (N / 64);
   auto stream = c10::hip::getCurrentHIPStream().stream();
   if (waves <= 0) return;
   const uint32_t* wp = reinterpret_cast<const uint32_t*>(w.data_ptr());
   const uint16_t* sp = reinterpret_cast<const uint16_t*>(s.data_ptr());
   const uint16_t* xp = reinterpret_cast<const uint16_t*>(xh.data_ptr());
+  const uint32_t* wx = w_extra.numel() ? reinterpret_cast<const uint32_t*>(w_extra.data_ptr()) : nullptr;
+  const uint16_t* sx = w_extra.numel() ? reinterpret_cast<const uint16_t*>(s_extra.data_ptr()) : nullptr;
 #define ROWLANE_CASE(W)                                                            \
   if (wpb == W) {                                                                  \
     w4f16_rowlane_kernel<160, W><<<(waves + W - 1) / W, 64 * W, 0, stream>>>(      \
         wp, sp, xp, row_tok.data_ptr<int32_t>(), row_exp.data_ptr<int32_t>(),      \
-        out.data_ptr<float>(), N, P, E, (long)N * (160 / 8), (long)N * 5);         \
+        out.data_ptr<float>(), N, P, E, (long)N * (160 / 8), (long)N * 5, wx, sx); \
     return;                                                                        \
   }
   ROWLANE_CASE(1) ROWLANE_CASE(4)
@@ -395,6 +531,10 @@ void gemv_rowlane_f16(at::Tensor w, at::Tensor s, at::Tensor xh, at::Tensor row_
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("cast_f16", &cast_f16, "x bf16 [R,K] -> xh fp16 [R,K] (per-8 permuted [k0 k4 k1 k5 ...])");
   m.def("cast_f16_audit", &cast_f16_audit, "cast_f16 + ovf int32 [>=3] {#ovf, #flush0, bits(max|x|)}");
-  m.def("gemv_slab_f16", &gemv_slab_f16, "w, s, xh, row_tok, row_exp, out fp32 [P,N], lpr(16), mode(0|1), wpb(1|4)");
-  m.def("gemv_rowlane_f16", &gemv_rowlane_f16, "w, s, xh, row_tok, row_exp, out fp32 [P,N], wpb(1|4)  (K=160)");
+  m.def("cast_f16_gate", &cast_f16_gate,
+        "cast_f16 + M extra blocks: row_exp/wcomb [M,topk+1] from topk_ids/topk_w and sigmoid(x.wg)");
+  m.def("gemv_slab_f16", &gemv_slab_f16,
+        "w, s, xh, row_tok, row_exp, out fp32 [P,N], lpr(16), mode(0|1), wpb(1|4), w_extra, s_extra");
+  m.def("gemv_rowlane_f16", &gemv_rowlane_f16,
+        "w, s, xh, row_tok, row_exp, out fp32 [P,N], wpb(1|4), w_extra, s_extra  (K=160)");
 }

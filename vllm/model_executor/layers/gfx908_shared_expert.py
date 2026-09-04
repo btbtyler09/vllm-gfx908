@@ -22,7 +22,12 @@ from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (
     triton_w4a16_gemv_partial_kernel,
 )
 from vllm.model_executor.layers.fused_moe.gfx908_w4a8 import (
-    shared_expert_w4a8,
+    W4A8_MAX_TOKENS,
+    shared_as_expert_enabled,
+    shared_defer,
+    shared_expert_from_pack,
+    shared_pack,
+    shared_register,
     w4a8_enabled,
 )
 from vllm.triton_utils import tl, triton
@@ -101,11 +106,22 @@ def _shared_expert_forward(
     group_size: int, zp_bias: int,
 ) -> torch.Tensor:
     M, K = x.shape
-    if w4a8_enabled() and group_size == 32 and zp_bias == 8:
-        # VLLM_GFX908_W4A8=1: int8-activation dot4 GEMVs (gfx908_w4a8.py); None -> stock path
-        out = shared_expert_w4a8(x, wq1, ws1, wq2, ws2, wg)
-        if out is not None:
-            return out
+    if (
+        w4a8_enabled() and group_size == 32 and zp_bias == 8
+        and M <= W4A8_MAX_TOKENS and x.dtype == torch.bfloat16
+    ):
+        # VLLM_GFX908_W4A8=1: int8/fp16-activation GEMVs (gfx908_w4a8.py); None -> stock path
+        pack = shared_pack(wq1, ws1, wq2, ws2, wg)
+        if pack is not None:
+            if shared_as_expert_enabled():
+                # VLLM_GFX908_SHARED_AS_EXPERT=1: hand the shared expert to the routed W4 GEMVs
+                # (which run right after this call) and return the zero stand-in.  `shared_defer`
+                # returns None until the routed MoE has confirmed it can consume the hand-off.
+                shared_register(pack)
+                z = shared_defer(x, pack)
+                if z is not None:
+                    return z
+            return shared_expert_from_pack(x, pack)
     part1, n1 = _gemv_partials(x, wq1, ws1, group_size, zp_bias)
     inter = torch.empty((M, n1 // 2), dtype=x.dtype, device=x.device)
     rb = 256

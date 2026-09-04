@@ -24,6 +24,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.gfx908_w4a8 import (
     moe_w4a8,
     moe_w4a8_applies,
+    shared_arm,
+    shared_expert_from_pack,
+    shared_take,
     w4a8_enabled,
 )
 from vllm.triton_utils import tl, triton
@@ -174,12 +177,37 @@ def gfx908_moe_hip(
     w1_i = w1.view(torch.int32)
     w2_i = w2.view(torch.int32)
 
+    # VLLM_GFX908_SHARED_AS_EXPERT=1: the shared expert ran just before us and handed over its
+    # (input, repacked weights) instead of computing itself.  Pop it unconditionally so a
+    # hand-off can never be dropped: either it is folded in as expert #E below, or it is computed
+    # separately here and added to our output (same result, the pre-fusion launch count).
+    pending = shared_take()
+    shared = None
+    if pending is not None and pending[0].data_ptr() == hidden_states.data_ptr() and (
+        pending[0].shape == hidden_states.shape
+    ):
+        shared = pending[1]
+
     if w4a8_enabled() and moe_w4a8_applies(K, N1, group_size, hidden_states.dtype):
         # VLLM_GFX908_W4A8=1: int8-activation dot4 GEMVs, no split-K (gfx908_w4a8.py)
-        return moe_w4a8(
+        out = moe_w4a8(
+            output, hidden_states, w1_i, w2_i, w1_scale, w2_scale, topk_weights,
+            row_token, row_self, row_expert, mul_routed_weight, shared=shared,
+        )
+        if out is not None:
+            if shared is None:
+                shared_arm(w1.shape[0], N1, K, K2, mul_routed_weight)
+                if pending is not None:
+                    out += shared_expert_from_pack(pending[0], pending[1])
+            return out
+        # the fused hand-off could not be taken this call: routed only, shared added separately
+        out = moe_w4a8(
             output, hidden_states, w1_i, w2_i, w1_scale, w2_scale, topk_weights,
             row_token, row_self, row_expert, mul_routed_weight,
         )
+        if pending is not None:
+            out += shared_expert_from_pack(pending[0], pending[1])
+        return out
 
     part1 = torch.empty((sk1, P, N1), dtype=torch.float32, device=dev)
     ext.w4gemv(hidden_states, w1_i, w1_scale, row_token, row_expert, part1, group_size, 1, bn1)
@@ -197,4 +225,7 @@ def gfx908_moe_hip(
         part2.stride(0), part2.stride(1), output.stride(0),
         TOPK=topk, SPLIT_K=sk2, BLOCK=rb2, MUL_W=mul_routed_weight,
     )
+    if pending is not None:
+        # stock split-K routed path: the deferred shared expert still has to be honoured
+        output += shared_expert_from_pack(pending[0], pending[1])
     return output
