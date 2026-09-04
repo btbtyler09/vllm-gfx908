@@ -415,8 +415,13 @@ decode windows, three c=1 probes + one c=4 probe per boot (`ablate.sh`).
 
 Also from the gemv_flight study (agents/gemv_flight/REPORT.md), applied as
 plain parameter changes, `torch.equal` to the shipping kernels: MoE reduce
-`BLOCK` 1024 -> 256 (3 -> 10 workgroups, 3.13 -> 1.98 us at M=1), slab and
-rowlane `wpb` 4 -> 1 on the non-fold path (-0.34 / -0.06 us). The study also
+`BLOCK` 1024 -> 256 (3 -> 10 workgroups, -1.1 / -1.0 / -0.8 us at M=1/4/8),
+slab `wpb` 4 -> 1 gated on tile count (P*N1/4 <= 4096; unconditional wpb=1
+regresses +1.2 us at M=8), gate_row's reduction 8 -> 2 barriers (-0.8 us,
+bitwise identical). The silu*mul+Q8 fold into the down GEMV prologue is in
+too (`VLLM_GFX908_MOE_SILU_FOLD=1`, off): bit-exact with the Triton kernel it
+replaces, but only -0.3 / -0.9 / -1.3 us per layer at M=1/4/8 because every
+down workgroup redoes the group quant. The study also
 refuted the "latency-bound GEMV" reading of the megakernel baseline: load
 latency is ~210 ns flat, the kernels already keep 10-20x the Little's-law
 bytes in flight, and against a size-matched cold floor the slab / rowlane
