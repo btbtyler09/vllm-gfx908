@@ -70,10 +70,21 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         elif current_platform.is_rocm():
             from vllm.platforms.rocm import on_gfx908
 
-            # TEST lever: pre-bind only when opted in; default off keeps the
-            # baseline runtime-dispatch path (VLLM_GFX908_PREBIND_GEMM=1).
-            if on_gfx908() and os.environ.get("VLLM_GFX908_PREBIND_GEMM", "0") == "1":
-                bind_rocm_unquantized_gemm_gfx908(layer)
+            if on_gfx908():
+                # W8A16: quantize lm_head, but never release its bf16 master
+                # copy here — VocabParallelEmbedding.forward reads `weight`
+                # through F.embedding (tied embeddings), which would see the
+                # zero-storage stub. lm_head is excluded from the default free
+                # policy anyway (it runs at M = #sequences every decode step).
+                from vllm.model_executor.layers.gfx908_w8a16 import (
+                    prepare_w8a16_layer,
+                )
+
+                prepare_w8a16_layer(layer, allow_free=False)
+                # TEST lever: pre-bind only when opted in; default off keeps the
+                # baseline runtime-dispatch path (VLLM_GFX908_PREBIND_GEMM=1).
+                if os.environ.get("VLLM_GFX908_PREBIND_GEMM", "0") == "1":
+                    bind_rocm_unquantized_gemm_gfx908(layer)
 
     def apply(
         self,

@@ -24,6 +24,8 @@ from vllm.model_executor.layers.gfx908_midm_gemm import (
     midm_gemm_applies,
 )
 from vllm.model_executor.layers.gfx908_w8a16 import (
+    is_w8a16_freed,
+    prepare_w8a16_layer,
     w8a16_enabled,
     w8a16_gemm,
 )
@@ -614,6 +616,35 @@ def rocm_unquantized_gemm_gfx908_impl(
 ) -> torch.Tensor:
     """gfx908 dispatch implementation (registered as torch custom op below).
 
+    W8A16 (opt-in, VLLM_GFX908_W8A16=1) gets first refusal: an int8 copy of the
+    whitelisted decode projections (GDN in_proj_qkvz / out_proj, lm_head) with
+    bf16 activations. At M <= 4 that is the skinny GEMV (1.5-2.0x graph-timed
+    over wvSplitK, the weight stream being the bottleneck). At M > 4 it only
+    fires for weights whose bf16 master copy has been *released*
+    (VLLM_GFX908_W8A16_FREE), rematerialising the weight into a small reusable
+    scratch and re-entering the bf16 dispatch below per N-chunk.
+
+    Returning None means "not mine" -> the stock bf16 dispatch, bit-for-bit.
+    """
+    if w8a16_enabled():
+        w8_out = w8a16_gemm(x, weight, bias, bf16_fn=_gfx908_gemm_bf16)
+        if w8_out is not None:
+            if os.environ.get("VLLM_GFX908_DEBUG_DISPATCH") == "1":
+                import sys as _sys
+                print(f"[W8A16] n={x.numel() // x.size(-1)} "
+                      f"m={weight.shape[0]} k={weight.shape[1]}",
+                      file=_sys.stderr, flush=True)
+            return w8_out
+    return _gfx908_gemm_bf16(x, weight, bias)
+
+
+def _gfx908_gemm_bf16(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """gfx908 bf16 GEMM dispatch (LLMM1 / wvSplitK / Triton mid-M / rocBLAS).
+
     Routes through a `direct_register_custom_op` wrapper so torch.compile /
     inductor sees one opaque graph node and does NOT inline this Python down
     to `aten::mm` (rocBLAS). That ensures QKV/QKVZ/o_proj inside compiled model
@@ -646,20 +677,6 @@ def rocm_unquantized_gemm_gfx908_impl(
         and weight.is_contiguous()
     )
     if skinny_ok:
-        # W8A16 (opt-in, VLLM_GFX908_W8A16=1): int8 weight copy + bf16 acts for
-        # the whitelisted decode projections (GDN in_proj_qkvz / out_proj,
-        # lm_head) at M <= 4. Halves the weight bytes of the HBM-bound skinny
-        # GEMV (1.5-2.0x graph-timed). Returns None -> stock wvSplitK below
-        # (shape not whitelisted, M > 4, bias, or not yet quantized because we
-        # are inside a cudagraph capture).
-        if w8a16_enabled():
-            w8_out = w8a16_gemm(x, weight, bias)
-            if w8_out is not None:
-                if debug:
-                    import sys as _sys
-                    print(f"[W8A16] n={n} m={m} k={k}",
-                          file=_sys.stderr, flush=True)
-                return w8_out
         x_view = x.reshape(-1, x.size(-1))
         # wvSplitK first: graph-timed on MI100 (mb_skinny.py, 2026-09-02) it
         # beats LLMM1 at n == 1 on every Qwen4Exp shape (in_proj_qkvz 19 vs
@@ -757,6 +774,11 @@ def rocm_unquantized_gemm_gfx908(
 
 def _gfx908_weight_can_use_custom_gemm(weight: torch.Tensor) -> bool:
     if weight.is_meta or weight.dim() != 2:
+        return True
+
+    # W8A16 released this weight's bf16 storage: only the custom op knows how
+    # to reach the int8 copy, F.linear on the stub would read garbage.
+    if is_w8a16_freed(weight):
         return True
 
     m = weight.shape[0]

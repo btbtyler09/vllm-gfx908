@@ -219,10 +219,20 @@ class UnquantizedLinearMethod(LinearMethodBase):
         elif current_platform.is_rocm():
             from vllm.platforms.rocm import on_gfx908
 
-            # TEST lever: pre-bind only when opted in; default off keeps the
-            # baseline runtime-dispatch path (VLLM_GFX908_PREBIND_GEMM=1).
-            if on_gfx908() and os.environ.get("VLLM_GFX908_PREBIND_GEMM", "0") == "1":
-                bind_rocm_unquantized_gemm_gfx908(layer)
+            if on_gfx908():
+                # W8A16 (VLLM_GFX908_W8A16=1): build the int8 side copy now and,
+                # per VLLM_GFX908_W8A16_FREE, release the bf16 master copy. Must
+                # happen here — before torch.compile and cudagraph capture — so
+                # no dynamo guard or captured graph ever saw the bf16 storage.
+                from vllm.model_executor.layers.gfx908_w8a16 import (
+                    prepare_w8a16_layer,
+                )
+
+                prepare_w8a16_layer(layer)
+                # TEST lever: pre-bind only when opted in; default off keeps the
+                # baseline runtime-dispatch path (VLLM_GFX908_PREBIND_GEMM=1).
+                if os.environ.get("VLLM_GFX908_PREBIND_GEMM", "0") == "1":
+                    bind_rocm_unquantized_gemm_gfx908(layer)
         elif current_platform.is_xpu():
             # Opt-in: F.linear on XPU is faster with an N-contiguous (N, K) weight
             # when K > N, but oneDNN's ab-weights matmul is not run-to-run bitwise

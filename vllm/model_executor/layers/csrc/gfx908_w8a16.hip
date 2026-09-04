@@ -10,6 +10,8 @@
 #include <c10/hip/HIPStream.h>
 #include "gfx908_w8a16_launch.cuh"
 
+bool w8a16_dequant(at::Tensor W, at::Tensor S, at::Tensor O, int64_t gs);
+
 extern template bool w8_launch_nb<1>(const W8Args&, int, int, int, int, int);
 extern template bool w8_launch_nb<2>(const W8Args&, int, int, int, int, int);
 extern template bool w8_launch_nb<3>(const W8Args&, int, int, int, int, int);
@@ -49,4 +51,7 @@ bool w8a16_gemv(at::Tensor W, at::Tensor S, at::Tensor X, at::Tensor C, int64_t 
   }
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("w8a16_gemv", &w8a16_gemv); }
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("w8a16_gemv", &w8a16_gemv);
+  m.def("w8a16_dequant", &w8a16_dequant);
+}
