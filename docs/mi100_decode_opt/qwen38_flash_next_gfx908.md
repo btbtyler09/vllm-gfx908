@@ -158,3 +158,35 @@ all-reduce over XGMI, launch fusion / megakernel verdict, GDN/QSA Triton codegen
 the BLOCK_M=8 miscompile: a 4x64 broadcast-MFMA branch new in Triton 3.7). Ground-truth checks
 so far: rocBLAS N=24 at 5<=M<=64 is 5.7 us (not 10-20), GDN BV=8 only helps B>=4 (bit-exact,
 `VLLM_GDN_DECODE_BV`).
+
+## Round 5 (2026-09-04): three kernels from the research reports
+
+Kernels were designed from the research reports and built + microbenched by subagents (one GPU
+each, graph-timed, HBM-cold), then integrated env-gated and gated in the server.
+
+| lever | env | kernel result (per rank, M=1) | server |
+|---|---|---|---|
+| W4A8 int8-dot GEMV for routed experts, shared expert, dense qkv/o_proj (`6d6bf0ff2a`) | `VLLM_GFX908_W4A8=1` | gate_up 21.7 -> 8.9 us, down 11.7 -> 5.8 (0.8-3.5 us above a pure stream of the bytes); M=8: 201 -> 42, 51 -> 24 | c=1 65.9 -> 72.7-73.1; parity 0.0052 (7/16 identical); PPL 3.130; GSM8K c=8 97.0% |
+| fused router GEMV + fp32 softmax + top-10 (one launch, MFMA 16x16x8 per wave, last-arriving WGs finalize, branch-free DPP top-k) | `VLLM_GFX908_ROUTER_FUSED=1` (+`_BF16=1` routes on bf16 logits exactly like stock) | 25.2 -> 9.2 us (stock = GEMV 5.9 + cast 1.8 + topkGating 17.6); ids bit-identical to `topk_softmax` on 180/180 tie/NaN/pad cases | see combined row |
+| W8A16 group-128 int8 GEMV for the bf16 GDN in_proj_qkvz / out_proj and lm_head at M<=4 (int8 side copy built at first eager call, ~1.4 GB/rank duplicated for now) | `VLLM_GFX908_W8A16=1`, `_GS=128` | lm_head 356 -> 180 us, qkvz 23.7 -> 13.5, out_proj 10.7 -> 7.0; bit-exact vs a fp64-rounded reference; per-channel scales fail on outlier columns (5-17%), gs128 ~2% | see combined row |
+| combined stack (all three) | | | c=1 77.4-77.5; parity vs the W4A8 build 0.0061 (6/16 c=1, 7/16 c=16); PPL 3.130 |
+
+Why A8 and not fp8: gfx908 has no fp8, but it has `v_dot4_i32_i8` (4 int8 MACs per VALU op) and
+`v_dot2_f32_f16`. The activation is quantized per token in blocks of 32 with an fp32 absmax scale
+(llama.cpp Q8_1 layout, zero point folded into the block sums), so the int8 dot is exact and the only
+added error is the block-32 rounding of the activation. An exact fp16-dot2 variant (bf16 -> fp16 cast
+is bit-exact, 0x6400 magic dequant, `v_and_or_b32` via inline asm, LDS-staged activation) was built as
+the fallback: 1.8-4.2x over stock with stock-identical accuracy, 6-41% slower than int8 (VALU-bound,
+not bytes). It is wired as `VLLM_GFX908_W4A8_MODE=f16`.
+
+Integration bug worth remembering: the fused router replaces the gate GEMM that lives in
+`MoERunner._forward_impl`, while the top-k lives in `FusedTopKRouter._compute_routing`. Two
+independent predicates (runner skips the GEMM; router fuses) drifted apart on the first boot — the
+router could not find the gate and fell back to stock top-k on the placeholder zero logits — and the
+model routed on zeros (0.51 nats, coherent-looking text). Now the runner hands the gate to the router
+and the router recomputes the logits itself whenever it cannot fuse. Coherent output is not evidence.
+
+Gate caveats: wikitext PPL is prefill-only (M >= 2048) and GSM8K at c=8 runs M=8, so neither exercises
+the M <= 4 W8A16 path; the greedy c=1 parity does, and sits at the noise floor. GSM8K at c <= 4 is the
+remaining check for W8A16. In-server throughput is only quotable with no microbench containers on
+GPUs 0-2 (c=48 drops from 558 to ~350 under a single agent's graph-replay bench).
