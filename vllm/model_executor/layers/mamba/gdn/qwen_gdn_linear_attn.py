@@ -29,6 +29,10 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
+from vllm.model_executor.layers.mamba.gdn.gfx908_gdn_fused import (
+    gdn_fused_layer_supported as gfx908_gdn_fused_layer_supported,
+    maybe_fused_gdn_decode as gfx908_maybe_fused_gdn_decode,
+)
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
@@ -518,6 +522,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.enable_fused_gdn_decode = self.gdn_decode_kernel == "cuda"
         logger.info_once("GDN decode kernel: %s", self.gdn_decode_kernel)
 
+        # gfx908: one-launch decode step (VLLM_GFX908_GDN_FUSED=1, default off).
+        # Static so torch.compile sees no data-dependent branch; the runtime
+        # decode/M<=8 check lives inside the opaque core op.
+        self._gfx908_gdn_fused = gfx908_gdn_fused_layer_supported(self, vllm_config)
+
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -856,6 +865,28 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> torch.Tensor:
         """ROCm forward using AITER Triton fused projection+attention when
         available, otherwise falling back to the generic CUDA path."""
+        if self._gfx908_gdn_fused:
+            # The core op owns the norm on this path (fused kernel for M<=8
+            # non-spec decode, stock core + Triton gated RMSNorm otherwise), so
+            # there is no z_out buffer/copy and no self.norm call here.  The op
+            # zeroes the buffer itself when it takes the stock path.
+            num_tokens = hidden_states.size(0)
+            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            ba, _ = self.in_proj_ba(hidden_states)
+            core_attn_out = torch.empty(
+                (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            torch.ops.vllm.qwen_gdn_attention_core_fused_norm_packed(
+                mixed_qkvz.view(num_tokens, -1),
+                ba.view(num_tokens, -1),
+                core_attn_out,
+                layer_name=_encode_layer_name(self.prefix),
+            )
+            output, _ = self.out_proj(core_attn_out.flatten(-2))
+            return output
+
         if GDN_AITER_TRITON_AVAILABLE:
             num_tokens = hidden_states.size(0)
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
@@ -1794,10 +1825,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if isinstance(attn_metadata_raw, dict):
             attn_metadata = attn_metadata_raw.get(self.prefix)
         if attn_metadata is None:
+            if self._gfx908_gdn_fused:
+                core_attn_out.zero_()  # buffer is torch.empty on this path
             self._warmup_prefill_kernels(mixed_qkvz[:, :qkv_size], 0)
             return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+        if self._gfx908_gdn_fused:
+            if gfx908_maybe_fused_gdn_decode(
+                self, mixed_qkvz, ba, core_attn_out, attn_metadata
+            ):
+                return
+            core_attn_out.zero_()  # stock path below expects a zeroed buffer
         mixed_qkv, output_gate_flat = mixed_qkvz.split(
             [qkv_size, self.value_dim // self.tp_size], dim=-1
         )
