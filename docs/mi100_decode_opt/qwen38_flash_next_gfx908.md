@@ -190,3 +190,22 @@ Gate caveats: wikitext PPL is prefill-only (M >= 2048) and GSM8K at c=8 runs M=8
 the M <= 4 W8A16 path; the greedy c=1 parity does, and sits at the noise floor. GSM8K at c <= 4 is the
 remaining check for W8A16. In-server throughput is only quotable with no microbench containers on
 GPUs 0-2 (c=48 drops from 558 to ~350 under a single agent's graph-replay bench).
+
+## Round 6 (2026-09-04, later): 77 -> 88 tok/s at c=1
+
+| lever | env | result |
+|---|---|---|
+| exact fp16-dot2 W4A16 mode (`7d380678f7`) | `VLLM_GFX908_W4A8_MODE=f16` | fallback/A-B arm: stock-identical accuracy, 1.8-4.2x stock, 6-41% below int8 |
+| W8A16 int8-only storage for the GDN projections | `VLLM_GFX908_W8A16_FREE=gdn` (default) | 36 layers 997 MB bf16 -> 552 MB int8 per rank; M>4 dequant +54 us/layer (+4.6% prefill); prefill now int8 -> PPL 3.130 -> 3.141 (HF W4 3.139) |
+| fused GDN decode glue (5 launches -> 1) | `VLLM_GFX908_GDN_FUSED=1` | 13.4 -> 7.8 us/layer at M=1, -144 launches/token; conv state bit-exact |
+| shared expert as expert #E (11 -> 7 launches per MoE layer) | `VLLM_GFX908_SHARED_AS_EXPERT=1` | 36 -> 24 us per MoE layer at M=1 |
+
+Full stack, quiet GPUs: **c=1 87.7-87.8 tok/s** (17.5 at the start of the bring-up, 59.6 at the end
+of round 3), c=48 545. Greedy parity vs the round-5 build 0.0083 (c=1) / 0.0070 (c=16); PPL 3.141;
+GSM8K 500q c=8 97.0%. The c=16 probe is bimodal across boots (250 vs 380) and not yet understood.
+
+Working method that got here: research agents (read-only, one bottleneck each) -> kernel agents
+(one GPU each, graph-timed cold microbench + correctness vs an fp32 reference) -> integration
+agents (env-gated, unit test in the container) -> the orchestrator's server gate (3 probes,
+greedy parity at c=1/c=16, PPL, GSM8K at a concurrency that actually exercises the new path).
+Two integration bugs were caught only by the parity gate (router on zero logits; UVA ring).
