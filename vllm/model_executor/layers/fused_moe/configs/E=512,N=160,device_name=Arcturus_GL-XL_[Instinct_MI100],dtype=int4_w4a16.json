@@ -148,5 +148,15 @@
         "num_stages": 2,
         "waves_per_eu": 4,
         "SPLIT_K": 1
+    },
+    "8192": {
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 8,
+        "num_stages": 2,
+        "waves_per_eu": 4,
+        "SPLIT_K": 1
     }
 }
