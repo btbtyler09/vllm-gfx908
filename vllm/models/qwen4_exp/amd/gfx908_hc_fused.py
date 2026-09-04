@@ -164,6 +164,201 @@ def hc_w8_free() -> bool:
     return os.environ.get("VLLM_GFX908_HC_W8_FREE", "1") == "1"
 
 
+# ---------------------------------------------------------------------------
+# TP sharding of the HC mix (``VLLM_GFX908_HC_SHARD=1``, default OFF)
+# ---------------------------------------------------------------------------
+# Both HC mixes are replicated on every TP rank (``disable_tp=True`` /
+# ``ReplicatedLinear`` in ``hyperconnection.py``): 1.30 GFLOP/token/rank of
+# bf16 MFMA, more than the whole MoE, and the largest single block of prefill
+# GEMM time (``research/prefill_gfx908.md`` sections 1.1 / 2.1, item #6).
+#
+# Once ``xn`` exists the mix is *purely row-wise* (per token): down GEMM ->
+# silu -> up GEMM -> gate-mix all act independently on each row.  So the split
+# that needs the cheapest collective is over M (tokens), not over columns:
+#
+#   * rank r computes rows [r*C, (r+1)*C) of the whole chain, C = ceil(M/TP);
+#   * reassembly is a single all-gather along dim 0, which is *exactly* the
+#     native layout of ``all_gather_into_tensor`` -- no transpose, no
+#     column-permutation of any weight, no extra copy;
+#   * the payload is the output ([M/TP, HD+HC] = 2.6 MB sent per rank at
+#     M=2048), not the [M, HYPER] activation.  That is about the same wire
+#     cost as the ``[M, 336]`` all-reduce a K-split of ``mix_down`` alone
+#     would need (2.1 MB moved per rank), but it covers *both* GEMMs plus the
+#     silu and the gate-mix -- twice the FLOP for the same collective -- and
+#     it needs no second collective, no [4,M,S] -> [M,4S] transpose, and no
+#     strided ``xn`` read;
+#   * weights stay replicated -> no extra VRAM, no permutation cache, no
+#     load-time change, and the W8 / fused-GEMV paths are untouched;
+#   * every output element is produced by exactly one rank with exactly the
+#     arithmetic the replicated chain used, so the result is bit-identical
+#     whenever rocBLAS picks the same kernel for M/TP rows as for M rows.
+#     Measured (agents/hc_shard): bit-identical for 512 <= M <= 2048; from
+#     M >= 3072 Tensile switches kernel and the two differ by at most 1 bf16
+#     ulp (3.9e-03 abs).  Both are valid roundings of the same fp32 math, but
+#     the prefill sizes that matter (7840 / 8192) are NOT bit-exact, so the
+#     wikitext-2 PPL + GSM8K gate is required, not a formality.
+#
+# The decode fused path (M <= HC_FUSED_MAX_M) never reaches this: the gate
+# below is an M floor far above any cudagraph-captured batch, so decode and
+# graph capture are bit-for-bit unchanged.
+#
+# The floor is 1536, measured on an idle TP4 MI100 box
+# (agents/hc_shard/REPORT.md).  Replicated vs sharded, per HC module:
+#   M=1024 0.97x | 1280 0.96x | 1536 1.23x | 1792 1.54x | 2048 1.60x
+#   M=4096 2.10x | 7840 2.20x | 8192 2.23x
+# The crossover is this high because mix_down is [M,10240]x[10240,336]: N=336
+# yields so few Tensile tiles that the GEMM is workgroup-bound and *flat* at
+# ~119 us for every M <= 512, so dividing its rows by 4 buys nothing there,
+# while the all-gather still costs 50-135 us.  mix_up (N=10240) shards ~3.6x.
+#
+# A floor >= 512 additionally keeps the per-rank slice above 64 rows so
+# mix_down does not cross into the Triton split-K path of `midm_gemm_applies`
+# (gfx908_midm_gemm.py:93-103, active for 5 <= rows <= 64 when out_features
+# <= 1024), which would change the accumulation order.
+HC_SHARD_DEFAULT_MIN_M = 1536
+_SHARD_FLAG: bool | None = None
+
+
+@functools.cache
+def hc_shard_min_m() -> int:
+    """M floor for the sharded path.
+
+    Must stay above ``max_cudagraph_capture_size`` (96 for this model) so no
+    captured graph ever contains the collective, and above the measured
+    crossover where the all-gather latency exceeds the GEMM saving.
+    """
+    return int(
+        os.environ.get("VLLM_GFX908_HC_SHARD_MIN_M", str(HC_SHARD_DEFAULT_MIN_M))
+    )
+
+
+@functools.cache
+def hc_shard_mode() -> str:
+    """How the per-rank ``[C, HD]`` / ``[C, HC]`` blocks are reassembled.
+
+    Both modes return **contiguous** tensors.  That is not cosmetic: the custom
+    op's ``fake_impl`` advertises contiguous outputs, and inductor bakes those
+    strides into the compiled graph, so returning a view into a wider gather
+    buffer aborts the run with
+
+        AssertionError: expected size 8192==8192, stride 2564==4 at dim=0
+        ... Error in op: torch.ops.vllm.gfx908_hc_fused_mix.default
+
+    (observed at M=8192 during profiling; an earlier ``view`` mode that returned
+    the strided slices directly has been removed for this reason).
+
+    ``ag2``  (default) two all-gathers, into separate ``[TP*C, HD]`` and
+             ``[TP*C, HC]`` buffers.  ``buf[:M]`` of a contiguous buffer is
+             itself contiguous, so this needs **no copy at all**; it costs one
+             extra small collective (~50 us, M-independent, since the injection
+             payload is only ``C*HC`` bf16).  Measured cheaper than ``cat`` from
+             M~4096 up, where ``cat``'s ``[M, HD]`` compaction copy dominates
+             (87.9 us at M=7840 vs 50.4 us for the extra all-gather).
+    ``cat``  one all-gather of ``cat([block_input, injection], -1)``, then a
+             ``.contiguous()`` on each slice.  One fewer collective, but it pays
+             a full ``[M, HD]`` copy plus a small ``[M, HC]`` copy.
+    """
+    m = os.environ.get("VLLM_GFX908_HC_SHARD_MODE", "ag2").lower()
+    if m not in ("ag2", "cat"):
+        logger.warning(
+            "gfx908 HC shard: unknown mode %r (valid: ag2, cat), using 'ag2'", m
+        )
+        m = "ag2"
+    return m
+
+
+def hc_shard_enabled() -> bool:
+    global _SHARD_FLAG
+    if _SHARD_FLAG is None:
+        from vllm.platforms.rocm import on_gfx908
+
+        _SHARD_FLAG = (
+            on_gfx908() and os.environ.get("VLLM_GFX908_HC_SHARD", "0") == "1"
+        )
+        if _SHARD_FLAG:
+            logger.info_once(
+                "gfx908: HC mix sharded over TP for M >= %d (mode=%s)",
+                hc_shard_min_m(),
+                hc_shard_mode(),
+            )
+    return _SHARD_FLAG
+
+
+@functools.cache
+def _tp_group():
+    from vllm.distributed.parallel_state import get_tp_group
+
+    return get_tp_group()
+
+
+def hc_shard_applies(m: int) -> bool:
+    """Runtime (never traced) dispatch on the real row count."""
+    if not hc_shard_enabled() or m < hc_shard_min_m():
+        return False
+    if _capturing():
+        # A cudagraph must not capture the collective; with the default M floor
+        # this is unreachable, but a lowered floor must not corrupt a capture.
+        return False
+    try:
+        g = _tp_group()
+    except Exception as exc:  # distributed not initialised (unit tests)
+        logger.warning_once("gfx908 HC shard: no TP group (%s)", exc)
+        return False
+    return g.world_size > 1 and m >= g.world_size
+
+
+def _pad_rows(t: torch.Tensor, rows: int) -> torch.Tensor:
+    if t.shape[0] == rows:
+        return t
+    return torch.nn.functional.pad(t, (0, 0, 0, rows - t.shape[0]))
+
+
+def hc_shard_mix(xn, chain, hidden: int, hc_count: int):
+    """Run the row-wise HC mix ``chain`` on this rank's 1/TP slice of ``xn`` and
+    all-gather the result.
+
+    ``chain(x) -> (block_input[n, hidden], injection[n, hc_count] | None)``.
+
+    Returns the full ``[M, hidden]`` / ``[M, hc_count]`` tensors, identical on
+    every rank and **always contiguous**, matching what ``_hc_mix_fake``
+    advertises to inductor.
+    """
+    import torch.distributed as dist
+
+    g = _tp_group()
+    world, rank = g.world_size, g.rank_in_group
+    pg = g.device_group
+    M = xn.shape[0]
+    C = -(-M // world)
+    start = min(rank * C, M)
+    end = min(start + C, M)
+    bi, inj = chain(xn[start:end])
+
+    if inj is None or hc_shard_mode() == "ag2":
+        # buf[:M] of a contiguous [TP*C, cols] buffer is contiguous: no copy.
+        ob = torch.empty((world * C, hidden), dtype=xn.dtype, device=xn.device)
+        dist.all_gather_into_tensor(ob, _pad_rows(bi, C).contiguous(), pg)
+        if inj is None:
+            return ob[:M], None
+        oi = torch.empty((world * C, hc_count), dtype=xn.dtype, device=xn.device)
+        dist.all_gather_into_tensor(oi, _pad_rows(inj, C).contiguous(), pg)
+        return ob[:M], oi[:M]
+
+    cols = hidden + hc_count
+    if bi.shape[0] == C:
+        send = torch.cat([bi, inj], dim=-1)
+    else:
+        send = torch.zeros((C, cols), dtype=xn.dtype, device=xn.device)
+        send[: bi.shape[0], :hidden] = bi
+        send[: bi.shape[0], hidden:] = inj
+    out = torch.empty((world * C, cols), dtype=xn.dtype, device=xn.device)
+    dist.all_gather_into_tensor(out, send, pg)
+    out = out[:M]
+    # Both slices MUST be compacted: they are views with row stride `cols`,
+    # and the op's fake_impl promises contiguous outputs.
+    return out[:, :hidden].contiguous(), out[:, hidden:].contiguous()
+
+
 @functools.cache
 def _cu_count() -> int:
     from vllm.utils.platform_utils import num_compute_units
@@ -375,11 +570,12 @@ def _gate_mix_perm(xn: torch.Tensor, gate_perm: torch.Tensor, hc: int, hidden: i
     return (torch.sigmoid(g) * x).mean(-1).to(xn.dtype)
 
 
-def _hc_mix_impl(
+def _hc_mix_local(
     xn: torch.Tensor, w_down: torch.Tensor, w_up: torch.Tensor,
     hc_count: int, lora_rank: int, hidden: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Opaque op: fused wvSplitK epilogues for M <= 3, stock math otherwise."""
+    """The HC mix on whatever rows it is given: fused wvSplitK epilogues for
+    M <= 3, stock math otherwise."""
     M = xn.shape[0]
     ed = eu = None
     if _W8_CACHE:
@@ -442,6 +638,28 @@ def _hc_mix_impl(
     return hc_gate_mix(xn, gate, hc_count), injection
 
 
+def _hc_mix_impl(
+    xn: torch.Tensor, w_down: torch.Tensor, w_up: torch.Tensor,
+    hc_count: int, lora_rank: int, hidden: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Opaque op. Dispatches on the *real* row count at run time, so the M
+    gates below never become torch.compile guards on a symbolic batch size."""
+    if hc_shard_applies(xn.shape[0]):
+        block_input, injection = hc_shard_mix(
+            xn,
+            lambda rows: _hc_mix_local(
+                rows, w_down, w_up, hc_count, lora_rank, hidden
+            ),
+            hidden,
+            hc_count,
+        )
+        # The fake_impl promises contiguous outputs and inductor bakes those
+        # strides into the graph; never hand back a view of a wider buffer.
+        assert block_input.is_contiguous() and injection.is_contiguous()
+        return block_input, injection
+    return _hc_mix_local(xn, w_down, w_up, hc_count, lora_rank, hidden)
+
+
 def _hc_mix_fake(xn, w_down, w_up, hc_count, lora_rank, hidden):
     return (
         xn.new_empty((xn.shape[0], hidden)),
@@ -458,3 +676,54 @@ direct_register_custom_op(
 
 def hc_fused_mix(xn, w_down, w_up, hc_count, lora_rank, hidden):
     return torch.ops.vllm.gfx908_hc_fused_mix(xn, w_down, w_up, hc_count, lora_rank, hidden)
+
+
+# ---------------------------------------------------------------------------
+# Final mixer (``use_combine=False``): same chain without the injection block.
+# One module out of 97, but it runs on the full prefill chunk too.
+# ---------------------------------------------------------------------------
+def _hc_final_mix_local(xn, w_down, w_up, hc_count, lora_rank, hidden):
+    from vllm.models.qwen4_exp.amd.ops.hc import hc_gate_mix, hc_silu
+
+    lora = torch.ops.vllm.rocm_unquantized_gemm_gfx908(xn, w_down, None)
+    lora = hc_silu(lora, hc_count)
+    gate = torch.ops.vllm.rocm_unquantized_gemm_gfx908(lora, w_up, None)
+    return hc_gate_mix(xn, gate, hc_count)
+
+
+def _hc_final_mix_impl(
+    xn: torch.Tensor, w_down: torch.Tensor, w_up: torch.Tensor,
+    hc_count: int, lora_rank: int, hidden: int,
+) -> torch.Tensor:
+    if hc_shard_applies(xn.shape[0]):
+        block_input, _ = hc_shard_mix(
+            xn,
+            lambda rows: (
+                _hc_final_mix_local(
+                    rows, w_down, w_up, hc_count, lora_rank, hidden
+                ),
+                None,
+            ),
+            hidden,
+            hc_count,
+        )
+        assert block_input.is_contiguous()
+        return block_input
+    return _hc_final_mix_local(xn, w_down, w_up, hc_count, lora_rank, hidden)
+
+
+def _hc_final_mix_fake(xn, w_down, w_up, hc_count, lora_rank, hidden):
+    return xn.new_empty((xn.shape[0], hidden))
+
+
+direct_register_custom_op(
+    op_name="gfx908_hc_final_mix",
+    op_func=_hc_final_mix_impl,
+    fake_impl=_hc_final_mix_fake,
+)
+
+
+def hc_final_mix(xn, w_down, w_up, hc_count, lora_rank, hidden):
+    return torch.ops.vllm.gfx908_hc_final_mix(
+        xn, w_down, w_up, hc_count, lora_rank, hidden
+    )
