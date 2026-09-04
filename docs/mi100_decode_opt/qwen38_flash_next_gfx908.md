@@ -104,3 +104,57 @@ Image: `btbtyler09/vllm-rocm-gfx908:v0.28.0rc2.dev-q38fn` (HIP ext at `/opt/vllm
 - Hand-written W4 GEMV (dense + MoE).
 - Fuse the ~35 glue kernels per layer (HC combine/mix/silu, MoE align/sum, fills/copies).
 - All-reduce count (2 per layer, latency-bound at 37 µs).
+
+## Round 4 (2026-09-03/04): the step was never GPU-bound — PLE zero-copy
+
+**The profiler lied.** The torch profiler adds ~2.4 us to every tiny kernel on gfx908 (1.33 us
+real inside a graph vs 3.75 us in the trace; a 2,000-node graph of trivial kernels replays in
+2.66 ms). Worse, kernels made of many tiny programs inflate more: the GDN decode kernel reads
+14.2 us in the trace and 1.8 us graph-timed with HBM-cold state. Every "launch floor" number in
+round 3 was mostly artifact, which is why fusing clusters gave +1% each. Rule: microbench
+(graph-timed, cold) before believing any per-kernel number under ~30 us; size host idle with
+py-spy + step period, not with the kernel table.
+
+**The real hole: ~2.5 ms/token of GPU idle at the step boundary.** py-spy on the worker showed
+68% of the main thread blocked in the PLE `ids.to("cpu")` (i.e. waiting for the whole previous
+step), then a serial chain: host memmap gather (0.2 ms) -> pinned stage -> H2D -> attention
+metadata -> graph launch. With the GPU drained every step, nothing overlapped.
+
+**Fix (`03869b6e62`, `VLLM_PLE_ZEROCOPY=1`, default in the serve script):** each rank
+`hipHostRegister`s the PLE shard files it owns (`shard % 4 == rank`, 23.8 GiB each; the kernel
+driver caps pinned system memory at ~307 GB per node so no rank can pin all 95 GiB), a HIP
+kernel gathers the 16 x 320 B rows per token straight from the host page cache inside the
+captured graph (zeros for shards it does not own), and one 5 KB TP all-reduce reassembles them
+exactly. The n-gram ids are computed on the GPU in the same opaque op. The worker never waits on
+the GPU, so steps queue back to back.
+
+Two bugs this exposed, both fixed in the same commit:
+- The V2 runner's host-mapped (UVA) input pools are a 2-deep round-robin ring, safe only while
+  the GPU drains each step; queued steps let the host overwrite a slot before the GPU read it
+  (non-deterministic outputs, 3/16 prompts identical between two runs). Zero-copy implies an
+  8-deep ring (`VLLM_UVA_MAX_CONCURRENCY`).
+- The padded tail of the PLE `query_start_loc` buffer held stale entries from earlier batches
+  (`[0, 13, 2, 3, 4, 5]`), and `searchsorted` over a non-monotonic array mis-bucketed real
+  prefill tokens (48/128 wrong ids on a 13-token prefill). The op takes a running max.
+
+Same-tree A/B (200-token completions, distinct prompts):
+
+| arm | c=1 | c=16 | c=48 |
+|---|---|---|---|
+| zero-copy off | 59.1-59.6 | 248.9 | 486.0 |
+| zero-copy on | 64.1-64.5 | 252.8 | 558.4 |
+
+Greedy per-token logprob parity vs the round-3 build: 0.0055 nats at c=1 (6/16 prompts
+bit-identical), 0.0063 at c=16 — the same-stack noise floor. Debug aids stay env-gated:
+`VLLM_PLE_ZEROCOPY_CHECK=1` (eager steps compare with the host gather),
+`VLLM_PLE_ZEROCOPY_DEBUG_IDS=1` (every step compares captured ids with host-computed ids).
+
+Overlay gotcha: rsync of the repo into the container must exclude `*.so` — the host tree carries
+a stale `_C.abi3.so` that silently removes `wvSplitK` and every custom op.
+
+Research reports (five agents, read-only): `research/*.md` — W4 GEMV redesign (current MoE
+kernel at ~12% of HBM), int8 weights for the 2.89 GB/token of bf16 projections, push-based
+all-reduce over XGMI, launch fusion / megakernel verdict, GDN/QSA Triton codegen (root cause of
+the BLOCK_M=8 miscompile: a 4x64 broadcast-MFMA branch new in Triton 3.7). Ground-truth checks
+so far: rocBLAS N=24 at 5<=M<=64 is 5.7 us (not 10-20), GDN BV=8 only helps B>=4 (bit-exact,
+`VLLM_GDN_DECODE_BV`).

@@ -8,6 +8,8 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -439,6 +441,11 @@ def fused_recurrent_gated_delta_rule_packed_decode(
             f"Packed decode kernel only supports NK=1 (got K={K}, BK={BK})."
         )
     BV = min(triton.next_power_of_2(V), 32)
+    # gfx908: the decode grid is only NV x B*HV single-wave programs (48 at B=1
+    # for this model); a smaller BV gives more waves and shorter reductions.
+    _bv_override = int(os.environ.get("VLLM_GDN_DECODE_BV", "0"))
+    if _bv_override > 0:
+        BV = min(_bv_override, BV)
     num_stages = 3
     num_warps = 1
 
