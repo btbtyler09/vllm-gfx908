@@ -25,8 +25,10 @@ failed = []
 for name in MODULES:
     try:
         mod = importlib.import_module(name)
-        ext = getattr(mod, "_ext")()
-        print(f"built {name}: {getattr(ext, '__file__', ext)}")
+        for fn in ("_ext", "_ext_f16"):
+            if hasattr(mod, fn):
+                ext = getattr(mod, fn)()
+                print(f"built {name}.{fn}: {getattr(ext, '__file__', ext)}")
     except Exception as exc:  # keep going; report at the end
         print(f"FAILED {name}: {exc}")
         failed.append(name)
