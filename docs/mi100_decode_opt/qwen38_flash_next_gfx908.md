@@ -335,3 +335,24 @@ code-object fix are above that floor, the stable top-k cost is not yet.
   nibble path). Same-FLOP dense rocBLAS is ~2x faster than the W4 MoE kernel
   at M=8192, so the remaining prefill headroom is the MoE GEMM structure
   (gather/padding/tiling), not the weight format.
+
+### Release rc5 (2026-09-04, later): `btbtyler09/vllm-rocm-gfx908:v0.28.0rc5.dev-q38fn`
+
+Tree 59255ea5cd, every extension prebuilt (incl. the new `w8big` and `w4lt`
+modules). Validated on the pure image (no overlay), TP4, util 0.90:
+
+| gate | rc5 | rc4 |
+|---|---|---|
+| c=1 step timer (1200-token decode windows) | 11.04 ms/step | 11.01 |
+| c=1 / c=4 / c=16 / c=48 probes (tok/s) | 89.9 / 210 / 264 / 568 | 89 / 186 / — / — |
+| greedy parity c=1 vs rc4 | 16/16 identical, 0.0000 | — |
+| greedy parity c=16 vs rc4 / vs itself | 5/16, 0.0076 / 7/16, 0.0068 | (floor) |
+| long-context determinism (4 x ~6K, two salts) | 4/4 bit-identical | 1/4 |
+| TTFT 3.2K / 12.8K (probe, warm) | 558 ms / 1.81 s | 655 ms / 2.29 s |
+
+c=16 parity has the same score against itself as against rc4: that is the
+batched path's own run-to-run floor, not a change. c=1 is bit-identical to
+rc4, and stable top-k now makes ~6K-context greedy output reproducible by
+default. The c=1 step time is within the boot floor of rc4; the c=4 gain is
+the HC range extension, the TTFT gain is the MoE M=8192 key plus the prefill
+round already in rc4 measured warm.
