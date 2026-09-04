@@ -721,11 +721,34 @@ class TritonWNA16Experts(TritonExperts):
             )
             return
 
+        from vllm.model_executor.layers.fused_moe.fused_moe import (
+            cast_to_fp16_sat,
+            gfx908_moe_fp16_compute,
+            gfx908_moe_fp16_config_name,
+            gfx908_moe_fp16_safe,
+        )
+
+        # gfx908 fp16-compute MoE (VLLM_GFX908_MOE_FP16_COMPUTE=1): decided
+        # before the config lookup, because the mode has its own tuned configs.
+        fp16_compute = gfx908_moe_fp16_compute(
+            num_tokens,
+            hidden_states.dtype,
+            bool(self.quant_config.use_int4_w4a16),
+            self.quant_config.w1_zp is not None
+            or self.quant_config.w2_zp is not None,
+        )
+        fp16_safe = fp16_compute and gfx908_moe_fp16_safe()
+        config_dtype = self.quant_config.config_name(hidden_states.dtype)
+        if fp16_compute:
+            config_dtype = gfx908_moe_fp16_config_name(
+                config_dtype, w2.size(), self.block_shape
+            )
+
         config = try_get_optimal_moe_config(
             w1.size(),
             w2.size(),
             top_k_num,
-            self.quant_config.config_name(hidden_states.dtype),
+            config_dtype,
             num_tokens,
             block_shape=self.block_shape,
         )
@@ -744,12 +767,27 @@ class TritonWNA16Experts(TritonExperts):
         else:
             raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
 
-        # Note that the output tensor might be in workspace1
-        intermediate_cache1 = _resize_cache(workspace2, (num_tokens, top_k_num, N))
         activation_out_dim = self.adjust_N_for_activation(N, activation)
+        if fp16_compute:
+            compute_type = tl.float16
+            hidden_states = cast_to_fp16_sat(hidden_states)
+        if fp16_compute and not fp16_safe:
+            # bf16 and fp16 are both 2 bytes, so the workspaces are reused as
+            # fp16 *views* -- no extra allocation, same peak memory.
+            ws2_c = workspace2.view(torch.float16)
+            ws13_c = workspace13.view(torch.float16)
+        else:
+            # safe mode: the intermediates keep bf16's 3.4e38 range (exactly
+            # today's precision); only the GEMM *operands* are fp16.
+            ws2_c, ws13_c = workspace2, workspace13
+
+        # Note that the output tensor might be in workspace1
+        intermediate_cache1 = _resize_cache(ws2_c, (num_tokens, top_k_num, N))
         intermediate_cache2 = _resize_cache(
-            workspace13, (num_tokens * top_k_num, activation_out_dim)
+            ws13_c, (num_tokens * top_k_num, activation_out_dim)
         )
+        # GEMM2 keeps a bf16 output even in fp16-compute mode, so moe_sum and
+        # the residual add downstream see exactly what they see today.
         intermediate_cache3 = _resize_cache(workspace2, (num_tokens, top_k_num, K))
 
         # Include fused shared-expert rows while preserving EP remapping.
@@ -780,6 +818,11 @@ class TritonWNA16Experts(TritonExperts):
         self.activation(
             activation, intermediate_cache2, intermediate_cache1.view(-1, N)
         )
+
+        if fp16_safe:
+            # GEMM2 wants an fp16 A operand; bf16 -> fp16 is exact for
+            # |v| <= 65504 (fp16 has 3 more mantissa bits) and saturates above.
+            intermediate_cache2 = cast_to_fp16_sat(intermediate_cache2)
 
         a2q_scale: torch.Tensor | None = None
 

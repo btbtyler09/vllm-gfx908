@@ -52,9 +52,9 @@ def write_zeros_to_output(
     token_mask,
     BLOCK_SIZE_M,
     BLOCK_SIZE_N,
-    compute_type,
+    out_type,
 ):
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=compute_type)
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=out_type)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
@@ -109,6 +109,8 @@ def fused_moe_kernel_gptq_awq(
     has_zp: tl.constexpr,
     use_int4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
+    out_type: tl.constexpr,
+    CLAMP_OUT: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -178,7 +180,7 @@ def fused_moe_kernel_gptq_awq(
             token_mask,
             BLOCK_SIZE_M,
             BLOCK_SIZE_N,
-            compute_type,
+            out_type,
         )
         return
 
@@ -286,7 +288,11 @@ def fused_moe_kernel_gptq_awq(
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
         accumulator = accumulator * moe_weight[:, None]
 
-    accumulator = accumulator.to(compute_type)
+    if CLAMP_OUT:
+        # fp16 output: saturate instead of letting an out-of-range accumulator
+        # become an inf that then poisons the whole token through moe_sum.
+        accumulator = tl.minimum(tl.maximum(accumulator, -65504.0), 65504.0)
+    accumulator = accumulator.to(out_type)
     # -----------------------------------------------------------
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -668,6 +674,120 @@ def invoke_fused_moe_wna16_cuda_kernel(
     )
 
 
+_GFX908_MOE_FP16: bool | None = None
+
+
+def gfx908_moe_fp16_compute(
+    num_tokens: int, dtype: torch.dtype, use_int4_w4a16: bool, has_zp: bool
+) -> bool:
+    """VLLM_GFX908_MOE_FP16_COMPUTE=1: run the W4A16 expert GEMMs at fp16 MFMA rate.
+
+    gfx908/CDNA1 issues fp16 MFMA at 184.6 TFLOP/s but bf16 MFMA at only
+    92.3 TFLOP/s, so the batched W4A16 expert GEMMs (prefill chunks and batched
+    decode) leave half the matrix pipe unused.  The mode keeps the int4 weights
+    and their bf16 scales exactly as they are; it only
+
+      * casts the routed activations to fp16 at the MoE input (saturating),
+      * dequantizes the nibbles to fp16 instead of bf16 inside the kernel,
+      * still accumulates in fp32,
+      * still writes a bf16 `intermediate_cache3`, so moe_sum and everything
+        downstream of the MoE are untouched.
+
+    Off by default: it is a numerics change (fp16 has 11 mantissa bits against
+    bf16's 8 -- more precise -- but a 65504 range ceiling instead of 3.4e38).
+    VLLM_GFX908_MOE_FP16_MIN_TOKENS (default 64) keeps the GEMV-shaped decode
+    batches on the bf16 path, where the MFMA rate is irrelevant.
+    """
+    global _GFX908_MOE_FP16
+    if _GFX908_MOE_FP16 is None:
+        from vllm.platforms.rocm import on_gfx908
+
+        _GFX908_MOE_FP16 = (
+            on_gfx908()
+            and os.environ.get("VLLM_GFX908_MOE_FP16_COMPUTE", "0") == "1"
+        )
+    if not _GFX908_MOE_FP16:
+        return False
+    return (
+        dtype == torch.bfloat16
+        and use_int4_w4a16
+        and not has_zp
+        and num_tokens >= int(os.environ.get("VLLM_GFX908_MOE_FP16_MIN_TOKENS", "64"))
+    )
+
+
+def gfx908_moe_fp16_config_name(
+    base: str | None, w2_shape, block_shape: list[int] | None
+) -> str | None:
+    """`<base>_fp16` if a tuned config file for it exists, else `base`.
+
+    The fp16 kernel does not want the bf16 kernel's tiles: at M=2048 the bf16
+    winner (BM64/BN64/w4/wpe4) is 5 % *slower* than bf16 in fp16, while the
+    fp16 winner (the same tile at waves_per_eu=0) is 20 % faster, and at M=4096
+    the fp16 winner moves from 4 to 8 warps.  So the mode reads its own
+    `dtype=int4_w4a16_fp16` config file, and silently falls back to the bf16
+    one if that file has not been shipped for this (E, N, device).
+    """
+    if not base:
+        return base
+    name = base + "_fp16"
+    E, _, N = w2_shape
+    if base.startswith("int4_w4a16"):
+        N = N * 2
+    block_n = block_shape[0] if block_shape else 0
+    block_k = block_shape[1] if block_shape else 0
+    return name if get_moe_configs(E, N, name, block_n, block_k) else base
+
+
+def gfx908_moe_fp16_safe() -> bool:
+    """VLLM_GFX908_MOE_FP16_SAFE (default 1): keep the MoE intermediates in bf16.
+
+    The fp16 mode's only new failure surface is `silu(gate) * up`, which grows
+    quadratically in |x|: measured on this model's shapes it reaches 65504 at
+    max|x| ~ 128, while the analytic bound on the hyper-connection MoE input is
+    max|x| <= sqrt(2560) * max|1 + w_hcnorm| = 384.  Safe mode keeps
+    intermediate_cache1 and intermediate_cache2 in bf16 -- byte-for-byte the
+    range and precision of today's path -- and casts intermediate_cache2 to
+    fp16 (saturating, and exact below 65504) just before GEMM2 reads it as an
+    A operand, so both GEMMs still issue fp16 MFMA.  It costs one extra pass
+    over intermediate_cache2.  Set to 0 for the slightly faster and slightly
+    more accurate all-fp16-intermediate variant, at the cost of that ceiling.
+    """
+    return os.environ.get("VLLM_GFX908_MOE_FP16_SAFE", "1") == "1"
+
+
+_TL_STORE_DTYPE = {
+    torch.bfloat16: tl.bfloat16,
+    torch.float16: tl.float16,
+    torch.float32: tl.float32,
+}
+
+
+@triton.jit
+def _cast_to_fp16_sat_kernel(src_ptr, dst_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(src_ptr + offs, mask=m, other=0.0).to(tl.float32)
+    x = tl.minimum(tl.maximum(x, -65504.0), 65504.0)
+    tl.store(dst_ptr + offs, x.to(tl.float16), mask=m)
+
+
+def cast_to_fp16_sat(src: torch.Tensor) -> torch.Tensor:
+    """bf16/fp32 -> fp16, saturating at +-65504 instead of overflowing to inf.
+
+    torch's own cast produces inf for |x| > 65504; a single inf activation would
+    turn a whole expert row into NaN.  Post-RMSNorm hidden states are far below
+    that in practice, so this is a safety net, not a correction.
+    """
+    out = torch.empty(src.shape, dtype=torch.float16, device=src.device)
+    n = src.numel()
+    BLOCK = 1024
+    _cast_to_fp16_sat_kernel[(triton.cdiv(n, BLOCK),)](
+        src, out, n, BLOCK=BLOCK, num_warps=4
+    )
+    return out
+
+
 # NOTE(zyongye): we can remove all the wna16 kernel
 # once we drop off sm75 support
 def invoke_fused_moe_wna16_triton_kernel(
@@ -694,6 +814,12 @@ def invoke_fused_moe_wna16_triton_kernel(
 
     M = A.size(0)
     num_tokens = M * top_k
+
+    # The store dtype is decoupled from the dot dtype so that an fp16-compute
+    # MoE (gfx908: 184.6 vs 92.3 TFLOP/s) can still hand a bf16 tensor to
+    # moe_sum.  For every existing caller C.dtype == the compute dtype, so this
+    # is a no-op there.
+    out_type = _TL_STORE_DTYPE.get(C.dtype, compute_type)
 
     EM = sorted_token_ids.size(0)
     if A.size(0) < config["BLOCK_SIZE_M"]:
@@ -756,6 +882,8 @@ def invoke_fused_moe_wna16_triton_kernel(
         has_zp=B_zp is not None,
         use_int4_w4a16=use_int4_w4a16,
         use_int8_w8a16=use_int8_w8a16,
+        out_type=out_type,
+        CLAMP_OUT=C.dtype == torch.float16,
         **config,
     )
 
@@ -1435,7 +1563,9 @@ def try_get_optimal_moe_config(
     else:
         # First try to load optimal config from the file
         E, _, N = w2_shape
-        if dtype == "int4_w4a16":
+        # startswith, not ==, so the gfx908 "int4_w4a16_fp16" variant resolves
+        # to the same (E, N) grid as "int4_w4a16".
+        if dtype is not None and dtype.startswith("int4_w4a16"):
             N = N * 2
         block_n = block_shape[0] if block_shape else 0
         block_k = block_shape[1] if block_shape else 0
@@ -1725,6 +1855,17 @@ def fused_experts_impl(
         use_int8_w8a8=use_int8_w8a8,
     )
 
+    # gfx908 fp16-compute MoE (VLLM_GFX908_MOE_FP16_COMPUTE=1): decided before
+    # the config lookup, because the mode has its own tuned config file.
+    fp16_compute = gfx908_moe_fp16_compute(
+        M, hidden_states.dtype, use_int4_w4a16, w1_zp is not None or w2_zp is not None
+    )
+    fp16_safe = fp16_compute and gfx908_moe_fp16_safe()
+    if fp16_compute:
+        config_dtype = gfx908_moe_fp16_config_name(
+            config_dtype, w2.size(), block_shape
+        )
+
     get_config_func = functools.partial(
         try_get_optimal_moe_config,
         w1.size(),
@@ -1766,6 +1907,18 @@ def fused_experts_impl(
         raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
 
     out_hidden_states = torch.empty_like(hidden_states)
+
+    # gfx908 fp16-compute MoE (VLLM_GFX908_MOE_FP16_COMPUTE=1).  cache13 backs
+    # both intermediate_cache1 (GEMM1 out, fp16 here) and intermediate_cache3
+    # (GEMM2 out, kept bf16) -- they are 2-byte views of the same storage, so
+    # nothing extra is allocated and moe_sum is unchanged.
+    if fp16_compute:
+        compute_type = tl.float16
+        hidden_states = cast_to_fp16_sat(hidden_states)
+        if not fp16_safe:
+            cache13_c = cache13.view(torch.float16)
+            intermediate_cache1 = cache13_c[: M * top_k_num * N].view(M, top_k_num, N)
+            intermediate_cache2 = intermediate_cache2.view(torch.float16)
 
     qhidden_states, a1q_scale = moe_kernel_quantize_input(
         A=hidden_states,
@@ -1815,6 +1968,9 @@ def fused_experts_impl(
     apply_moe_activation(
         activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
     )
+
+    if fp16_safe:
+        intermediate_cache2 = cast_to_fp16_sat(intermediate_cache2)
 
     qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
         A=intermediate_cache2,
