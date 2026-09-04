@@ -3,6 +3,7 @@
 """GPU-resident Qwen4Exp position-learning enhancement layers."""
 
 import math
+import os
 from collections.abc import Iterable, Sequence
 
 import torch
@@ -34,6 +35,10 @@ from ..common.ple import PLEVocabParallelEmbedding
 # The mmap PLE table (VLLM_PLE_MMAP) is platform-neutral (np.memmap + thread
 # pool + plain H2D copies); the module lives in the nvidia tree upstream.
 from ..nvidia import ple_mmap
+from vllm.models.qwen4_exp.amd import gfx908_ple_zc
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 class Qwen4ExpPLEGroupedNorm(nn.Module):
@@ -429,6 +434,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             dtype=dtype,
             device=device,
         )
+        if os.environ.get("VLLM_PLE_ZEROCOPY_DEBUG_IDS", "0") == "1":
+            # Debug buffers must exist before graph capture (the op is captured).
+            self._zc_debug_ids = torch.zeros(max_num_tokens * self.ngram_heads + 1, dtype=torch.int64, device=device)
+            self._zc_debug_in = torch.zeros(max_num_tokens + 8 + 512 * 64, dtype=torch.int64, device=device)
+            self._zc_prev = None
+            self._zc_step = 0
 
     def prepare_mmap_rows(
         self,
@@ -452,6 +463,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 f"PLE mmap: {self.layer_name!r} staging was never initialized"
             )
         embedding = self._require_mmap_embedding()
+        if gfx908_ple_zc.zerocopy_table(embedding) is not None:
+            if os.environ.get("VLLM_PLE_ZEROCOPY_DEBUG_IDS", "0") == "1":
+                self._zc_debug_compare(input_ids, query_start_loc, ngram_context, actual_tokens)
+            return  # rows are gathered on the GPU inside forward; no host work
         if actual_tokens > 0:
             ngram_ids = self.compute_ngram_ids(
                 input_ids, query_start_loc, ngram_context
@@ -459,6 +474,40 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             embedding.gather_into(ngram_ids, self._mmap_staging[:actual_tokens])
         if padded_tokens > actual_tokens:
             self._mmap_staging[actual_tokens:padded_tokens].zero_()
+
+    def _zc_debug_compare(self, input_ids, query_start_loc, ngram_context, actual_tokens) -> None:
+        """Debug: compare the previous step's in-graph ids with host-computed ids."""
+        torch.cuda.synchronize()
+        n_graph = int(self._zc_debug_ids[-1].item())
+        din = self._zc_debug_in.cpu()
+        if self._zc_prev is not None:
+            exp, n_exp, h_in, h_qsl, h_ctx = self._zc_prev
+            got = self._zc_debug_ids[:n_exp].cpu()
+            bad = (got != exp).nonzero().flatten()
+            t, r, w = int(din[0]), int(din[1]), int(din[2])
+            g_in = din[3 : 3 + t]; g_qsl = din[3 + t : 4 + t + r]; g_ctx = din[4 + t + r : 4 + t + r + r * w].reshape(r, w)
+            ta = h_in.numel(); ra = h_qsl.numel() - 1
+            in_ok = torch.equal(g_in[:ta], h_in); qsl_ok = torch.equal(g_qsl[: ra + 1], h_qsl)
+            ctx_ok = torch.equal(g_ctx[:ra], h_ctx[:ra])
+            if bad.numel() or self._zc_step < 4 or self._zc_step % 50 == 0:
+                i = int(bad[0]) if bad.numel() else -1
+                logger.info(
+                    "PLE zc ids step %d: host rows %d graph rows %d mismatches %d first bad idx %d got %s exp %s | "
+                    "graph T=%d R=%d W=%d host T=%d R=%d | input_ids eq %s qsl eq %s ctx eq %s | g_in %s h_in %s | g_qsl %s h_qsl %s | g_ctx0 %s h_ctx0 %s",
+                    self._zc_step, n_exp, n_graph, int(bad.numel()), i,
+                    got[i].item() if i >= 0 else None, exp[i].item() if i >= 0 else None,
+                    t, r, w, ta, ra, in_ok, qsl_ok, ctx_ok,
+                    g_in[:6].tolist(), h_in[:6].tolist(), g_qsl[:6].tolist(), h_qsl[:6].tolist(),
+                    g_ctx[0, -6:].tolist() if r > 0 else None, h_ctx[0, -6:].tolist() if ra > 0 else None,
+                )
+        if actual_tokens > 0:
+            ids = self.compute_ngram_ids(input_ids, query_start_loc, ngram_context).reshape(-1)
+            n_req = query_start_loc.numel() - 1
+            self._zc_prev = (ids.cpu(), ids.numel(), input_ids.reshape(-1).cpu().long(),
+                             query_start_loc.cpu().long(), ngram_context[:n_req].cpu().long())
+        else:
+            self._zc_prev = None
+        self._zc_step += 1
 
     def prepare_dummy_mmap_rows(self, padded_tokens: int) -> None:
         """Zero this layer's staged rows for a dummy/capture step.
@@ -488,6 +537,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             # .numel()-derived slicing. A plain shape[0] read stays a SymInt
             # when traced.
             num_tokens = input_ids.reshape(-1).shape[0]
+            if gfx908_ple_zc.zerocopy_table(self.ngram_embedding) is not None:
+                # gfx908 zero-copy: ids + GPU gather + TP all-reduce inside the graph.
+                output = self._mmap_staging.new_empty((num_tokens, self.embedding_dim))
+                torch.ops.vllm.gfx908_ple_zc_embed(
+                    input_ids, query_start_loc, ngram_context, output, self.layer_name
+                )
+                return output
             return self._mmap_staging[:num_tokens].flatten(-2)
         ngram_ids = self.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
         output = ngram_ids.new_empty(

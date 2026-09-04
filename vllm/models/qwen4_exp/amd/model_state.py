@@ -227,6 +227,12 @@ class Qwen4ExpModelState(MambaHybridModelState):
         num_reqs_padded = input_batch.num_reqs_after_padding
         query_start_loc = self.ple_query_start_loc[: num_reqs_padded + 1]
         query_start_loc.copy_(input_batch.query_start_loc[: num_reqs_padded + 1])
+        # The padded tail must stay monotonic: the in-graph n-gram id path
+        # (gfx908 zero-copy) runs searchsorted over the padded extent, and
+        # stale entries from an earlier batch mis-bucket real tokens.
+        num_reqs_actual = input_batch.num_reqs
+        if num_reqs_padded > num_reqs_actual:
+            query_start_loc[num_reqs_actual + 1 :].fill_(input_batch.num_tokens)
         ngram_context = self._prepare_ngram_context(input_batch, req_states)
         model_inputs.update(
             query_start_loc=query_start_loc,

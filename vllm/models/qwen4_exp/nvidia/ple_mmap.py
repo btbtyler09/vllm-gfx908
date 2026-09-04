@@ -2044,6 +2044,13 @@ def _attach_table(
             )
 
         embedding.table = table
+        try:
+            from vllm.models.qwen4_exp.amd import gfx908_ple_zc
+
+            if gfx908_ple_zc.zerocopy_enabled():
+                gfx908_ple_zc.attach(embedding, layer_idx)
+        except ImportError:
+            pass
     except Exception:
         # Nothing between construction and the attach above may raise and
         # leak the table's memmaps, readahead fds, or thread pool — close

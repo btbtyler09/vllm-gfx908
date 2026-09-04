@@ -3,6 +3,8 @@
 from collections.abc import Iterable, Sequence
 from functools import partial
 
+import os
+
 import numpy as np
 import torch
 
@@ -18,9 +20,25 @@ from vllm.utils.torch_utils import (
 _DEFAULT_MAX_CONCURRENCY = 2
 
 
+def _env_max_concurrency() -> int:
+    # gfx908 PLE zero-copy lets the worker queue steps back to back; the GPU
+    # may then read a step's UVA inputs long after the host wrote them, so the
+    # ring must be deeper than the number of queued steps (VLLM_UVA_MAX_CONCURRENCY).
+    try:
+        n = int(os.environ.get("VLLM_UVA_MAX_CONCURRENCY", "0"))
+    except ValueError:
+        n = 0
+    if os.environ.get("VLLM_PLE_ZEROCOPY", "0") == "1":
+        n = max(n, 8)
+    return n
+
+
+_DEFAULT_MAX_CONCURRENCY = max(_DEFAULT_MAX_CONCURRENCY, _env_max_concurrency())
+
+
 def set_default_max_concurrency(n: int) -> None:
     global _DEFAULT_MAX_CONCURRENCY
-    _DEFAULT_MAX_CONCURRENCY = max(2, n)
+    _DEFAULT_MAX_CONCURRENCY = max(2, n, _env_max_concurrency())
 
 
 def async_copy_to_gpu(
