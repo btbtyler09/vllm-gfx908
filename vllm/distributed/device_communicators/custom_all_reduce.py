@@ -142,6 +142,8 @@ class CustomAllreduce:
         self._IS_CAPTURING = False
         self._ptr = 0
         self.disabled = True
+        # gfx908 sentinel push all-reduce (VLLM_GFX908_PUSH_AR=1); None on every other path.
+        self._push_ar = None
         self.mnnvl_buffer = None
         self.mnnvl_handle = None
         self.mnnvl_peer_buffers: list[torch.Tensor] | None = None
@@ -301,6 +303,12 @@ class CustomAllreduce:
             self.meta_ptrs, self.rank_data, rank, self.fully_connected
         )
         ops.register_buffer(self._ptr, self.buffer_ptrs)
+        if same_node:
+            from vllm.distributed.device_communicators.gfx908_push_ar import (
+                maybe_create_push_ar,
+            )
+
+            self._push_ar = maybe_create_push_ar(self)
         self._init_mnnvl_buffer(
             max(
                 max_mnnvl_all_gather_size * world_size,
@@ -443,6 +451,12 @@ class CustomAllreduce:
         # When custom allreduce is disabled, this will be None.
         if self.disabled or not self.should_custom_ar(input):
             return None
+        if self._push_ar is not None and not (
+            self._IS_CAPTURING and not torch.cuda.is_current_stream_capturing()
+        ):
+            out = self._push_ar.maybe_all_reduce(input)
+            if out is not None:
+                return out
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
                 # gfx908: route captured all-reduce through the pre-registered
@@ -577,6 +591,9 @@ class CustomAllreduce:
             if ops is not None:
                 ops.dispose(self._ptr)
             self._ptr = 0
+            if self._push_ar is not None:
+                self._push_ar.close()
+                self._push_ar = None
             self.free_shared_buffer(self.meta_ptrs, rank=self.rank)
             self.free_shared_buffer(self.buffer_ptrs, rank=self.rank)
             self.mnnvl_peer_buffers = None

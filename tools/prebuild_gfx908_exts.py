@@ -16,6 +16,7 @@ MODULES = [
     "vllm.models.qwen4_exp.amd.gfx908_ple_zc",
     "vllm.models.qwen4_exp.amd.gfx908_hc_fused",
     "vllm.model_executor.layers.mamba.gdn.gfx908_gdn_fused",
+    "vllm.distributed.device_communicators.gfx908_push_ar",
 ]
 
 build_dir = os.environ.get("VLLM_GFX908_HIP_BUILD_DIR")
@@ -26,7 +27,7 @@ failed = []
 for name in MODULES:
     try:
         mod = importlib.import_module(name)
-        for fn in ("_ext", "_ext_f16"):
+        for fn in ("_ext", "_ext_f16", "_ext_w8"):
             if hasattr(mod, fn):
                 ext = getattr(mod, fn)()
                 print(f"built {name}.{fn}: {getattr(ext, '__file__', ext)}")
