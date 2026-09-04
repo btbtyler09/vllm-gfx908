@@ -48,6 +48,26 @@ def _gfx908_small_m_topk(gating_output: torch.Tensor, topk_indices: torch.Tensor
     )
 
 
+_GFX908_ROUTER_FUSED: bool | None = None
+
+
+def _gfx908_router_fused_enabled() -> bool:
+    """VLLM_GFX908_ROUTER_FUSED=1: fuse the gate GEMV + softmax + top-k (MI100).
+
+    See vllm/model_executor/layers/fused_moe/gfx908_router_topk.py.
+    """
+    global _GFX908_ROUTER_FUSED
+    if _GFX908_ROUTER_FUSED is None:
+        from vllm.platforms.rocm import on_gfx908
+
+        _GFX908_ROUTER_FUSED = (
+            current_platform_is_rocm()
+            and on_gfx908()
+            and os.environ.get("VLLM_GFX908_ROUTER_FUSED", "0") == "1"
+        )
+    return _GFX908_ROUTER_FUSED
+
+
 def current_platform_is_rocm() -> bool:
     from vllm.platforms import current_platform
 
@@ -201,6 +221,30 @@ class FusedTopKRouter(BaseRouter):
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute routing using standard fused top-k."""
+        # gfx908 (MI100): one HIP kernel replaces the gate GEMV, the bf16->fp32
+        # cast and topkGating for decode-sized batches. `router_logits` has
+        # already been produced by MoERunner._forward_impl; the fused op
+        # recomputes them from `hidden_states` and the gate weight (and the gate
+        # module's GEMM is bypassed after the first call, see gfx908_router_topk).
+        if self.scoring_func == "softmax" and _gfx908_router_fused_enabled():
+            from vllm.model_executor.layers.fused_moe.gfx908_router_topk import (
+                maybe_fused_router,
+            )
+
+            fused = maybe_fused_router(
+                self,
+                hidden_states,
+                self.top_k,
+                self.renormalize,
+                _get_padding_mask(hidden_states.shape[0]),
+            )
+            if isinstance(fused, tuple):
+                return fused
+            if fused is not None:
+                # MoERunner skipped the gate GEMM but this call cannot be
+                # fused: maybe_fused_router recomputed the real logits.
+                router_logits = fused
+
         topk_weights, topk_ids, token_expert_indices = fused_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,

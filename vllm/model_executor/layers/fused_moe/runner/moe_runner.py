@@ -45,6 +45,10 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
     SharedExpertsOrder,
 )
+from vllm.model_executor.layers.fused_moe.gfx908_router_topk import (
+    gfx908_router_will_fuse as _gfx908_router_will_fuse,
+    gfx908_zero_logits as _gfx908_zero_logits,
+)
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
     _USE_LAYERNAME,
@@ -898,6 +902,14 @@ class MoERunner(MoERunnerInterface):
             if self._fse_fuse_gate:
                 self._maybe_fuse_gate_weights()
                 router_logits = F.linear(hidden_states, self._combined_gate_weight)
+            elif _gfx908_router_will_fuse(self, hidden_states):
+                # gfx908: the fused router kernel recomputes the logits from
+                # hidden_states inside the router (VLLM_GFX908_ROUTER_FUSED=1).
+                # Hand the router the gate so the decision is shared: if the
+                # router cannot fuse this call it recomputes the logits itself.
+                self.router._gfx908_gate = self.gate
+                self.router._gfx908_gate_skipped = True
+                router_logits = _gfx908_zero_logits(self, hidden_states)
             else:
                 router_logits, _ = self.gate(hidden_states)
 
