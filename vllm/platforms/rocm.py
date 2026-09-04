@@ -287,8 +287,11 @@ if _ON_GFX908:
         # protocol shave ~0.5 ms / step (~4.6% TPOT) vs the Ring/default-proto
         # combination by reducing per-message latency for the small (~few KB)
         # per-step all-reduces decode produces.
-        "NCCL_ALGO": "Tree",
-        "NCCL_PROTO": "LL",
+        # Prefill all-reduces (10-40 MB per call at 2K-8K tokens) fall off the
+        # custom-AR size limit onto RCCL, where Tree/LL is the wrong choice;
+        # VLLM_GFX908_NCCL_DECODE_TUNE=0 leaves RCCL's size-based defaults.
+        **({"NCCL_ALGO": "Tree", "NCCL_PROTO": "LL"}
+           if os.environ.get("VLLM_GFX908_NCCL_DECODE_TUNE", "1") == "1" else {}),
         # ROCm 7.2.4 hipBLASLt grew gfx908 addmm coverage with untuned
         # heuristics: MTP verify GEMMs pick slow kernels (+15% TPOT on
         # long-prompt spec decode). rocBLAS fallback restores the pre-7.2.4

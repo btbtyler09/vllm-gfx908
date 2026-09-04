@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from typing import cast
 
+import os
+
 import torch
 from torch import nn
 
@@ -163,8 +165,14 @@ class QSAIndexer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Project replicated Q/K, normalize+rotate Q, and preserve raw K."""
+        with_q: bool = True,
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        """Project replicated Q/K, normalize+rotate Q, and preserve raw K.
+
+        ``with_q=False`` keeps the fused projection (its K half feeds the
+        compressed-key state that decode still needs) but drops the query
+        norm + RoPE, which only exist to feed the scorer.
+        """
 
         qk, _ = self.index_qk_proj(hidden_states)
         q_raw, token_k = qk.split(
@@ -174,13 +182,16 @@ class QSAIndexer(nn.Module):
             ),
             dim=-1,
         )
+        token_k = token_k.reshape(-1, 1, self.index_head_dim)
+        if not with_q:
+            return None, token_k
         q = q_raw.reshape(-1, self.index_n_heads, self.index_head_dim)
         q = apply_qsa_rmsnorm(
             self.q_layernorm,
             q.reshape(-1, self.index_head_dim),
         ).reshape_as(q)
         q = apply_qsa_rope(self.rotary_emb, positions, q)
-        return q, token_k.reshape(-1, 1, self.index_head_dim)
+        return q, token_k
 
     def normalize_compressed_keys(
         self,
@@ -287,15 +298,43 @@ class QSAIndexer(nn.Module):
             self.token_topk,
             self.compress_ratio,
             out,
+            num_columns=self._qsa_num_columns(metadata),
         )
+
+    def _qsa_num_columns(self, metadata: QSAForwardMetadata) -> int | None:
+        """gfx908: bound the indexer scorer's columns to the batch's real
+        context (VLLM_GFX908_QSA_NUM_COLUMNS=1) instead of max_model_len/4.
+        Under graph capture max_seq_len is the capture's dummy value, so the
+        captured decode graphs keep the full width; eager prefill shrinks."""
+        if os.environ.get("VLLM_GFX908_QSA_NUM_COLUMNS", "0") != "1":
+            return None
+        max_seq_len = int(getattr(metadata, "max_seq_len", 0) or 0)
+        if max_seq_len <= 0 or torch.cuda.is_current_stream_capturing():
+            return None
+        capacity = metadata.block_table.shape[1] * self.compressed_key_cache.kv_cache.shape[1]
+        cols = (max_seq_len + self.compress_ratio - 1) // self.compress_ratio
+        cols = ((cols + 63) // 64) * 64
+        return min(capacity, max(cols, 64))
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         out: torch.Tensor | None = None,
+        skip_select: bool = False,
+        force_select: bool = False,
     ) -> torch.Tensor:
-        """Return fixed-width request-relative token indices padded with ``-1``."""
+        """Return fixed-width request-relative token indices padded with ``-1``.
+
+        ``skip_select`` (the ``VLLM_GFX908_QSA_DENSE_SHORT`` fast path) keeps
+        every cache-state update - raw keys, the compressor-state ring, the
+        pooled/normalized compressed keys and the packed RoPE positions - and
+        drops only the scorer / top-k / expand chain, whose result the caller
+        does not consume because the selection would be the identity.  The
+        returned buffer is then stale; the caller must not read it.
+        ``force_select`` overrides ``skip_topk`` when the buffer went stale
+        that way.
+        """
 
         metadata = self._metadata()
         if metadata is None:
@@ -314,8 +353,11 @@ class QSAIndexer(nn.Module):
             return result
         raw_metadata, compressed_metadata = metadata
         num_tokens = raw_metadata.num_actual_tokens
+        reuse = self.skip_topk and not force_select
         q, token_k = self.project_qk(
-            hidden_states[:num_tokens], positions[..., :num_tokens]
+            hidden_states[:num_tokens],
+            positions[..., :num_tokens],
+            with_q=not (skip_select or reuse),
         )
         self._update_and_compress(
             token_k,
@@ -323,7 +365,7 @@ class QSAIndexer(nn.Module):
             raw_metadata,
             compressed_metadata,
         )
-        if self.skip_topk:
+        if skip_select or reuse:
             if out is None:
                 raise RuntimeError("QSA top-k reuse requires an output buffer")
             return out

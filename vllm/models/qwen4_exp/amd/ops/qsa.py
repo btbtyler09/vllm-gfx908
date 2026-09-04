@@ -736,6 +736,7 @@ def qsa_select_paged_tokens(
     token_topk: int,
     compress_ratio: int,
     out: torch.Tensor | None = None,
+    num_columns: int | None = None,
 ) -> torch.Tensor:
     """Score, select, and expand QSA indices without host synchronization."""
 
@@ -769,6 +770,7 @@ def qsa_select_paged_tokens(
             query_positions[row_slice],
             sequence_lengths,
             compress_ratio,
+            num_columns=num_columns,
         )
         blocks = blocks_buffer[: row_end - row_start]
         use_cooperative_topk = (
@@ -816,6 +818,81 @@ def qsa_select_paged_tokens(
             token_topk,
             out[row_slice],
         )
+    return out
+
+
+def qsa_dense_causal_paged_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_query_len: int,
+    max_seq_len: int,
+    softmax_scale: float,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Dense causal GQA over the paged BF16 K/V cache.
+
+    Used by the ``VLLM_GFX908_QSA_DENSE_SHORT`` fast path: when every request
+    in the batch has a context no longer than ``indexer_budget`` the QSA
+    selection is the identity (it selects the whole causal prefix), so the
+    sparse kernel computes exactly dense causal attention over a materialised
+    index list.  This runs the same math through vLLM's Triton unified
+    attention, which tiles the query dimension (BLOCK_M=16 shared by
+    ``BLOCK_Q`` consecutive tokens x ``num_queries_per_kv`` heads) instead of
+    launching one program per token, and walks the KV once per tile instead of
+    re-gathering a 2051-wide index per token.
+
+    ``k_cache``/``v_cache`` are the ``[pages, page_size, kv_heads, head_dim]``
+    views the QSA owner already builds from the merged ``(B, H, N, 2 * D)``
+    cache; only their strides are passed to the kernel, so the K/V interleaving
+    on the last axis is irrelevant.
+    """
+
+    if not q.is_cuda or not HAS_TRITON:
+        raise RuntimeError("paged QSA dense attention requires a GPU and Triton")
+    if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
+        raise ValueError("QSA dense attention received invalid Q/K/V shapes")
+    if out.shape != q.shape:
+        raise ValueError("QSA dense output must match its query")
+    if block_table.ndim != 2 or query_start_loc.ndim != 1 or seq_lens.ndim != 1:
+        raise ValueError("QSA dense attention metadata has invalid shapes")
+    if q.shape[2] != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
+        raise ValueError("QSA dense attention requires valid grouped-query heads")
+    assert q.dtype == k_cache.dtype == v_cache.dtype == out.dtype
+    assert q.stride(2) == 1 and out.stride(2) == 1
+    assert k_cache.stride(3) == 1 and v_cache.stride(3) == 1
+    if not q.shape[0]:
+        return out
+
+    from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+
+    # ``num_seqs`` is taken from ``len(seqused_k)``; the two metadata tensors
+    # must therefore agree on the request count (they can be padded).
+    num_requests = query_start_loc.shape[0] - 1
+    if seq_lens.shape[0] < num_requests:
+        raise ValueError("QSA dense attention seq_lens is shorter than the batch")
+
+    unified_attention(
+        q=q,
+        k=k_cache,
+        v=v_cache,
+        out=out,
+        cu_seqlens_q=query_start_loc,
+        max_seqlen_q=max_query_len,
+        seqused_k=seq_lens[:num_requests],
+        max_seqlen_k=max_seq_len,
+        softmax_scale=softmax_scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_table,
+        softcap=0.0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+    )
     return out
 
 
@@ -1127,6 +1204,7 @@ def qsa_compress_groups_with_ratio(
 __all__ = [
     "expand_qsa_block_indices_cuda",
     "qsa_compress_groups_with_ratio",
+    "qsa_dense_causal_paged_attention",
     "qsa_mqa_paged",
     "qsa_select_paged_tokens",
     "qsa_sparse_paged_attention",

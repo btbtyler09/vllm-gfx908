@@ -359,6 +359,17 @@ def triton_w4a16_gemm(
     ):
         return _gfx908_w4a16_gemv(a, b_q, scales, group_size, zp_bias)
 
+    # Large-M escape: dequantise once into a reusable scratch and let the stock
+    # bf16 dispatch (rocBLAS) do the GEMM.  Off by default; see
+    # _w4a16_dequant_escape.  Placed after the GEMV gate so the decode path is
+    # untouched, and it returns None whenever it does not apply.
+    if current_platform.is_rocm():
+        escaped = _w4a16_dequant_escape(
+            a, b_q, scales, qzeros, group_size, zp_bias
+        )
+        if escaped is not None:
+            return escaped
+
     c = torch.empty((M, N), dtype=a.dtype, device=a.device)
 
     has_zp = qzeros is not None
@@ -481,19 +492,24 @@ direct_register_custom_op(
 def triton_w4a16_dequant_kernel(
     b_ptr,           # [K, N//8] int32 packed weights (8 nibbles per int32)
     scales_ptr,      # [K//G, N] fp16/bf16
-    out_ptr,         # [K, N] fp16 output
+    zeros_ptr,       # [K//G, N//8] int32 packed zeros (unused when HAS_ZP=False)
+    out_ptr,         # [K, N] (TRANSPOSE_OUT=False) or [N, K] (True)
     N, K,
     stride_bk, stride_bn,
     group_size,
+    HAS_ZP: tl.constexpr,
     ZP_BIAS: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_N8: tl.constexpr,
+    TRANSPOSE_OUT: tl.constexpr,
 ):
-    """Dequantize a [K, N//8]-packed GPTQ4 weight to dense fp16 [K, N].
+    """Dequantize a [K, N//8]-packed GPTQ4 weight to dense [K, N] (or [N, K]).
 
-    Symmetric-only (uint4b8): w_fp = (nibble - ZP_BIAS) * scale. Same
-    dequant math as triton_w4a16_gemm_kernel so the dequant+hgemm route
-    sees the same weight values as the fused MFMA route.
+    Dequant math is identical to triton_w4a16_gemm_kernel:
+        w = (nibble - zero).to(scales.dtype) * scale
+    with `zero` either the unpacked qzeros nibble (HAS_ZP) or the constant
+    ZP_BIAS (symmetric uint4b8), so the dequant+hgemm route sees bit-identical
+    weight values to the fused MFMA route.
     """
     pid_k = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -525,9 +541,29 @@ def triton_w4a16_dequant_kernel(
         other=1.0,
     )
 
-    w = (b - ZP_BIAS).to(scales.dtype) * scales
-    out_ptrs = out_ptr + offs_k[:, None] * N + offs_n[None, :]
-    tl.store(out_ptrs, w, mask=mask_k[:, None] & mask_n[None, :])
+    if HAS_ZP:
+        # zeros are packed exactly like the weights: [K//G, N//8] int32
+        z_packed = tl.load(
+            zeros_ptr + g_idx[:, None] * (N // 8) + offs_n8[None, :],
+            mask=mask_k[:, None] & mask_n8[None, :],
+            other=0,
+        )
+        z = tl.interleave(z_packed, z_packed)
+        z = tl.interleave(z, z)
+        z = tl.interleave(z, z)
+        z = (z >> shifts_1d[None, :]) & 0xF
+    else:
+        z = tl.full((BLOCK_K, BLOCK_N8 * 8), ZP_BIAS, dtype=tl.int32)
+
+    w = (b - z).to(scales.dtype) * scales
+    if TRANSPOSE_OUT:
+        out_ptrs = out_ptr + offs_n[:, None] * K + offs_k[None, :]
+        tl.store(
+            out_ptrs, tl.trans(w), mask=mask_n[:, None] & mask_k[None, :]
+        )
+    else:
+        out_ptrs = out_ptr + offs_k[:, None] * N + offs_n[None, :]
+        tl.store(out_ptrs, w, mask=mask_k[:, None] & mask_n[None, :])
 
 
 def triton_w4a16_dequant(
@@ -535,28 +571,215 @@ def triton_w4a16_dequant(
     scales: torch.Tensor,    # [K//G, N] fp16/bf16
     group_size: int,
     zp_bias: int = 8,
+    qzeros: torch.Tensor | None = None,  # [K//G, N//8] int32 (asymmetric)
+    out: torch.Tensor | None = None,     # optional pre-allocated [K, N] scratch
+    transpose_out: bool = False,         # write [N, K] instead of [K, N]
 ) -> torch.Tensor:
     """Dequantize the repacked GPTQ4 weight to dense [K, N] in scales.dtype.
 
-    Used by the gfx908 GPTQ4 dual dispatch for M > dequant threshold: at
-    high M, dequant-once + rocBLAS hgemm beats the fused MFMA kernel whose
-    BLOCK_K is clamped to group_size (=32 for GS32 checkpoints)."""
+    Used by the gfx908 GPTQ4 dual dispatch and by the large-M dequant escape in
+    TritonW4A16LinearKernel: at high M, dequant-once + rocBLAS hgemm beats the
+    fused MFMA kernel whose BLOCK_K is clamped to group_size (=32 for GS32
+    checkpoints).
+
+    `out` lets the caller pass a reusable scratch buffer (shape [K, N], or
+    [N, K] when transpose_out) so the escape does not allocate per call.
+    """
     assert b_q.is_contiguous() and scales.is_contiguous()
     K = b_q.shape[0]
     N = b_q.shape[1] * 8
-    out = torch.empty((K, N), dtype=scales.dtype, device=b_q.device)
+    shape = (N, K) if transpose_out else (K, N)
+    if out is None:
+        out = torch.empty(shape, dtype=scales.dtype, device=b_q.device)
+    else:
+        assert out.shape == shape and out.dtype == scales.dtype
+        assert out.is_contiguous()
+    has_zp = qzeros is not None
     BLOCK_K, BLOCK_N8 = 32, 16
     grid = (triton.cdiv(K, BLOCK_K), triton.cdiv(N // 8, BLOCK_N8))
     triton_w4a16_dequant_kernel[grid](
-        b_q, scales, out,
+        b_q, scales, qzeros if has_zp else b_q, out,
         N, K,
         b_q.stride(0), b_q.stride(1),
         group_size=group_size,
+        HAS_ZP=has_zp,
         ZP_BIAS=zp_bias,
         BLOCK_K=BLOCK_K,
         BLOCK_N8=BLOCK_N8,
+        TRANSPOSE_OUT=transpose_out,
     )
     return out
+
+
+# --------------------------------------------------------------------------- #
+# gfx908 large-M dequant escape (VLLM_GFX908_W4_DEQUANT_LARGE_M=1, default off)
+#
+# The fused W4A16 MFMA kernel is capped at BLOCK_K = group_size (32 for the
+# GS32 checkpoints) and has no L2 swizzle, so at prefill M it runs at 17-36
+# TFLOP/s against a 92.3 bf16-MFMA peak.  Above a threshold it is cheaper to
+# materialise the weight once into a bf16 scratch and hand the GEMM to rocBLAS,
+# which reaches 40-56 TFLOP/s on the same shapes.  Mirrors exllama.py's
+# `dequant_mthresh` escape for the GPTQ8 dual dispatch.
+#
+# The scratch holds the weight **transposed**, `[N, K]`, so the GEMM is
+# `F.linear` (the "NT" layout every other vLLM linear uses) rather than
+# `torch.mm` on a `[K, N]` weight.  Graph-timed on MI100 (agents/w4_dequant,
+# 2026-09-04) that choice is what makes the escape win: on the narrow shared
+# expert shapes rocBLAS picks a much worse kernel for the `[K, N]` "NN" form
+# (shared gate_up 2560x320 at M=1024: 145 us NN vs 49 us NT), and NN loses to
+# the fused kernel outright at several M.
+#
+# The transposed store costs 6-25% more in the dequant kernel than the plain
+# `[K, N]` store; the dequant is 1-5% of the call either way.
+#
+# At M >= 256 `rocm_unquantized_gemm_gfx908` provably terminates in `F.linear`
+# for every dense W4 shape in this model (wvSplitK needs n<=4, LLMM1 n==1,
+# the Triton mid-M path 5<=M<=64, the AITER whitelist does not contain these
+# shapes, and the einsum path needs weight.shape[0] <= 8), so calling F.linear
+# here is the same rocBLAS kernel with one fewer opaque hop.  It is also the
+# safe choice: the scratch is a *mutable* buffer whose contents change every
+# call, and the gfx908 W8A16 registry inside that dispatch caches int8 copies
+# keyed on `weight.data_ptr()` for a shape set that includes (2560, 1536) --
+# exactly the QSA o_proj weight in `[N, K]` form.  Today its M gates
+# (W8A16_MAX_M=4, MFMA_MAX_M=64) make that unreachable at M >= 256, but
+# handing it a scratch buffer at all is a trap worth not setting.
+#
+# The scratch is a single flat buffer per (device, dtype), grown on demand to
+# the largest K*N seen, and is allocated on the first *eager* call only: the
+# escape is skipped entirely while a CUDA graph is being captured, so no
+# allocation and no cross-replay buffer aliasing can happen inside a graph.
+# Prefill runs eager on gfx908, which is the only regime the escape targets.
+# --------------------------------------------------------------------------- #
+_W4_DEQUANT_LARGE_M_FLAG: bool | None = None
+_W4_DEQUANT_MIN_M: int | None = None
+_W4_DEQUANT_MIN_K: int | None = None
+_W4_DEQUANT_LAYOUT: str | None = None
+_W4_DEQUANT_SCRATCH: dict = {}
+
+
+def _w4_dequant_large_m_enabled() -> bool:
+    global _W4_DEQUANT_LARGE_M_FLAG
+    if _W4_DEQUANT_LARGE_M_FLAG is None:
+        import os
+
+        try:
+            from vllm.platforms.rocm import on_gfx908
+
+            is_gfx908 = on_gfx908()
+        except Exception:
+            is_gfx908 = False
+        _W4_DEQUANT_LARGE_M_FLAG = is_gfx908 and (
+            os.environ.get("VLLM_GFX908_W4_DEQUANT_LARGE_M", "0") == "1"
+        )
+    return _W4_DEQUANT_LARGE_M_FLAG
+
+
+def _w4_dequant_min_m() -> int:
+    global _W4_DEQUANT_MIN_M
+    if _W4_DEQUANT_MIN_M is None:
+        import os
+
+        try:
+            _W4_DEQUANT_MIN_M = int(
+                os.environ.get("VLLM_GFX908_W4_DEQUANT_MIN_M", "256")
+            )
+        except ValueError:
+            _W4_DEQUANT_MIN_M = 256
+    return _W4_DEQUANT_MIN_M
+
+
+def _w4_dequant_min_k() -> int:
+    """Smallest K the escape will fire for.  0 (default) = no K gate.
+
+    Exists for the shared-expert down projection, K=160: its packed weight is
+    0.2 MB, so it is L2-resident and the fused kernel already runs it at
+    23-26 TFLOP/s -- the best of the four dense shapes here -- which leaves the
+    escape little to win.  Graph-timed on MI100 it still wins at M=256 (11.9 vs
+    16.8 us), M=1024 (wash) and M=8192 (135.0 vs 251.9), and loses only at
+    M=2048 (71.8 vs 65.7 = -6 us/call, -0.3 ms across the 48 layers), so it is
+    included by default: at the 7840-token chunk this model actually prefills
+    with, that shape is worth ~5.6 ms/pass.  Set
+    VLLM_GFX908_W4_DEQUANT_MIN_K=256 to exclude it for a short-prompt-dominated
+    workload, where its per-call extra launch is a larger share of the cost.
+    """
+    global _W4_DEQUANT_MIN_K
+    if _W4_DEQUANT_MIN_K is None:
+        import os
+
+        try:
+            _W4_DEQUANT_MIN_K = int(
+                os.environ.get("VLLM_GFX908_W4_DEQUANT_MIN_K", "0")
+            )
+        except ValueError:
+            _W4_DEQUANT_MIN_K = 0
+    return _W4_DEQUANT_MIN_K
+
+
+def _w4_dequant_layout() -> str:
+    """Scratch weight layout: "nt" -> [N, K] + F.linear, "nn" -> [K, N] + mm.
+
+    "nt" is the default and wins overall (and on every shape at M=8192), but
+    which layout rocBLAS prefers actually flips per (shape, M) -- most sharply
+    on the narrow shared-expert gate_up (2560x320) at M=256, where "nn" is
+    20 us and "nt" is 75 us against a 151 us fused kernel.  See
+    agents/w4_dequant/INTEGRATION.md for the full table; a per-shape layout
+    table is a follow-up worth ~2-3 ms/pass at the small M.
+    """
+    global _W4_DEQUANT_LAYOUT
+    if _W4_DEQUANT_LAYOUT is None:
+        import os
+
+        v = os.environ.get("VLLM_GFX908_W4_DEQUANT_LAYOUT", "nt").lower()
+        _W4_DEQUANT_LAYOUT = v if v in ("nt", "nn") else "nt"
+    return _W4_DEQUANT_LAYOUT
+
+
+def _w4_dequant_scratch(
+    numel: int, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """One flat scratch buffer per (device, dtype), grown to the largest shape."""
+    key = (device.type, -1 if device.index is None else device.index, dtype)
+    buf = _W4_DEQUANT_SCRATCH.get(key)
+    if buf is None or buf.numel() < numel:
+        buf = torch.empty(numel, dtype=dtype, device=device)
+        _W4_DEQUANT_SCRATCH[key] = buf
+    return buf[:numel]
+
+
+def _w4a16_dequant_escape(
+    a: torch.Tensor,
+    b_q: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor | None,
+    group_size: int,
+    zp_bias: int,
+) -> torch.Tensor | None:
+    """Return A @ dequant(B) via the bf16 dispatch, or None if not applicable."""
+    if not _w4_dequant_large_m_enabled():
+        return None
+    if a.shape[0] < _w4_dequant_min_m():
+        return None
+    K = b_q.shape[0]
+    N = b_q.shape[1] * 8
+    if K < _w4_dequant_min_k():
+        return None
+    if scales.dtype != a.dtype:
+        return None
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    nt = _w4_dequant_layout() == "nt"
+    shape = (N, K) if nt else (K, N)
+    w = _w4_dequant_scratch(K * N, scales.dtype, b_q.device).view(shape)
+    triton_w4a16_dequant(
+        b_q=b_q,
+        scales=scales,
+        group_size=group_size,
+        zp_bias=zp_bias,
+        qzeros=qzeros,
+        out=w,
+        transpose_out=nt,
+    )
+    return torch.nn.functional.linear(a, w) if nt else torch.mm(a, w)
 
 
 class TritonW4A16LinearKernel(MPLinearKernel):

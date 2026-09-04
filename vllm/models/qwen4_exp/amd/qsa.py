@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import ClassVar, cast
 
 import torch
@@ -11,6 +12,7 @@ from torch import nn
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention.attention import (
@@ -56,6 +58,20 @@ from vllm.v1.kv_cache_interface import (
 from ..common.qsa_cache import QSAForwardMetadata
 from . import model
 from .indexer_qsa import QSAIndexer
+
+
+def _dense_short_enabled() -> bool:
+    """``VLLM_GFX908_QSA_DENSE_SHORT=1`` opts into the dense-causal fast path.
+
+    Read per call (one dict lookup) so a process can flip it between forward
+    passes; the default is off.
+    """
+
+    return os.environ.get("VLLM_GFX908_QSA_DENSE_SHORT", "0").strip() in (
+        "1",
+        "true",
+        "True",
+    )
 
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -113,6 +129,46 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         if self.kv_cache_dtype not in ("auto", "bfloat16"):
             raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache")
         self.supports_quant_query_input = False
+
+    def forward_dense_causal(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Dense causal attention over the paged KV, bypassing the selection.
+
+        Only valid when every request's context fits the indexer budget, in
+        which case the QSA selection is the whole causal prefix and this is the
+        same math (see ``Qwen4ExpQSAAttention._dense_short_eligible``).
+        """
+
+        num_tokens = attn_metadata.num_actual_tokens
+        output.zero_()
+        if num_tokens == 0:
+            return output
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        key_cache = canonicalize_singleton_dim_strides(key_cache)
+        value_cache = canonicalize_singleton_dim_strides(value_cache)
+        if key_cache.dtype != torch.bfloat16 or query.dtype != torch.bfloat16:
+            raise NotImplementedError("Qwen4Exp QSA requires BF16 Q/K/V")
+
+        from .ops.qsa import qsa_dense_causal_paged_attention
+
+        qsa_dense_causal_paged_attention(
+            query[:num_tokens],
+            key_cache,
+            value_cache,
+            attn_metadata.block_table,
+            attn_metadata.query_start_loc,
+            attn_metadata.seq_lens,
+            attn_metadata.max_query_len,
+            attn_metadata.max_seq_len,
+            self.scale,
+            output[:num_tokens],
+        )
+        return output
 
     def forward_qsa(
         self,
@@ -307,6 +363,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             persistent=False,
         )
 
+        # Set when a dense-causal step skipped the selection, so the buffer
+        # holds the previous step's rows.
+        self._topk_buffer_stale = False
+
         static_context = vllm_config.compilation_config.static_forward_context
         if self.layer_name in static_context:
             raise ValueError(f"Duplicate layer name: {self.layer_name}")
@@ -324,6 +384,35 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             dtype=self.kv_cache_torch_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
         )
+
+    def _dense_short_eligible(self, main_metadata: FlashAttentionMetadata) -> bool:
+        """True when the QSA selection is provably the identity for this batch.
+
+        The indexer selects ``indexer_budget`` tokens as ``budget /
+        compress_ratio`` compressed blocks plus the ragged tail, and a query at
+        logical position ``p`` has ``(p + 1) // compress_ratio`` complete blocks
+        visible.  Once ``p + 1 <= indexer_budget`` for every query, top-k has
+        fewer candidates than slots, so it returns *every* visible block and the
+        expansion covers the whole causal prefix ``[0, p]`` - exactly what dense
+        causal attention computes.  ``max_seq_len`` (a host-side upper bound on
+        the batch's context, cached prefix included) bounds every ``p + 1``.
+
+        Guards: cudagraph capture/replay must never see a data-dependent branch,
+        so only eager launches qualify; ``max_query_len > 1`` keeps this to
+        prefill-shaped batches (pure decode keeps the tuned sparse decode
+        kernel); and MTP index reuse (``skip_topk``) needs a live top-k buffer.
+        """
+
+        if not _dense_short_enabled():
+            return False
+        if self.indexer.skip_topk:
+            return False
+        if int(getattr(main_metadata, "max_query_len", 1) or 1) <= 1:
+            return False
+        max_seq_len = int(getattr(main_metadata, "max_seq_len", 0) or 0)
+        if max_seq_len <= 0 or max_seq_len > self.indexer.token_topk:
+            return False
+        return get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.NONE
 
     def _run_qsa(
         self,
@@ -351,12 +440,19 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         if side_metadata.num_actual_tokens != num_tokens:
             raise RuntimeError("QSA main and side metadata token counts disagree")
+        dense_short = self._dense_short_eligible(main_metadata)
+        # A skipped selection leaves the top-k buffer stale, so an MTP step
+        # that would have reused it recomputes instead of reading garbage.
         selected = self.indexer(
             hidden_states,
             positions,
             self.topk_indices_buffer[:num_tokens],
+            skip_select=dense_short,
+            force_select=getattr(self, "_topk_buffer_stale", False)
+            and self.indexer.skip_topk,
         )
-        if selected.shape != (
+        self._topk_buffer_stale = dense_short
+        if not dense_short and selected.shape != (
             num_tokens,
             self.indexer.output_width,
         ):
@@ -369,6 +465,14 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             self.kv_cache,
             main_metadata.slot_mapping,
         )
+        if dense_short:
+            impl.forward_dense_causal(
+                query,
+                self.kv_cache,
+                main_metadata,
+                output,
+            )
+            return
         impl.forward_qsa(
             self,
             query,

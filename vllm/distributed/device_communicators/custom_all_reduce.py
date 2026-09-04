@@ -4,6 +4,8 @@
 from contextlib import contextmanager
 from typing import cast
 
+import os
+
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
@@ -220,6 +222,11 @@ class CustomAllreduce:
                     CUSTOM_ALL_REDUCE_MAX_SIZES[device_capability_str][world_size],
                     max_size,
                 )
+        # gfx908 prefill: the custom 2-stage kernel moves 10 MB messages at
+        # ~12 GB/s; a lower cap sends them to RCCL instead (A/B knob, MiB).
+        _cap_mb = os.environ.get("VLLM_GFX908_CUSTOM_AR_MAX_SIZE_MB")
+        if _cap_mb:
+            max_size = min(max_size, int(float(_cap_mb) * 1024 * 1024))
         # device.index is a visible ordinal, not a logical local ID.
         fully_connected = False
         if same_node:

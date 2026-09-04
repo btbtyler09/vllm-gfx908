@@ -562,6 +562,9 @@ class QSAForwardMetadata(AttentionMetadata):
     num_actual_tokens: int
     storage_block_size: int
     compress_ratio: int
+    # Host-side max sequence length in the batch (0 = unknown): lets the
+    # indexer scorer bound its column loop instead of scanning max_model_len.
+    max_seq_len: int = 0
 
 
 class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
@@ -646,6 +649,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=slot_mapping,
             seq_lens=common_attn_metadata.seq_lens,
+            max_seq_len=int(getattr(common_attn_metadata, "max_seq_len", 0) or 0),
             query_start_loc=common_attn_metadata.query_start_loc,
             token_to_req=token_to_req,
             logical_positions=logical_positions,
