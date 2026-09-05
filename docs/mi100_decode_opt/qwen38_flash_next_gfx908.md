@@ -658,3 +658,20 @@ Pure-image validation, TP4, util 0.90:
 
 The c=1 parity shift vs rc4 is the M=1 swizzled W8 GEMV (within 1 bf16 ulp
 on 0.02-0.04% of outputs, not bit-exact); c=16 is at the batched-path floor.
+
+12-tier BenchAndReport on the pure rc6 image
+(`mi100-llm-testing/Model_Reports/benchmark_Qwen3.8-Flash-Next-GPTQ-4bit_rc6.md`):
+
+| tier | rc5 | rc6 |
+|---|---|---|
+| Single user 2K/512 TTFT / TPOT | 541 ms / 11.4 ms | 500 ms / 11.2 ms |
+| Decode stress c=1 | 89.2 tok/s | 91.3 tok/s |
+| Long context 16K c=4 tok/s, TTFT / TPOT | 115.8, 9.02 s / 21.6 ms | 130.6, 8.32 s / 19.0 ms |
+| Short context c=16 tok/s, TTFT | 276, 1.87 s | 437, 1.69 s |
+| Mixed c=8 | 265 tok/s | 323 tok/s |
+| c=4 / c=16 / c=32 / c=64 / c=128 | 175 / 302 / 357 / 341 / 387 | 208 / 509 / 534 / 483 / 539 |
+
+The batch tiers move 40-70% (multi-row MoE kernel + MFMA + fp16 experts);
+c=1 moves 2% (prep fold + sampler); the 16K tier +13% (fp16 experts, gemm2
+configs, FLA BV16). Against the 2x RTX Pro 6000 NVFP4 reference (c=16 706,
+c=64 1349): c=16 gap 2.3x -> 1.4x, c=64 4.0x -> 2.8x.
