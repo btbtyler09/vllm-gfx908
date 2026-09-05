@@ -816,3 +816,25 @@ one 120-WG grid barrier (~-1 us/module, deadlock-fragile under co-residency)
 Measurement note from the same agent: the first graph capture of a freshly
 loaded code object mis-measures badly (63 us for a 14.8 us kernel); warm every
 arm with an eager call plus a throwaway capture before timing.
+
+### PLE decode glue and sampler passes (agent ple_glue, 2026-09-05)
+
+PLE layer (runs once per step, layer 2): 23 launches -> 1 HIP kernel,
+64.5 -> 12.4 us warm, 85 -> 16 us cold at T=1 (-22 graph nodes); T=4/8:
+82 -> 13 us, 117 -> 23 us. Correctness target was the inductor-compiled
+path (torch.equal at T=1/2/4 on output and conv state; 5 of 2.5M bf16
+elements differ by 1 ulp over the 12-case grid). Two rounding traps that
+each move ~5% of elements: the eager `.sum(-1)` stays bf16, and `F.conv1d`
+materialises bf16 before silu. Committed gated off (`VLLM_GFX908_PLE_GLUE`,
+2f5f40fc4a); when on, prefill/mixed batches run the eager PLE body instead of
+inductor, so the arm needs the PPL gate. Not taken: ring-buffer conv state
+(would cut the dominant 368 KB/token state shift).
+
+Sampler radix passes: 7 -> 6 launches and the selection replay is gone
+(87 -> 54 us at 1 row, 112 -> 76 at 3, 295 -> 178 at 8), torch.equal to the
+shipping fast path on 162/162 cases. Memset folded into the top-p kernel via
+a persistent workspace; per-digit selection slots carried forward (a shared
+slot is a same-pass read/write race). Compaction + top-p replay not merged
+(unbounded tie rescan cannot be captured). Held as a patch
+(`agents/ple_glue/patch/sampler_merge.patch`) because it changes the default
+path un-gated; goes in after rc8 with its own parity + three-boot arm.
