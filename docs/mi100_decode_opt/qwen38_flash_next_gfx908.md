@@ -546,3 +546,23 @@ c=1 4/16 mean 0.0078 (the M=1 GEMV is within 1 ulp, not bit-exact), TTFT
 571 ms @3.2K / 1.81 s @12.8K (rc5 558 / 1.81), c=1 88.3-90.6, c=4 217-220
 (rc5 209-214), c=16 probe 387 tok/s (rc5 264; the fp16-experts arm alone read
 360 on the same probe).
+
+### MTP arms on the round-9 stack (2026-09-05, before the sampler/spec-path fixes)
+
+`--speculative-config '{"method":"qwen4_exp_mtp","num_speculative_tokens":n}'`,
+util 0.90, 16 seqs, 4096 batched tokens, mixed real-text corpus, greedy:
+
+| n | acceptance / position | tokens per step | c=1 ms/step | c=1 tok/s | c=4 | c=16 |
+|---|---|---|---|---|---|---|
+| 1 | 0.69 | 1.69 | 21-25 | 73-74 | 252 | 241 |
+| 2 | 0.53 | 2.06 | 24-28 | 82-83 | 148 | 202 |
+| 3 | did not boot at 0.90 / 16 seqs (no memory for cache blocks) | | | | | |
+
+The head drafts well enough (2.06 tokens per step at n=2) but the step costs
+2.2-2.5x a plain step, so MTP loses to the 90 tok/s non-spec decode. Causes
+(spec_research / mtp_draft anatomy): the spec branch drops the fused GDN glue
+(+180 launches), the small-M GEMVs are row-serial (~3.5 ms per extra verify
+row), the verify sampler's full-vocab sort (1.6 ms), eager draft metadata,
+NCCL all-gathers on the spec path. Fixes staged: exact radix sampler (now
+default), fused GDN on the spec branch + captured draft metadata (spec_path
+agent, window pending), M-amortized GEMVs (batch_research).
