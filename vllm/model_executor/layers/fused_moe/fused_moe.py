@@ -704,7 +704,7 @@ def gfx908_moe_fp16_compute(
 
         _GFX908_MOE_FP16 = (
             on_gfx908()
-            and os.environ.get("VLLM_GFX908_MOE_FP16_COMPUTE", "0") == "1"
+            and os.environ.get("VLLM_GFX908_MOE_FP16_COMPUTE", "1") == "1"
         )
     if not _GFX908_MOE_FP16:
         return False

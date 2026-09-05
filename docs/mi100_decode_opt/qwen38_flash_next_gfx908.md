@@ -412,6 +412,8 @@ decode windows, three c=1 probes + one c=4 probe per boot (`ablate.sh`).
 | base (rc5 defaults) | 11.05 / 11.11 / 11.17 | 88.7-89.9 | 208 | control |
 | `VLLM_GFX908_W8A16_MFMA=1` | 11.18 / 11.26 / 11.29 | 88.0-88.9 | 215-219 | c=4 +4%, c=1 +0.15 ms: M<=4 also runs through the padded MFMA kernel because the swizzled copy is the only resident int8; swizzled-read GEMV for M<=4 in progress, then default on |
 | `VLLM_GFX908_MOE_PREP_FOLD=1` (shared-as-expert fold) | 11.02 / 10.94 / 10.95 | 89.8-90.7 | 205-207 | every boot faster than every base boot (-0.16 ms median, the predicted -3 us x 48 layers); c=4 neutral. **Default on.** |
+| tree e6f2f4db4b defaults (prep fold on + reduce BLOCK 256 + gated wpb) | 11.00 / 10.99 / 11.00 | 89.9-90.4 | 209-214 | confirms the new defaults: -0.11 ms median vs base, every boot faster |
+| + `VLLM_GFX908_W8A16_MFMA=1` with the swizzled M=1 GEMV | 11.04 / 10.97 / 10.92 | 89.9-91.0 | 217-220 | c=1 neutral (the swizzled M=1 GEMV removed the +0.15 ms), c=4 +4%. Default on after the parity gate. |
 
 Also from the gemv_flight study (agents/gemv_flight/REPORT.md), applied as
 plain parameter changes, `torch.equal` to the shipping kernels: MoE reduce
@@ -430,3 +432,17 @@ artifact; they are at 77-97%). What remains per launch is a fixed
 1.8-2.3 us, so the only lever left in the MoE layer is one fewer launch
 without a cross-workgroup wait (silu fold into the down GEMV prologue,
 in progress).
+
+### fp16 expert GEMMs (round 9, default on)
+
+`VLLM_GFX908_MOE_FP16_COMPUTE=1` (0 disables; `VLLM_GFX908_MOE_FP16_SAFE=1`
+keeps the silu*up intermediate in bf16): the fused W4A16 MoE kernel used at
+M>=64 takes fp16 activations, dequantizes to fp16 and accumulates in fp32;
+MI100 fp16 MFMA runs at 2x the bf16 rate. Retuned configs in
+`dtype=int4_w4a16_fp16.json`. Per MoE layer per rank: M=64 1307 -> 1076 us,
+1024 2362 -> 2057, 7840 9141 -> 7295 (-88 ms per 16K prefill chunk).
+Gate on the real model (same tree, one boot): PPL 3.149 (ref 3.145),
+GSM8K 491/500 (ref 490), greedy parity c=1 6/16 mean 0.0046 / c=16 8/16
+0.0063 (batched-path floor), TTFT 3.2K 558 -> 542 ms, 12.8K 1.81 -> 1.72 s,
+c=16 probe 264 -> 360 tok/s (attribution vs the MFMA arm pending).
+fp16 is 2x closer to fp32 than bf16 on these GEMMs (rel-L2 2.4e-3 vs 4.8e-3).
