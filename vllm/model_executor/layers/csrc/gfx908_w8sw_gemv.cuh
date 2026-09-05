@@ -41,6 +41,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <cstdint>
+#include "gfx908_push_epi.cuh"
 
 #define WSW_LDS_BYTES (64 * 1024)
 #define WSW_RED_BYTES (8 * 1024)  // 16 waves x 16*NB*NT partials x 4 B (NB*NT <= 8)
@@ -63,17 +64,54 @@ __device__ __forceinline__ float wsw_h_reduce(float v, int lane) {
   return v;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Fused push-AR producer epilogue (VLLM_GFX908_PUSH_AR_FUSED_PRODUCER=1).
+//
+// When the GEMV output is the input of a TP all-reduce (the GDN out_proj), the separate `push_k`
+// launch of the sentinel push AR can be removed by storing the result straight into the four
+// ranks' receive slots.  The push scheme carries no flag -- the payload is the flag (see
+// gfx908_push_epi.cuh) -- so no fence, no arrival counter and no cross-workgroup order is needed:
+// each workgroup stores the slice it owns and retires.
+//
+// The one requirement is 16 B stores.  This kernel's natural epilogue is one bf16 per lane
+// (lanes nin = 0..15 of a wave hold 16 consecutive output rows), which over XGMI would be 8x the
+// store instructions and a fabric transaction each; ar_push/REPORT.md section 5 measured exactly
+// that failure on the wvSplitK epilogue.  So the wave stages its 16 bf16 in LDS and lanes
+// 0..NB*NT*8-1 issue one `global_store_dwordx4 glc slc` each -- (chunk, rank) spread over lanes.
+// LDS comes from the spare part of the split-K partial buffer; wsw_launch_one refuses the push
+// when it does not fit.
+//
+//   pstage layout, KS == 1 : [wave][n][y][16]      (16 * NB * NT uint16 per wave)
+//   pstage layout, KS  > 1 : [rg][RSTRIDE]         (only ks == 0 waves stage)
+template <int NT, int NB>
+__device__ __forceinline__ void wsw_push_stage(uint16_t* pstage, int wave, int lane, int ntb,
+                                               int ntiles, int N, bool act, const PushPtrs& pp,
+                                               long off16) {
+  constexpr int CH = NB * NT * 2;   // 16 bf16 = 32 B = 2 chunks per (batch row, n-tile)
+  asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");   // wave-local: no s_barrier needed
+  if (!act || lane >= CH * 4) return;
+  const int ch = lane >> 2, r = lane & 3;
+  const int n = ch / (NT * 2), rem = ch % (NT * 2), y = rem >> 1, half = rem & 1;
+  const int nt = ntb + y;
+  if (nt >= ntiles) return;
+  const pe_u32x4 v = *reinterpret_cast<const pe_u32x4*>(
+      pstage + wave * (16 * NB * NT) + (n * NT + y) * 16 + half * 8);
+  pe_push_chunk_r(pp, off16, ((long)n * N + nt * 16 + half * 8) >> 3, v, r);
+}
+
 // NT   : n-tiles (16 rows each) per wave
 // UNRL : k-tiles prefetched in flight
 // NB   : batch M (1..4), template
 // F32LDS : stage X as fp32 (else bf16)
 // KS   : intra-WG split-K waves per row group
-template <int NT, int UNRL, int NB, bool F32LDS, int KS>
+// PUSH : fused push-AR producer epilogue (pushmode 1 = local store + push, 2 = push only)
+template <int NT, int UNRL, int NB, bool F32LDS, int KS, bool PUSH>
 __global__ void __launch_bounds__(1024)
 w8sw_gemv_kernel(const int K, const int N, const int8_t* __restrict__ W,
                  const float* __restrict__ S, const uint16_t* __restrict__ X,
                  uint16_t* __restrict__ C, const int wvRG, const int rounds,
-                 const int NKT, const int ntiles, const int gshift) {
+                 const int NKT, const int ntiles, const int gshift,
+                 PushPtrs pp, long off16, int pushmode) {
   constexpr int LDS_BF16 = WSW_X_BYTES / 2;
   constexpr int RSTRIDE = 16 * NB * NT;  // floats per wave in the split-K buffer
   static_assert(KS == 1 || RSTRIDE * 16 * 4 <= WSW_RED_BYTES, "split-K partial buffer");
@@ -81,6 +119,7 @@ w8sw_gemv_kernel(const int K, const int N, const int8_t* __restrict__ W,
   float* sf = reinterpret_cast<float*>(lds_raw);
   uint16_t* sh = reinterpret_cast<uint16_t*>(lds_raw);
   float* red = reinterpret_cast<float*>(lds_raw + WSW_X_BYTES);
+  uint16_t* pstage = reinterpret_cast<uint16_t*>(red + (KS == 1 ? 0 : 16 * (16 * NB * NT)));
 
   const int lane = threadIdx.x, wave = threadIdx.y;
   const int tid = wave * 64 + lane;
@@ -239,11 +278,17 @@ w8sw_gemv_kernel(const int K, const int N, const int8_t* __restrict__ W,
 #pragma unroll
             for (int n = 0; n < NB; n++) {
               __hip_bfloat16 o = __float2bfloat16(sum[n][y]);
-              C[(size_t)n * N + nt * 16 + nin] = *reinterpret_cast<uint16_t*>(&o);
+              const uint16_t ob = *reinterpret_cast<uint16_t*>(&o);
+              if (!PUSH || pushmode != 2) C[(size_t)n * N + nt * 16 + nin] = ob;
+              if constexpr (PUSH)
+                pstage[wave * (16 * NB * NT) + (n * NT + y) * 16 + nin] =
+                    (uint16_t)pe_sanitize16(ob);
             }
           }
         }
       }
+      if constexpr (PUSH)
+        wsw_push_stage<NT, NB>(pstage, wave, lane, ntb, ntiles, N, act, pp, off16);
     } else {
       if (hh == 0) {
 #pragma unroll
@@ -261,9 +306,16 @@ w8sw_gemv_kernel(const int K, const int N, const int8_t* __restrict__ W,
           const int nt = ntb + y;
           if (nt < ntiles) {
             __hip_bfloat16 o = __float2bfloat16(v);
-            C[(size_t)n * N + nt * 16 + nn] = *reinterpret_cast<uint16_t*>(&o);
+            const uint16_t ob = *reinterpret_cast<uint16_t*>(&o);
+            if (!PUSH || pushmode != 2) C[(size_t)n * N + nt * 16 + nn] = ob;
+            if constexpr (PUSH) pstage[rg * RSTRIDE + i] = (uint16_t)pe_sanitize16(ob);
           }
         }
+      }
+      if constexpr (PUSH) {
+        if (ks == 0)
+          wsw_push_stage<NT, NB>(pstage + rg * RSTRIDE - wave * (16 * NB * NT), wave, lane, ntb,
+                                 ntiles, N, act, pp, off16);
       }
       __syncthreads();
     }

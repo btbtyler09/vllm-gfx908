@@ -74,6 +74,29 @@ _PREP_FOLD: bool | None = None
 _SILU_FOLD: bool | None = None
 
 
+_PUSH_INC = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
+    "distributed", "device_communicators", "csrc",
+)
+
+
+@functools.cache
+def _push_claim_fns():
+    """(claim_fused_push, drop_fused_push) or (None, None) when the fused producer is off."""
+    try:
+        from vllm.distributed.device_communicators.gfx908_push_ar import (
+            claim_fused_push,
+            drop_fused_push,
+            fused_producer_enabled,
+        )
+
+        if not fused_producer_enabled():
+            return None, None
+        return claim_fused_push, drop_fused_push
+    except Exception:
+        return None, None
+
+
 def _load(name: str, src: str, subdir: str):
     from torch.utils.cpp_extension import load
 
@@ -87,6 +110,7 @@ def _load(name: str, src: str, subdir: str):
         name=name,
         sources=[src],
         build_directory=build_dir,
+        extra_include_paths=[_PUSH_INC],
         extra_cuda_cflags=["-O3", "--offload-arch=gfx908"],
         verbose=False,
     )
@@ -712,12 +736,42 @@ def moe_w4a8(
             part2 = gemv_rowlane(w2_i, w2_scale, i8, isc, isum, row_self, row_expert, wpb=1,
                                  extra=extra2)
     rb2 = 256  # 3 -> 10 workgroups; 3.13 -> 1.98 us at M=1 (agents/gemv_flight), same per-element order
-    _moe_reduce_weighted_sum_kernel[(triton.cdiv(K, rb2), M)](
-        part2, wsum, output, K,
-        0, part2.stride(0), output.stride(0),
-        TOPK=rows, SPLIT_K=1, BLOCK=rb2, MUL_W=mul_routed_weight,
-    )
+    if not _moe_reduce_push(ext, part2, wsum, output, rows, mul_routed_weight):
+        _moe_reduce_weighted_sum_kernel[(triton.cdiv(K, rb2), M)](
+            part2, wsum, output, K,
+            0, part2.stride(0), output.stride(0),
+            TOPK=rows, SPLIT_K=1, BLOCK=rb2, MUL_W=mul_routed_weight,
+        )
     return output
+
+
+# Threads per block of moe_reduce_push: one column per thread, so 128 threads = 128 columns and
+# 20 workgroups at K = 2560 -- the grid the Triton reduce uses (measured 2.29 us vs its 1.67 at
+# T = 1, and 2.74 with the push epilogue vs 1.67 + 1.62 for the Triton reduce plus push_k).
+_MOE_REDUCE_TPB = 128
+
+
+def _moe_reduce_push(ext, part2, wsum, output, rows: int, mul_routed_weight: bool) -> bool:
+    """VLLM_GFX908_PUSH_AR_FUSED_PRODUCER: reduce and push into the peers' slots in one launch.
+
+    Returns False when no site was claimed (the caller then runs the stock Triton reduce).  The
+    HIP kernel is bit-identical to ``_moe_reduce_weighted_sum_kernel`` with ``SPLIT_K == 1``
+    (same fp32 order, the same mul+add contracted into an fma, the same ``0.0f + v``).
+    """
+    claim, drop = _push_claim_fns()
+    if claim is None:
+        return False
+    pc = claim("moe_reduce", output)
+    if pc is None:
+        return False
+    try:
+        ext.moe_reduce_push(part2, wsum, output, rows, 1 if mul_routed_weight else 0,
+                            pc[0], pc[1], pc[2], 1, _MOE_REDUCE_TPB, 0)
+    except Exception as exc:   # unsupported shape: skip the site on every rank
+        drop()
+        logger.warning_once("gfx908: fused push MoE reduce unavailable (%s)", exc)
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -817,11 +871,12 @@ def moe_w4a8_mr(
     if part2 is None:
         return None
     rb2 = 256
-    _moe_reduce_weighted_sum_kernel[(triton.cdiv(K, rb2), M)](
-        part2, wsum, output, K,
-        0, part2.stride(0), output.stride(0),
-        TOPK=rows, SPLIT_K=1, BLOCK=rb2, MUL_W=mul_routed_weight,
-    )
+    if not _moe_reduce_push(ext, part2, wsum, output, rows, mul_routed_weight):
+        _moe_reduce_weighted_sum_kernel[(triton.cdiv(K, rb2), M)](
+            part2, wsum, output, K,
+            0, part2.stride(0), output.stride(0),
+            TOPK=rows, SPLIT_K=1, BLOCK=rb2, MUL_W=mul_routed_weight,
+        )
     return output
 
 
@@ -1029,6 +1084,15 @@ def dense_w4a8_gemv(a, b_q, scales):
         c = torch.empty((M, N), dtype=torch.bfloat16, device=a.device)
         wx, sx = _no_extra(a.device)
         if fold:
+            claim, drop = _push_claim_fns()
+            pc = claim("slab", c) if claim is not None else None
+            if pc is not None:
+                try:
+                    _ext().gemv_slab_prep_push(p[0], p[1], a, rt, re, c, pc[0], pc[1], pc[2])
+                    return c
+                except Exception as exc:
+                    drop()
+                    logger.warning_once("gfx908: fused push dense slab unavailable (%s)", exc)
             _ext().gemv_slab_prep(p[0], p[1], a, rt, re, c, 16, wx, sx)
         else:
             x8, xs, xsum = quant_q8(a)

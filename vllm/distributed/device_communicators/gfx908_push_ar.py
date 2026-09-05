@@ -44,6 +44,33 @@ Env knobs:
   ``VLLM_GFX908_PUSH_AR_EAGER``   eager slots (default 8)
   ``VLLM_GFX908_PUSH_AR_MAX_SPIN`` bounded spin, poll rounds (default 4194304, ~3 s)
   ``VLLM_GFX908_PUSH_AR_STATS``   1 to also collect the per-wave spin histogram (costs ~0.5 us)
+  ``VLLM_GFX908_PUSH_AR_FUSED_PRODUCER`` 1 to let a producing GEMV/reduce kernel write the peers'
+                                  slots from its own epilogue, removing the ``push_k`` launch
+                                  (default 0; see the "fused producer" section below)
+  ``VLLM_GFX908_PUSH_AR_FUSED_SAFE`` 1 to also write the producer's local output tensor (default 0)
+
+Fused producer (``VLLM_GFX908_PUSH_AR_FUSED_PRODUCER=1``)
+--------------------------------------------------------
+The push half of the collective is a *fire-and-forget store*: the payload is the flag, ownership is
+per element, and there is no fence, arrival counter or cross-workgroup order anywhere in the
+scheme.  A kernel that already computes the partial can therefore store it straight into the four
+ranks' slots and the separate ``push_k`` launch disappears -- 96 of the 98 all-reduces of a decode
+step are produced by three kernels:
+
+  ===========================  =========  ===============================
+  producer                     per step   kernel
+  ===========================  =========  ===============================
+  GDN ``out_proj``                   36   ``w8sw_gemv`` (pushmode)
+  MoE weighted-sum reduce            48   ``moe_reduce_push``
+  QSA ``o_proj``                     12   ``gemv_slab_prep_push``
+  ===========================  =========  ===============================
+
+Mechanics: the layer arms a claim right before the producing call (``arm_fused_push``), the
+producer's Python wrapper claims a site (``claim_fused_push``) and passes the peer pointers to its
+kernel, and the all-reduce entry point recognises the tensor (``take_fused_push``) and runs the
+consume half only.  A claim that is never taken is drained (consumed into a scratch tensor) so a
+slot can never be left dirty, and a producer that declines the config drops the claim -- both are
+symmetric across ranks because every rank runs the same shapes.
 """
 
 import functools
@@ -64,6 +91,151 @@ _DEFAULT_WIDTH = 2560
 _DEFAULT_SITES = 128
 _DEFAULT_EAGER = 8
 _DEFAULT_MAX_SPIN = 1 << 22
+
+# --------------------------------------------------------------------------- fused producer
+_FUSED_FLAG: bool | None = None
+_FUSED_SAFE: bool | None = None
+
+# One rank per process, one stream, and every claim is taken or drained inside the same layer
+# forward: module state is enough (the same shape as ``_PENDING`` in gfx908_hc_ar_fused.py).
+_ARM: tuple | None = None       # (kinds, T, N) a producer may claim
+_CLAIM: tuple | None = None     # (par, site, T, N, data_ptr) after a producer pushed
+FUSED_STATS: dict[str, int] = {"claims": 0, "taken": 0, "dropped": 0, "drained": 0, "armed": 0}
+
+
+def fused_producer_enabled() -> bool:
+    """VLLM_GFX908_PUSH_AR_FUSED_PRODUCER=1 (default 0): producers push from their epilogue."""
+    global _FUSED_FLAG
+    if _FUSED_FLAG is None:
+        _FUSED_FLAG = os.environ.get("VLLM_GFX908_PUSH_AR_FUSED_PRODUCER", "0") == "1"
+    return _FUSED_FLAG
+
+
+def _fused_pushmode() -> int:
+    """2 = push only (the fast path); 1 = also write the producer's local output tensor."""
+    global _FUSED_SAFE
+    if _FUSED_SAFE is None:
+        _FUSED_SAFE = os.environ.get("VLLM_GFX908_PUSH_AR_FUSED_SAFE", "0") == "1"
+    return 1 if _FUSED_SAFE else 2
+
+
+def _tp_push_ar():
+    """The PushAllreduce of the TP custom-AR communicator, or None."""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        ca = getattr(get_tp_group().device_communicator, "ca_comm", None)
+        if ca is None or ca.disabled:
+            return None
+        return getattr(ca, "_push_ar", None)
+    except Exception:
+        return None
+
+
+def arm_fused_push(kinds, t: int, n: int) -> None:
+    """Allow the next matching producer inside this block to push from its epilogue.
+
+    ``kinds`` is the producer name (or a tuple of names) that may claim, ``(t, n)`` the exact
+    output shape of the all-reduce this block will issue.  Both guards matter: within an armed
+    block the other GEMVs have a different output width (GDN in_proj 4096/4160, QSA qkv 3584,
+    index_qk 640), so a mis-claim is not possible for the shapes this model runs.
+    """
+    global _ARM
+    if not fused_producer_enabled():
+        return
+    _ARM = ((kinds,) if isinstance(kinds, str) else tuple(kinds), int(t), int(n))
+    FUSED_STATS["armed"] += 1
+
+
+def disarm_fused_push() -> None:
+    global _ARM
+    _ARM = None
+
+
+def claim_fused_push(kind: str, out: torch.Tensor):
+    """Called by a producer's Python wrapper.  Returns ``(bases, off_elems, pushmode)`` or None.
+
+    On success the caller MUST launch its kernel with those arguments; if it declines the config
+    afterwards it must call :func:`drop_fused_push` (the site is then skipped on every rank,
+    which keeps the site sequence aligned).
+    """
+    global _ARM, _CLAIM
+    if _ARM is None or _CLAIM is not None or not fused_producer_enabled():
+        return None
+    kinds, t, n = _ARM
+    if kind not in kinds or out.dim() != 2 or out.shape[0] != t or out.shape[1] != n:
+        return None
+    if out.dtype is not torch.bfloat16 or not out.is_contiguous():
+        return None
+    par = _tp_push_ar()
+    if par is None or not par.eligible(out):
+        return None
+    ca = par.ca
+    # exactly the gate the all-reduce entry point applies, so a claimed message can never miss
+    # its consume: `custom_all_reduce` returns None (stock path) when this is False
+    if not ca.should_custom_ar(out):
+        return None
+    if ca._IS_CAPTURING and not torch.cuda.is_current_stream_capturing():
+        return None          # cudagraph warm-up pass: communicate nothing
+    site = par._next_site()
+    if site is None:
+        return None
+    _ARM = None
+    _CLAIM = (par, site, t, n, out.data_ptr())
+    FUSED_STATS["claims"] += 1
+    return (par.ptrs, (site * par.world_size + par.rank) * par.slot_elems, _fused_pushmode())
+
+
+def drop_fused_push() -> None:
+    """Undo a claim whose kernel was never launched (the site is skipped on every rank)."""
+    global _CLAIM
+    if _CLAIM is not None:
+        _CLAIM = None
+        FUSED_STATS["dropped"] += 1
+
+
+def take_fused_push(x: torch.Tensor):
+    """Called by the all-reduce entry point.  ``(par, site, T, N)`` when ``x`` was pushed by its
+    producer, else None -- and any stale claim is drained first so a slot is never left dirty."""
+    global _ARM, _CLAIM
+    _ARM = None
+    c = _CLAIM
+    if c is None:
+        return None
+    par, site, t, n, ptr = c
+    if ptr != x.data_ptr() or x.numel() != t * n:
+        _drain_claim()
+        return None
+    _CLAIM = None
+    FUSED_STATS["taken"] += 1
+    return par, site, t, n
+
+
+def _drain_claim() -> None:
+    """Consume a claimed-but-unused site into a scratch tensor: re-arms the slot for its next use.
+
+    Every rank claimed and pushed the same site (same shapes, same code), so the consume completes;
+    the reduced value is simply thrown away and the caller falls back to the stock all-reduce.
+    """
+    global _CLAIM
+    c = _CLAIM
+    _CLAIM = None
+    if c is None:
+        return
+    par, site, t, n, _ = c
+    try:
+        scratch = torch.empty((t, n), dtype=torch.bfloat16, device=par.device)
+        _ext().consume(
+            scratch, par.ptrs[par.rank] + site * par.world_size * par.slot_elems * 2,
+            par.slot_elems, par.stats, par.max_spin, site, par.spin_stats,
+        )
+        FUSED_STATS["drained"] += 1
+        logger.warning_once(
+            "gfx908 push AR: a fused-producer claim was not taken by an all-reduce; the slot was "
+            "drained (this costs one extra consume launch, output is unaffected)"
+        )
+    except Exception as exc:
+        logger.error("gfx908 push AR: draining a fused-producer claim failed (%s)", exc)
 
 
 @functools.cache
@@ -192,8 +364,23 @@ class PushAllreduce:
             return False
         return inp.numel() <= self.slot_elems
 
+    def consume_only(self, inp: torch.Tensor, site: int, t: int, n: int) -> torch.Tensor:
+        """Consume half of an all-reduce whose push was done by the producing kernel's epilogue."""
+        out = torch.empty_like(inp)
+        _ext().consume(
+            out.view(t, n),
+            self.ptrs[self.rank] + site * self.world_size * self.slot_elems * 2,
+            self.slot_elems, self.stats, self.max_spin, site, self.spin_stats,
+        )
+        self.calls += 1
+        return out
+
     def maybe_all_reduce(self, inp: torch.Tensor) -> torch.Tensor | None:
         """Push+consume all-reduce, or None when this message must take the stock path."""
+        rec = take_fused_push(inp)
+        if rec is not None:
+            _, site, t, n = rec
+            return self.consume_only(inp, site, t, n)
         if not self.eligible(inp):
             self.fallbacks += 1
             return None
@@ -225,7 +412,7 @@ class PushAllreduce:
         return {
             "timeouts": v[0], "max_spin": v[1], "waves_spun": v[2],
             "last_timeout_site": v[3], "last_timeout_row": v[4], "last_timeout_col": v[5],
-            "calls": self.calls, "fallbacks": self.fallbacks,
+            "calls": self.calls, "fallbacks": self.fallbacks, "fused": dict(FUSED_STATS),
         }
 
     def check_and_log(self, tag: str = "") -> bool:

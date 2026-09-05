@@ -53,7 +53,7 @@ _FLAG: bool | None = None
 # (site, T, N, placeholder data_ptr) of the push whose consume is still outstanding.
 _PENDING: tuple[int, int, int, int] | None = None
 STATS = {"fused": 0, "fused_split": 0, "consume_stock": 0, "stock": 0,
-         "push_deferred": 0, "push_stock": 0}
+         "push_deferred": 0, "push_stock": 0, "push_fused": 0}
 # Kernel arithmetic modes: bit0 = exp2-based sigmoid (what Triton's AMD backend emits for
 # tl.sigmoid; with expf 7 of 2.9M combine outputs differ by 1 ulp on catastrophic-cancellation
 # elements), bit1 = fma in the combine.  Measured bit-exact for `out` (agents/hc_gdn_glue).
@@ -163,10 +163,21 @@ def _push_ar():
 # --------------------------------------------------------------------------- push
 def _ar_push_deferred_impl(x: torch.Tensor) -> torch.Tensor:
     global _PENDING
+    from vllm.distributed.device_communicators.gfx908_push_ar import take_fused_push
     from vllm.distributed.parallel_state import get_tp_group
 
     _PENDING = None
     ca, par = _push_ar()
+    # VLLM_GFX908_PUSH_AR_FUSED_PRODUCER: the producing GEMV/reduce already pushed `x` into the
+    # peers' slots, so there is no push launch here at all -- `x` itself is the placeholder the
+    # combine matches on, and the combine does the consume half.
+    rec = take_fused_push(x) if par is not None else None
+    if rec is not None:
+        _, site, t, n = rec
+        _PENDING = (site, t, n, x.data_ptr())
+        par.calls += 1
+        STATS["push_fused"] += 1
+        return x
     if par is not None and ca.should_custom_ar(x):
         if ca._IS_CAPTURING and not torch.cuda.is_current_stream_capturing():
             # cudagraph warm-up pass: the stock path communicates nothing and returns an
@@ -231,6 +242,13 @@ def _hc_combine_norm_ar_impl(
     p = _take_pending(block)
     ca, par = (None, None) if p is None else _push_ar()
     if p is None or par is None or hc != 4 or residual.stride(1) != 1 or inj.stride(1) != 1:
+        if p is not None and par is not None:
+            # a pending push whose fused consumer does not apply: `block` is only a placeholder,
+            # so the slot must still be consumed into it (and re-armed) before the stock combine
+            _ext().consume(block.view(p[1], p[2]), par.ptrs[par.rank]
+                           + p[0] * par.world_size * par.slot_elems * 2,
+                           par.slot_elems, par.stats, par.max_spin, p[0], par.spin_stats)
+            STATS["consume_stock"] += 1
         STATS["stock"] += 1
         return _hc_combine_norm(residual, block, inj, w, eps, hc)
     site, T, N, _ = p
@@ -265,6 +283,13 @@ def _hc_combine_ar_impl(
     p = _take_pending(block)
     ca, par = (None, None) if p is None else _push_ar()
     if p is None or par is None or hc != 4 or residual.stride(1) != 1 or inj.stride(1) != 1:
+        if p is not None and par is not None:
+            # a pending push whose fused consumer does not apply: `block` is only a placeholder,
+            # so the slot must still be consumed into it (and re-armed) before the stock combine
+            _ext().consume(block.view(p[1], p[2]), par.ptrs[par.rank]
+                           + p[0] * par.world_size * par.slot_elems * 2,
+                           par.slot_elems, par.stats, par.max_spin, p[0], par.spin_stats)
+            STATS["consume_stock"] += 1
         STATS["stock"] += 1
         return _hc_combine(residual, block, inj, hc)
     site, T, N, _ = p

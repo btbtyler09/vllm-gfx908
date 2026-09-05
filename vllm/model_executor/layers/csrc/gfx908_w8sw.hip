@@ -9,6 +9,8 @@
 #include <torch/extension.h>
 #include <c10/hip/HIPStream.h>
 #include "gfx908_w8sw_launch.cuh"
+#include <optional>
+#include <vector>
 
 // Practical HBM read ceiling for the same rotation protocol: every WG streams a contiguous
 // slice with nontemporal dwordx4 loads and xors it into one dword (never stored).
@@ -41,7 +43,9 @@ extern template bool wsw_launch_nb<3>(const WswArgs&, int, int, int);
 extern template bool wsw_launch_nb<4>(const WswArgs&, int, int, int);
 
 bool w8sw_gemv(at::Tensor Wsw, at::Tensor Ssw, at::Tensor X, at::Tensor C, int64_t gs,
-               int64_t nt, int64_t unrl, int64_t ks, int64_t cu) {
+               int64_t nt, int64_t unrl, int64_t ks, int64_t cu,
+               std::optional<std::vector<int64_t>> push_bases, int64_t push_off_elems,
+               int64_t pushmode) {
   const int NB = (int)X.size(0), K = (int)X.size(1), N = (int)C.size(1);
   TORCH_CHECK(Wsw.dtype() == torch::kInt8 && Wsw.is_contiguous(), "Wsw contiguous int8");
   TORCH_CHECK(Ssw.dtype() == torch::kFloat32 && Ssw.is_contiguous(), "Ssw contiguous fp32");
@@ -56,11 +60,21 @@ bool w8sw_gemv(at::Tensor Wsw, at::Tensor Ssw, at::Tensor X, at::Tensor C, int64
   TORCH_CHECK(Ssw.numel() == (long)N * (K / (int)gs), "Ssw must be [K/gs, N]");
   int gshift = 0;
   while ((1 << gshift) < (int)gs) gshift++;
+  // fused push-AR producer: write the result into the 4 ranks' receive slots (16 B chunks) and
+  // skip the separate push kernel.  push_off_elems = (site * 4 + my_rank) * slot_elems.
+  PushPtrs pp{};
+  if (pushmode) {
+    TORCH_CHECK(push_bases.has_value() && push_bases->size() == 4,
+                "w8sw_gemv: the fused push needs 4 peer buffer pointers");
+    TORCH_CHECK(push_off_elems % 8 == 0 && (long)NB * N % 8 == 0, "w8sw_gemv: 16 B alignment");
+    for (int r = 0; r < 4; r++) pp.base[r] = (void*)(*push_bases)[r];
+  }
   WswArgs a{K, N, reinterpret_cast<const int8_t*>(Wsw.data_ptr()),
             reinterpret_cast<const float*>(Ssw.data_ptr()),
             reinterpret_cast<const uint16_t*>(X.data_ptr()),
             reinterpret_cast<uint16_t*>(C.data_ptr()), (int)cu,
-            c10::hip::getCurrentHIPStream().stream(), gshift};
+            c10::hip::getCurrentHIPStream().stream(), gshift,
+            pp, push_off_elems / 8, (int)pushmode};
   switch (NB) {
     case 1: return wsw_launch_nb<1>(a, (int)nt, (int)unrl, (int)ks);
     case 2: return wsw_launch_nb<2>(a, (int)nt, (int)unrl, (int)ks);

@@ -7,6 +7,8 @@
 // Returns false (and launches nothing) when the requested config is not instantiated or does not
 // apply to this shape, so the caller can fall back to the bf16 path.
 #include <torch/extension.h>
+#include <optional>
+#include <vector>
 #include <c10/hip/HIPStream.h>
 #include "gfx908_w8a16_launch.cuh"
 
@@ -16,7 +18,8 @@ bool mfma_w8_gemm(at::Tensor Wsw, at::Tensor Ssw, at::Tensor X, at::Tensor C, in
 bool mfma_w8_dequant(at::Tensor Wsw, at::Tensor Ssw, at::Tensor O, int64_t r0, int64_t Nfull);
 void wsw_stream(at::Tensor W, at::Tensor out, int64_t cu);
 bool w8sw_gemv(at::Tensor Wsw, at::Tensor Ssw, at::Tensor X, at::Tensor C, int64_t gs,
-               int64_t nt, int64_t unrl, int64_t ks, int64_t cu);
+               int64_t nt, int64_t unrl, int64_t ks, int64_t cu, std::optional<std::vector<int64_t>> push_bases,
+               int64_t push_off_elems, int64_t pushmode);
 
 extern template bool w8_launch_nb<1>(const W8Args&, int, int, int, int, int);
 extern template bool w8_launch_nb<2>(const W8Args&, int, int, int, int, int);
@@ -62,6 +65,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("w8a16_dequant", &w8a16_dequant);
   m.def("mfma_w8_gemm", &mfma_w8_gemm);
   m.def("mfma_w8_dequant", &mfma_w8_dequant);
-  m.def("w8sw_gemv", &w8sw_gemv);
+  m.def("w8sw_gemv", &w8sw_gemv, py::arg("Wsw"), py::arg("Ssw"), py::arg("X"), py::arg("C"),
+        py::arg("gs"), py::arg("nt"), py::arg("unrl"), py::arg("ks"), py::arg("cu"),
+        py::arg("push_bases") = std::nullopt, py::arg("push_off_elems") = 0,
+        py::arg("pushmode") = 0);
   m.def("wsw_stream", &wsw_stream);
 }

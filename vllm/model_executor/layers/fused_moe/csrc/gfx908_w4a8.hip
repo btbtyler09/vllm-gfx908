@@ -16,6 +16,8 @@
 // row_exp[p] outside [0, E) -> zero row (cudagraph capture routing).
 #include <hip/hip_runtime.h>
 #include <torch/extension.h>
+#include "gfx908_push_epi.cuh"
+#include <vector>
 #include <c10/hip/HIPStream.h>
 #include <cstdint>
 
@@ -1029,6 +1031,200 @@ void gemv_rowlane_silu(at::Tensor w, at::Tensor s, at::Tensor part, at::Tensor r
   TORCH_CHECK(false, "gemv_rowlane_silu: unsupported wpb/hoist ", wpb, "/", hoist);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Fused push-AR producers (VLLM_GFX908_PUSH_AR_FUSED_PRODUCER=1).
+//
+// The sentinel push all-reduce carries no arrival flag -- the payload is the flag (see
+// gfx908_push_epi.cuh) -- so a producer kernel can store its result straight into the four ranks'
+// receive slots and the separate `push_k` launch disappears: no fence, no arrival counter, no
+// cross-workgroup ordering.  The only requirement is that the fabric sees 16 B stores, which both
+// kernels below get by staging their tile in LDS first.
+//
+//   moe_reduce_push        : the MoE weighted-sum reduce (replaces _moe_reduce_weighted_sum_kernel
+//                            with SPLIT_K == 1; bit-identical, including the Triton reduce's
+//                            mul+add contraction into an fma and its `0.0f + v` canonicalisation)
+//   gemv_slab_prep_push    : w4a8_slab_prep_kernel with the push epilogue (QSA o_proj)
+// pushmode: 1 = local store + push, 2 = push only.
+// ------------------------------------------------------------------ producer: MoE reduce
+// Bit-identical to _moe_reduce_weighted_sum_kernel (SPLIT_K = 1):
+//   acc = 0; for t in range(TOPK): v = 0 + part[token*TOPK+t]; if MUL_W: v *= w; acc += v
+//   out = bf16_rne(acc)
+// One block per token, one thread per 16 B chunk (8 output elements).
+template <int MULW, int AMODE, int UNR, int TK>
+__global__ void __launch_bounds__(1024)
+moe_reduce_push_k(const float* __restrict__ part, const float* __restrict__ wv,
+                  uint16_t* __restrict__ out, long part_stride, int N, int TOPK,
+                  PushPtrs pp, long off16, int pushmode) {
+  // Same decomposition as the Triton reduce: one element per thread, so a block of TPB threads
+  // covers TPB consecutive columns and issues TOPK independent 4 B loads per thread.  The peer
+  // push then needs 16 B stores, which one thread cannot form on its own, so the block stages its
+  // TPB bf16 results in LDS and the first TPB/8*4 threads issue one dwordx4 each -- (chunk, rank)
+  // spread over lanes, never one lane issuing all of them (the ar_push epilogue's mistake).
+  extern __shared__ uint16_t pst[];
+  const int t = blockIdx.y;
+  const int col = blockIdx.x * blockDim.x + threadIdx.x;
+  const bool live = col < N;
+  float acc = 0.f;
+  // 32-bit row stride and a pointer increment: `part[pair * (long)stride + col]` costs a 64-bit
+  // multiply-add per expert row, which is what put this kernel 1.3 us behind the Triton reduce.
+  const int ps = (int)part_stride;
+  const float* prow = part + (long)t * TOPK * (long)ps + col;
+  const float* wrow = wv + (long)t * TOPK;
+  if (live && TK > 0) {
+    // compile-time expert count: fully unrolled, all TK loads issued before the first use
+    float v[TK > 0 ? TK : 1], ww[TK > 0 ? TK : 1];
+#pragma unroll
+    for (int k = 0; k < TK; k++) {
+      v[k] = prow[(long)(k * ps)];
+      if constexpr (MULW) ww[k] = wrow[k];
+    }
+#pragma unroll
+    for (int k = 0; k < TK; k++) {
+      const float x = 0.f + v[k];
+      if constexpr (!MULW) acc = acc + x;
+      else if constexpr (AMODE) acc = __builtin_fmaf(x, ww[k], acc);
+      else acc = acc + x * ww[k];
+    }
+  } else if (live) {
+    for (int k0 = 0; k0 < TOPK; k0 += UNR) {
+      float v[UNR], ww[UNR];
+#pragma unroll
+      for (int u = 0; u < UNR; u++) {
+        const int k = k0 + u;
+        if (k < TOPK) {
+          v[u] = prow[(long)(u * ps)];
+          if constexpr (MULW) ww[u] = wrow[k]; else ww[u] = 1.0f;
+        }
+      }
+      prow += (long)UNR * ps;
+#pragma unroll
+      for (int u = 0; u < UNR; u++) {
+        if (k0 + u < TOPK) {
+          const float x = 0.f + v[u];
+          if constexpr (!MULW) acc = acc + x;
+          else if constexpr (AMODE) acc = __builtin_fmaf(x, ww[u], acc);
+          else acc = acc + x * ww[u];
+        }
+      }
+    }
+  }
+  const unsigned ob = pe_f2bf(acc);
+  if (pushmode != PE_MODE_PUSH && live) out[(long)t * N + col] = (uint16_t)ob;
+  if (pushmode == PE_MODE_LOCAL) return;
+  pst[threadIdx.x] = (uint16_t)pe_sanitize16(ob);
+  __syncthreads();
+  const int nchunk = (int)(blockDim.x >> 3);             // 16 B chunks staged by this block
+  if ((int)threadIdx.x < nchunk * 4) {
+    const int ch = threadIdx.x >> 2, r = threadIdx.x & 3;
+    const long col0 = (long)blockIdx.x * blockDim.x + ch * 8;
+    if (col0 < N) {
+      const pe_u32x4 v = *reinterpret_cast<const pe_u32x4*>(pst + ch * 8);
+      pe_push_chunk_r(pp, off16, ((long)t * N + col0) >> 3, v, r);
+    }
+  }
+}
+
+void moe_reduce_push(at::Tensor part, at::Tensor wv, at::Tensor out, int64_t topk, int64_t mulw,
+                std::vector<int64_t> bases, int64_t off_elems, int64_t pushmode, int64_t amode,
+                int64_t tpb_, int64_t unr_) {
+  const int M = (int)out.size(0), N = (int)out.size(1);
+  TORCH_CHECK(N % 8 == 0 && N / 8 <= 1024, "moe_reduce_push: N % 8 and N/8 <= 8192");
+  TORCH_CHECK(part.scalar_type() == at::kFloat && out.scalar_type() == at::kBFloat16);
+  PushPtrs pp{};
+  for (int r = 0; r < 4 && r < (int)bases.size(); r++) pp.base[r] = (void*)bases[r];
+  {
+    const int tpb = (int)tpb_;
+    TORCH_CHECK(tpb % 8 == 0, "moe_reduce_push: threads per block must be a multiple of 8");
+    dim3 grid((N + tpb - 1) / tpb, M);
+#define MRED_CALL(MW, AM, UN, TK)                                                              \
+  moe_reduce_push_k<MW, AM, UN, TK><<<grid, tpb, tpb * 2, cur_stream()>>>(                     \
+      part.data_ptr<float>(), (MW) ? wv.data_ptr<float>() : nullptr, (uint16_t*)out.data_ptr(),\
+      part.stride(0), N, (int)topk, pp, off_elems / 8, (int)pushmode)
+    const int un = (int)unr_;
+    // compile-time expert count for the shipping combination (weighted sum, fused multiply-add):
+    // TOPK is topk + 1 = 11 for Flash-Next; anything else falls back to the batched runtime loop.
+    if (mulw && amode && un == 0) {
+      switch ((int)topk) {
+#define MRED_TK(T) case T: MRED_CALL(1, 1, 12, T); break;
+        MRED_TK(2) MRED_TK(3) MRED_TK(4) MRED_TK(5) MRED_TK(6) MRED_TK(7) MRED_TK(8)
+        MRED_TK(9) MRED_TK(10) MRED_TK(11) MRED_TK(12) MRED_TK(13) MRED_TK(16)
+#undef MRED_TK
+        default: MRED_CALL(1, 1, 12, 0); break;
+      }
+    }
+    else if (mulw && amode) { if (un == 4) MRED_CALL(1, 1, 4, 0); else if (un == 8) MRED_CALL(1, 1, 8, 0); else MRED_CALL(1, 1, 12, 0); }
+    else if (mulw)          { if (un == 4) MRED_CALL(1, 0, 4, 0); else if (un == 8) MRED_CALL(1, 0, 8, 0); else MRED_CALL(1, 0, 12, 0); }
+    else                    { if (un == 4) MRED_CALL(0, 0, 4, 0); else if (un == 8) MRED_CALL(0, 0, 8, 0); else MRED_CALL(0, 0, 12, 0); }
+#undef MRED_CALL
+  }
+}
+
+// ------------------------------------------------------------------ producer: W4A8 dense slab
+// Copy of w4a8_slab_prep_kernel with the fused push epilogue (the stock kernel is left alone so
+// its codegen does not move).  A block owns 4 waves x ROWS consecutive output columns; the block
+// stages them in LDS and issues 16 B chunks.
+template <int K, int LPR>
+__global__ void __launch_bounds__(256) w4a8_slab_prep_push_kernel(
+    const uint32_t* __restrict__ w, const uint16_t* __restrict__ s, const uint32_t* __restrict__ x,
+    const int* __restrict__ row_tok, const int* __restrict__ row_exp, float* __restrict__ out,
+    int N, int P, int E, long stride_we, long stride_se, const uint32_t* __restrict__ w_extra,
+    const uint16_t* __restrict__ s_extra, int obf, PushPtrs pp, long off16, int pushmode) {
+  constexpr int ROWS = 64 / LPR, G = K / 32, BLKN = 4 * ROWS;   // columns per block
+  static_assert(BLKN % 8 == 0, "block must own a whole number of 16 B chunks");
+  __shared__ __align__(16) uint32_t xl[K / 4];
+  __shared__ float xsl[G], xsuml[G];
+  __shared__ __align__(16) uint16_t pst[BLKN];
+  const int lane = threadIdx.x & 63, r = lane / LPR, l = lane % LPR, wv = threadIdx.x >> 6;
+  const int tiles_per_p = N / ROWS;
+  const int tile0 = __builtin_amdgcn_readfirstlane(blockIdx.x * 4);
+  const int p = tile0 / tiles_per_p;
+  const int n = ((tile0 + wv) % tiles_per_p) * ROWS + r;
+  const int e = row_exp[p], t = row_tok[p];
+  const uint32_t* wbase;
+  const uint16_t* sbase;
+  const bool ok = pick_expert(e, E, w, s, stride_we, stride_se, w_extra, s_extra, wbase, sbase);
+  float acc = 0.f;
+  if (ok) acc = w4a8_slab_prep_body<K, LPR>(wbase, sbase, x, t, n, l, xl, xsl, xsuml);
+  if (l == LPR - 1) {
+    if (pushmode != PE_MODE_PUSH) slab_store(out, (long)p * N + n, acc, obf);
+    if (pushmode != PE_MODE_LOCAL) pst[wv * ROWS + r] = (uint16_t)pe_sanitize16(f2bf_rne(acc));
+  }
+  if (pushmode == PE_MODE_LOCAL) return;
+  __syncthreads();
+  // BLKN columns = BLKN/8 chunks; (chunk, rank) over the first BLKN/2 threads.
+  if (threadIdx.x < (BLKN / 8) * 4) {
+    const int ch = threadIdx.x >> 2, rk = threadIdx.x & 3;
+    const int n0 = ((tile0 % tiles_per_p) * ROWS) + ch * 8;
+    const pe_u32x4 v = *reinterpret_cast<const pe_u32x4*>(pst + ch * 8);
+    pe_push_chunk_r(pp, off16, ((long)p * N + n0) >> 3, v, rk);
+  }
+}
+
+void gemv_slab_prep_push(at::Tensor w, at::Tensor s, at::Tensor x, at::Tensor row_tok, at::Tensor row_exp,
+               at::Tensor out, std::vector<int64_t> bases, int64_t off_elems, int64_t pushmode) {
+  const int P = row_tok.numel(), N = (int)w.size(1), E = (int)w.size(0), K = (int)x.size(1);
+  constexpr int LPR = 16, ROWS = 64 / LPR;
+  TORCH_CHECK(N % ROWS == 0 && (N / ROWS) % 4 == 0);
+  TORCH_CHECK(K == 1536 || K == 2560, "gemv_slab_prep_push: K in {1536, 2560}");
+  PushPtrs pp{};
+  for (int r = 0; r < 4 && r < (int)bases.size(); r++) pp.base[r] = (void*)bases[r];
+  const long tiles = (long)P * (N / ROWS);
+  auto st = cur_stream();
+  const int obf = out.scalar_type() == at::kBFloat16 ? 1 : 0;
+  auto go = [&](auto kk) {
+    constexpr int KK = decltype(kk)::value;
+    w4a8_slab_prep_push_kernel<KK, LPR><<<(tiles + 3) / 4, 256, 0, st>>>(
+        reinterpret_cast<const uint32_t*>(w.data_ptr()),
+        reinterpret_cast<const uint16_t*>(s.data_ptr()),
+        reinterpret_cast<const uint32_t*>(x.data_ptr()), row_tok.data_ptr<int32_t>(),
+        row_exp.data_ptr<int32_t>(), (float*)out.data_ptr(), N, P, E, (long)N * (KK / 8),
+        (long)N * (KK / 32), nullptr, nullptr, obf, pp, off_elems / 8, (int)pushmode);
+  };
+  if (K == 1536) go(std::integral_constant<int, 1536>{});
+  else go(std::integral_constant<int, 2560>{});
+}
+
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("quant_q8", &quant_q8, "x bf16 [R,K] -> x8 int8 [R,K] (per-8 de-interleaved), xs/xsum fp32 [R,K/32]");
   m.def("quant_q8_gate", &quant_q8_gate,
@@ -1045,6 +1241,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gemv_rowlane_silu", &gemv_rowlane_silu,
         "w, s, part fp32 [P,320] (gate|up), row_tok, row_exp, out fp32 [P,N], wpb, hoist, "
         "w_extra, s_extra  (silu*mul + Q8_1 folded into the down GEMV; bit-exact)");
+  m.def("moe_reduce_push", &moe_reduce_push,
+        "part fp32 [M*TOPK, N], w fp32 [M*TOPK], out bf16 [M, N], topk, mul_w, push_bases[4], "
+        "push_off_elems, pushmode(0|1|2), amode(1), threads_per_block(128), unroll(0 = compile-time "
+        "TOPK)  (bit-identical to _moe_reduce_weighted_sum_kernel with SPLIT_K = 1)");
+  m.def("gemv_slab_prep_push", &gemv_slab_prep_push,
+        "w, s, x bf16 [R,K], row_tok, row_exp, out bf16 [P,N], push_bases[4], push_off_elems, "
+        "pushmode(1|2)  (gemv_slab_prep with the fused push-AR producer epilogue)");
   m.def("gemv_rowlane", &gemv_rowlane,
         "w, s, x8, xs, xsum, row_tok, row_exp, out fp32 [P,N], wpb(1|4), w_extra, s_extra  (K=160)");
 }
