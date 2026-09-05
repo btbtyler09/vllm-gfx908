@@ -228,10 +228,31 @@ class PushAllreduce:
             "calls": self.calls, "fallbacks": self.fallbacks,
         }
 
+    def check_and_log(self, tag: str = "") -> bool:
+        """Log the counters (one D2H sync of 16 ints); ERROR if a consumer ever timed out.
+
+        Called from the gfx908 step timer every 200 steps and at teardown. A non-zero
+        ``timeouts`` means a consumer gave up waiting for a rank's push and summed the
+        sentinel: the run is corrupt and the site sequence diverged across ranks.
+        Returns True when the counters are clean.
+        """
+        try:
+            d = self.stats_dict()
+        except Exception as exc:  # device already torn down
+            logger.debug("gfx908 push AR stats unavailable (%s)", exc)
+            return True
+        if d["timeouts"]:
+            logger.error("gfx908 push AR%s CORRUPT: %s", f" {tag}" if tag else "", d)
+            return False
+        logger.info("gfx908 push AR%s: %s", f" {tag}" if tag else "", d)
+        return True
+
     def close(self):
         from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
 
         if self.ptrs is not None:
+            if self.calls:
+                self.check_and_log("at teardown")
             CustomAllreduce.free_shared_buffer(self.ptrs, rank=self.rank)
             self.ptrs = None
 

@@ -2210,3 +2210,23 @@ def _gfx908_step_end(runner) -> None:
             st["gpu_ms"] = st["wall_ms"] = 0.0
             st["n"] = 0
             st["hist"].clear()
+            _gfx908_log_collective_stats()
+
+
+def _gfx908_log_collective_stats() -> None:
+    """Push-AR counters (VLLM_GFX908_PUSH_AR=1): one 16-int D2H sync per 200 steps.
+
+    A non-zero timeout count is logged at ERROR by check_and_log; it means a consumer
+    summed the sentinel for a missing rank and the run is corrupt (ship gate: must
+    stay 0 for the whole soak).
+    """
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        comm = get_tp_group().device_communicator
+        ca = getattr(comm, "ca_comm", None)
+        push = getattr(ca, "_push_ar", None)
+        if push is not None:
+            push.check_and_log()
+    except Exception as exc:  # single GPU / no TP group / torn down
+        logger.debug("gfx908 collective stats unavailable: %s", exc)

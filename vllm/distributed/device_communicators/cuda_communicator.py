@@ -378,6 +378,25 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # copy on every step. This is on the hot path for TP forward passes, so
         # keep ROCm on the base-class collective to avoid a decode regression.
         if current_platform.is_rocm():
+            # gfx908 (VLLM_GFX908_CUSTOM_AG=1): the vocab-parallel logits gather
+            # (dim=-1, 121 KB in / 485 KB out per decode step) goes through the
+            # custom xGMI all-gather instead of RCCL (57 us eager). The custom
+            # kernel concatenates along dim 0; the movedim/reshape below is the
+            # base-class layout fix-up (a 485 KB copy for dim != 0).
+            ca_comm = self.ca_comm
+            if ca_comm is not None and not ca_comm.disabled and ca_comm.gfx908_custom_ag:
+                inp = input_.contiguous()
+                out = ca_comm.custom_all_gather(inp)
+                if out is not None:
+                    if dim == 0:
+                        return out
+                    input_size = inp.size()
+                    out = out.reshape((self.world_size,) + input_size).movedim(0, dim)
+                    return out.reshape(
+                        input_size[:dim]
+                        + (self.world_size * input_size[dim],)
+                        + input_size[dim + 1 :]
+                    )
             return super().all_gather(input_, dim)
 
         input_size = input_.size()

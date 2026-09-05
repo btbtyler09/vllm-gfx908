@@ -146,6 +146,13 @@ class CustomAllreduce:
         self.disabled = True
         # gfx908 sentinel push all-reduce (VLLM_GFX908_PUSH_AR=1); None on every other path.
         self._push_ar = None
+        # gfx908 custom (xGMI peer-read) all-gather for the vocab-parallel logits gather
+        # (VLLM_GFX908_CUSTOM_AG=1, default off). The kernel (cross_device_all_gather) is the
+        # same staged-copy + start/end-barrier scheme as the one-shot all-reduce the decode
+        # step already runs 97x per step in its captured graphs, on the same uncached
+        # buffer_ptrs, so it is graph-safe on CDNA1 for the same reason. Off everywhere else.
+        self.gfx908_custom_ag = False
+        self.gfx908_custom_ag_max_size = 0
         self.mnnvl_buffer = None
         self.mnnvl_handle = None
         self.mnnvl_peer_buffers: list[torch.Tensor] | None = None
@@ -316,6 +323,7 @@ class CustomAllreduce:
             )
 
             self._push_ar = maybe_create_push_ar(self)
+            self._init_gfx908_custom_ag(legacy_buffer_size)
         self._init_mnnvl_buffer(
             max(
                 max_mnnvl_all_gather_size * world_size,
@@ -382,6 +390,49 @@ class CustomAllreduce:
             self.mnnvl_lamport_rs_epoch_ptr = epochs[1].data_ptr()
         except RuntimeError as error:
             logger.debug("MNNVL AG/RS initialization failed: %s", error)
+
+    def _init_gfx908_custom_ag(self, reg_buffer_size: int) -> None:
+        """Enable the custom all-gather on gfx908 (VLLM_GFX908_CUSTOM_AG=1).
+
+        Requirements checked here: ROCm + gfx908, a fully connected (xGMI) same-node
+        group, and the pre-registered uncached staging buffer (``buffer_ptrs``, the
+        one the in-graph all-reduce copies into) being large enough for the message.
+        ``VLLM_GFX908_CUSTOM_AG_MAX_SIZE_MB`` (default 0.25: the custom kernel wins only at
+        1-2 logits rows, ag_mb 2026-09-05; T=4 loses 75 vs 50 us in-graph)
+        bounds the per-rank input size; larger gathers stay on RCCL.
+        """
+        if os.environ.get("VLLM_GFX908_CUSTOM_AG", "0") != "1":
+            return
+        try:
+            if not current_platform.is_rocm():
+                return
+            from vllm.platforms.rocm import on_gfx908
+
+            if not on_gfx908():
+                logger.warning_once("VLLM_GFX908_CUSTOM_AG=1 ignored: not gfx908")
+                return
+        except Exception as exc:
+            logger.warning("gfx908 custom all-gather: platform probe failed (%s)", exc)
+            return
+        if not self.fully_connected or self.world_size > 8:
+            logger.warning_once(
+                "VLLM_GFX908_CUSTOM_AG=1 ignored: group is not fully connected"
+            )
+            return
+        cap_mb = os.environ.get("VLLM_GFX908_CUSTOM_AG_MAX_SIZE_MB", "0.25")
+        try:
+            cap = int(float(cap_mb) * 1024 * 1024)
+        except ValueError:
+            cap = self.max_all_gather_size
+        # The staging copy lands in buffer_ptrs[rank]; never exceed it.
+        cap = min(cap, reg_buffer_size)
+        self.gfx908_custom_ag_max_size = cap
+        self.gfx908_custom_ag = cap > 0
+        logger.info(
+            "gfx908 custom all-gather enabled: per-rank input <= %d bytes "
+            "(VLLM_GFX908_CUSTOM_AG_MAX_SIZE_MB=%s), staging buffer %d bytes",
+            cap, cap_mb, reg_buffer_size,
+        )
 
     @contextmanager
     def capture(self):
@@ -489,7 +540,11 @@ class CustomAllreduce:
             return self.all_reduce(input, registered=False)
 
     def should_custom_all_gather(self, inp: torch.Tensor) -> bool:
-        if self.disabled or not current_platform.is_cuda():
+        if self.disabled:
+            return False
+        # Stock: CUDA only. gfx908: opt-in (VLLM_GFX908_CUSTOM_AG=1), see
+        # _init_gfx908_custom_ag.
+        if not current_platform.is_cuda() and not self.gfx908_custom_ag:
             return False
         if self.world_size == 16 and not self.mnnvl_only:
             return False
@@ -500,11 +555,14 @@ class CustomAllreduce:
             torch.bfloat16,
         ):
             return False
-        max_size = (
-            self.max_mnnvl_all_gather_size
-            if self.mnnvl_multicast_ptr
-            else self.max_all_gather_size
-        )
+        if self.gfx908_custom_ag:
+            max_size = self.gfx908_custom_ag_max_size
+        else:
+            max_size = (
+                self.max_mnnvl_all_gather_size
+                if self.mnnvl_multicast_ptr
+                else self.max_all_gather_size
+            )
         return (
             0 < inp_size <= max_size
             and inp_size % 16 == 0
@@ -533,6 +591,19 @@ class CustomAllreduce:
             )
         else:
             out = torch.empty(out_shape, dtype=inp.dtype, device=inp.device)
+            if self.gfx908_custom_ag:
+                if self._IS_CAPTURING and not torch.cuda.is_current_stream_capturing():
+                    # Capture warm-up (mirrors custom_all_reduce): mimic the
+                    # allocation pattern, do not communicate.
+                    return out
+                ops.custom_all_gather(
+                    self._ptr,
+                    inp,
+                    out,
+                    self.buffer_ptrs[self.rank],
+                    self.gfx908_custom_ag_max_size,
+                )
+                return out
             ops.custom_all_gather(
                 self._ptr,
                 inp,
