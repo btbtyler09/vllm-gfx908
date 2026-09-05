@@ -496,3 +496,17 @@ not the interactive default. Stage 2: bound the PLE prefill packing transient
 (patch 0001, `VLLM_GFX908_PLE_PACK_RATIO`) and log a memory watermark (patch
 0002) to raise utilization by the measured slack. Stage 3: bf16 GDN SSM state
 halves the block to 4.98 MiB (c=128 resident), accuracy-gated.
+
+Concurrency-cap probes (c=64 / c=128 tiers, 1024 in / 256 out, util 0.90):
+
+| config | KV pool | c=64 tok/s, TTFT, TPOT | c=128 tok/s, TTFT |
+|---|---|---|---|
+| rc5: max-num-seqs 48 | 2.96 GiB (308 blocks) | 341, 13.2 s, 85 ms | 387, 33 s |
+| max-num-seqs 96 | 1.53 GiB | 246, 27.6 s, 70 ms | 262, 55 s |
+| max-num-seqs 96 + capture sizes 1..96 (10) | 3.3 GiB | 300, 17.4 s, 107 ms | 371, 33 s |
+
+More resident sequences do not pay: the step at M~64 tokens (700 expert rows)
+costs more per token than at 48, i.e. the batched MoE kernel (padding, gather,
+bf16-rate MFMA) is the limit above c~32, not residency. The lever for those
+tiers is the mid-M MoE kernel (batch_research), not memory; the memory work
+matters for long-context residency (16K c=4 and beyond).
