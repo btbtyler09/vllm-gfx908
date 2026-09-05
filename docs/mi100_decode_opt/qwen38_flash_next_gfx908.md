@@ -712,3 +712,22 @@ Custom all-gather for the logits gather (`VLLM_GFX908_CUSTOM_AG=1`, off):
 T~4 (cap 0.25 MB); the gather is eager because compute_logits runs after
 the FULL-graph replay, so the real prize (-0.1..-0.3 ms) is capturing
 compute_logits into the decode graph with a static logits buffer.
+
+## Round 11 (2026-09-05 afternoon): single-digit TPOT
+
+Three-boot arms on the rc6 image + tree 6c13d32bee (step timer, 1200-token
+c=1 windows):
+
+| arm | c=1 ms/step (3 boots) | c=1 tok/s |
+|---|---|---|
+| base (rc6 defaults) | 10.83 / 10.71 / 10.78 | 91.6-92.7 |
+| `VLLM_GFX908_QSA_GLUE=1` | **9.96 / 9.83 / 9.86** | **99.5-101.3** |
+| `VLLM_GFX908_PUSH_AR=1` (ar_ship window, 2 boots) | 10.43-10.48 | 94.3-95.3 |
+
+QSA glue: -0.9 ms/step, more than the -0.35..-0.55 predicted from its
+launch count (the removed launches sat on the critical path with their
+tails); bit-exact vs the compiled numerics. Both flags become defaults in
+rc7 (push AR after its parity + soak gate). Expected rc7 c=1: ~9.5 ms/step,
+~104-105 tok/s. Note: the r11 push-AR arm was invalid (serve.sh's env list
+overrode the arm's --env; harness fixed), so its evidence is the ar_ship
+window's two boots + base.
