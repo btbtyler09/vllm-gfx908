@@ -472,3 +472,27 @@ branch, then M-amortized GEMVs (also the c=2..16 lever). Projected c=1:
 ~107 -> ~119 -> ~145 tok/s at n=2. ngram lookup: prose gains nothing, code
 +10-15%; needs a V2-runner port. No public EAGLE/DFlash drafter exists for
 Flash-Next.
+
+### Memory anatomy and the concurrency cap (mem_research, 2026-09-05)
+
+Per rank at util 0.90, max-num-seqs 48 (measured from boot logs + safetensors
+headers): weights 20.63 GiB (W4 experts 16.3, HC mixes 1.76 = 1.17 bf16
+masters kept by `HC_W8_FREE=0` + 0.59 int8, embed+lm_head 0.6, GDN int8 0.5),
+non-torch 2.05, profile transient 1.0, cudagraphs 1.70 actual (~69 MB per
+captured graph; count scales with max-num-seqs, not batched tokens), KV pool
+2.95 GiB, 3.6 GiB free at rest. The KV pool is 308 blocks of 9.76 MiB: the
+block is 784 tokens because the fp32 GDN SSM state is 801,792 B per layer per
+sequence and six cache groups alias one uniform pool, so a 1280-token request
+costs 7 blocks (prefix caching off) to 11 (default "align" mamba prefix
+caching); the raw-key ring (13 KB) and the PLE conv state (180 KB) each burn
+a full block. Hence 28-44 resident requests: the c=64/128 tiers are
+block-limited, and max-num-seqs 96 halved the pool (more graphs + state).
+
+Stage 1 (no code): `--no-enable-prefix-caching --max-num-seqs 64
+--cudagraph-capture-sizes 1 2 4 8 16 32 48 64` + `VLLM_GFX908_HC_W8_FREE=1`
+-> ~4.7 GiB = ~489 blocks, c=64 fully resident (needs 448); costs prefix
+reuse and ~90 ms per 2K prefill (HC dequant), so it is a batch-tier config,
+not the interactive default. Stage 2: bound the PLE prefill packing transient
+(patch 0001, `VLLM_GFX908_PLE_PACK_RATIO`) and log a memory watermark (patch
+0002) to raise utilization by the measured slack. Stage 3: bf16 GDN SSM state
+halves the block to 4.98 MiB (c=128 resident), accuracy-gated.
