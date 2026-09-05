@@ -640,3 +640,21 @@ pure rc5 image + overlay, step timer on 1200-token c=1 windows:
 | 3 | 10.74 | 92.1-92.5 | 242 (15.8) |
 
 vs rc5 (11.01-11.17 / 88.7-89.9 / 208-214): c=1 -0.3 ms (+3%), c=4 +15%.
+
+### Release rc6 (2026-09-05): `btbtyler09/vllm-rocm-gfx908:v0.28.0rc6.dev-q38fn`
+
+Tree cd9cabe31f, every extension prebuilt (incl. moe_mr, w8sw, qsa_glue).
+Pure-image validation, TP4, util 0.90:
+
+| gate | rc6 | rc5 |
+|---|---|---|
+| c=1 step timer (1200-token windows, 3 boots) | 10.74-10.79 ms | 11.01-11.17 |
+| c=1 / c=4 / c=16 / c=48 probes (tok/s) | 91 / 244 / 407 / 834 | 89.9 / 210 / 264 / 568 |
+| greedy parity c=1 vs rc4 / c=16 vs rc5 | 4/16 0.0070 / 7/16 0.0067 | 16/16 / 5/16 |
+| long-context determinism (4 x ~6K) | 4/4 | 4/4 |
+| TTFT 3.2K / 12.8K (probe, warm) | 519-530 ms / 1.66 s | 558 ms / 1.81 s |
+| PPL (64 windows) | 3.1488 | 3.1488 |
+| GSM8K full (1319) / batched c=32 (500) | RC6_GSM_FULL / RC6_GSM_C32 | (rc5: 490/500 at c=8) |
+
+The c=1 parity shift vs rc4 is the M=1 swizzled W8 GEMV (within 1 bf16 ulp
+on 0.02-0.04% of outputs, not bit-exact); c=16 is at the batched-path floor.
