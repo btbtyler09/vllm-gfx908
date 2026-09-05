@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from typing import Any
 
 import torch
@@ -46,6 +47,13 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.prefill_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.use_fused_multi_step_decode = False
+        # gfx908 (VLLM_GFX908_DRAFT_CAPTURED_METADATA=1, default off): when the
+        # fused multi-step decode runs as a FULL graph, refresh the attention
+        # metadata (slot mappings + per-backend in-place update) at the START
+        # of every draft step inside the graph instead of rebuilding it
+        # eagerly on the host before step 1.  Needs every draft backend to
+        # support update_draft_decode_metadata with a device-only refresh.
+        self.captured_draft_metadata = False
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
@@ -128,6 +136,16 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             }
         )
         self.use_fused_multi_step_decode = not unsupported_backends
+        self.captured_draft_metadata = (
+            self.use_fused_multi_step_decode
+            and self.advance_draft_positions
+            and os.environ.get("VLLM_GFX908_DRAFT_CAPTURED_METADATA", "0") == "1"
+        )
+        if self.captured_draft_metadata:
+            logger.info_once(
+                "Draft decode attention metadata is refreshed inside the fused "
+                "multi-step decode graph (VLLM_GFX908_DRAFT_CAPTURED_METADATA=1)."
+            )
         if unsupported_backends:
             logger.info_once(
                 "Fused multi-step draft decode is not supported by attention "
@@ -551,7 +569,15 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         attn_metadata = None
         slot_mappings_by_layer = None
-        if not skip_attn:
+        # With captured metadata the FULL decode graph recomputes the slot
+        # mappings and refreshes the (persistent-buffer backed) metadata it
+        # was captured with at the start of every step, so nothing has to be
+        # rebuilt on the host here.
+        in_graph_metadata = (
+            self.captured_draft_metadata
+            and batch_desc.cg_mode == CUDAGraphMode.FULL
+        )
+        if not skip_attn and not in_graph_metadata:
             slot_mappings = self.block_tables.compute_slot_mappings(
                 idx_mapping,
                 query_start_loc,
@@ -602,7 +628,23 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             else []
         )
 
+        refresh_first = self.captured_draft_metadata and attn_metadata is not None
+
         for step in range(1, self.num_speculative_steps):
+            if refresh_first:
+                # Refresh at the start of the step (captured into the graph):
+                # the positions/seq_lens of this step are already in the
+                # persistent input buffers (prepare_decode_inputs /
+                # update_draft_inputs), so the metadata built at capture time
+                # is recomputed from them here.
+                self.block_tables.compute_slot_mappings(
+                    idx_mapping,
+                    query_start_loc,
+                    positions,
+                    num_tokens_padded,
+                )
+                for attn_group in attn_groups:
+                    attn_group.update_draft_decode_metadata(attn_metadata)
             self.current_draft_step.fill_(step)
             self._generate_draft(
                 num_reqs,
@@ -613,7 +655,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 cudagraph_runtime_mode,
             )
             if (
-                step < self.num_speculative_steps - 1
+                not refresh_first
+                and step < self.num_speculative_steps - 1
                 and attn_metadata is not None
                 and self.advance_draft_positions
             ):

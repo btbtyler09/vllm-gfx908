@@ -229,9 +229,17 @@ def _build_qsa_metadata_kernel(
     TOKEN_BLOCK_SIZE: tl.constexpr,
     REQUEST_SCAN_SIZE: tl.constexpr,
     WORK_BLOCK_SIZE: tl.constexpr,
+    MAPPED_FROM_DEVICE: tl.constexpr = False,
 ):
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
+
+    if MAPPED_FROM_DEVICE:
+        # Captured draft-decode refresh: the live request count is only known
+        # on the device.  query_start_loc is padded past the real requests
+        # with the real token total, so its entry at the padded batch size is
+        # the mapped-token count for this replay.
+        num_mapped_tokens = tl.load(query_start_loc_ptr + num_reqs)
 
     pid = tl.program_id(0)
     token_idx = pid * TOKEN_BLOCK_SIZE + tl.arange(0, TOKEN_BLOCK_SIZE)
@@ -387,8 +395,14 @@ def build_qsa_metadata_triton(
     circular_buffer_size: int = 0,
     k_work_metadata_buffer: torch.Tensor | None = None,
     request_capacity: int | None = None,
+    mapped_from_device: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build QSA side-cache and optional pre-indexer work metadata."""
+    """Build QSA side-cache and optional pre-indexer work metadata.
+
+    ``mapped_from_device``: read the mapped-token count from
+    ``query_start_loc[num_reqs]`` on the device instead of the host copy, so
+    the launch can be captured in a CUDA graph and replayed for a smaller
+    live batch (draft-decode metadata refresh)."""
     num_tokens = common_attn_metadata.num_actual_tokens
     num_mapped_tokens = int(common_attn_metadata.query_start_loc_cpu[-1])
     token_to_req = token_to_req_buffer[:num_tokens]
@@ -444,6 +458,7 @@ def build_qsa_metadata_triton(
         TOKEN_BLOCK_SIZE=128,
         REQUEST_SCAN_SIZE=request_scan_size,
         WORK_BLOCK_SIZE=256,
+        MAPPED_FROM_DEVICE=mapped_from_device,
         num_warps=4,
     )
     if circular_buffer_size == 0 and compress_ratio == 1:
@@ -462,8 +477,9 @@ def _build_qsa_metadata_torch(
     circular_buffer_size: int = 0,
     k_work_metadata_buffer: torch.Tensor | None = None,
     request_capacity: int | None = None,
+    mapped_from_device: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    del request_capacity
+    del request_capacity, mapped_from_device   # host path: never graph-captured
     num_tokens = common_attn_metadata.num_actual_tokens
     num_mapped_tokens = int(common_attn_metadata.query_start_loc_cpu[-1])
     logical_positions = logical_positions_buffer[:num_tokens]
@@ -571,6 +587,12 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
     """Build QSA metadata from vLLM's cache-group-specific common metadata."""
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    # Every step-dependent field (logical positions, side-cache slot mapping,
+    # compressor work list) is recomputed on the device from the persistent
+    # query_start_loc / seq_lens / block-table / slot-mapping buffers by
+    # `update_draft_decode_metadata`, so the autoregressive draft loop can
+    # reuse one metadata build (and capture the refresh in its decode graph).
+    supports_draft_decode_metadata_update = True
 
     def __init__(
         self,
@@ -602,6 +624,8 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         )
         max_requests = vllm_config.scheduler_config.max_num_seqs
         self.request_capacity = max_requests
+        # Inputs of the last build(): what update_draft_decode_metadata replays.
+        self._last_build: tuple[CommonAttentionMetadata, torch.Tensor | None, int | None] | None = None
         if not self.is_circular_buffer and self.compress_ratio != 1:
             max_k_work = (
                 max_tokens + (self.compress_ratio - 1) * max_requests
@@ -645,6 +669,11 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             k_work_metadata_buffer=k_work_metadata if build_k_work else None,
             request_capacity=request_capacity,
         )
+        self._last_build = (
+            common_attn_metadata,
+            k_work_metadata if build_k_work else None,
+            request_capacity,
+        )
         return QSAForwardMetadata(
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=slot_mapping,
@@ -657,6 +686,33 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             num_actual_tokens=num_tokens,
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
+        )
+
+
+    def update_draft_decode_metadata(self, metadata: QSAForwardMetadata) -> None:
+        """Refresh the step-dependent fields of the metadata returned by the
+        last build() in place, from the persistent buffers it was built on
+        (query_start_loc / seq_lens / block table / common slot mapping).
+        Pure device work: capturable inside the fused draft-decode graph."""
+        if self._last_build is None:
+            return
+        common, k_work_metadata, request_capacity = self._last_build
+        if metadata.token_to_req.data_ptr() != self.token_to_req_buffer.data_ptr():
+            # Not a metadata object built by this builder: nothing to refresh.
+            return
+        build_qsa_metadata(
+            common,
+            self.token_to_req_buffer,
+            self.logical_positions_buffer,
+            self.slot_mapping_buffer,
+            storage_block_size=self.storage_block_size,
+            compress_ratio=self.compress_ratio,
+            circular_buffer_size=(
+                self.kv_cache_spec.block_size if self.is_circular_buffer else 0
+            ),
+            k_work_metadata_buffer=k_work_metadata,
+            request_capacity=request_capacity,
+            mapped_from_device=True,
         )
 
 
