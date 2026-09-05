@@ -591,3 +591,20 @@ fork saves ~38 us at best (patch kept as a template, off). Correction to the
 campaign's node count: ~1,100-1,200 kernel nodes per c=1 step (17 per GDN
 layer, ~45 per QSA layer), i.e. 1.6-2 ms of pure dispatch tax; the QSA decode
 glue is the largest remaining launch-reduction target.
+
+batch_research (2026-09-05): (a) BUILD BUG: the V6 prologue commit broke
+csrc/gfx908_w4a8.hip (static_assert for the K=160 gate-fold instantiation);
+w4a8_enabled() swallowed the error and every boot from that tree ran the
+split-K W4A16 GEMV fallback. Fixed in b0d56034b4. Lesson: the extension
+loader must fail loudly (or the gate must assert the expected kernel) --
+add a boot-time check that logs which MoE path is active. (b) The
+production switch to the Triton gptq_awq kernel at M>8 was 3-4x too early:
+the per-pair HIP W4A8 path beats Triton up to M=128. (c) New expert-
+deduplicated multi-row kernel (VLLM_GFX908_MOE_MR, on; 24<M<=256; HIP path
+bound VLLM_GFX908_MOE_HIP_MAX_M=256): sort rows by expert, LDS-staged slab
+gate_up, rowlane down; per MoE layer per rank M=48 294 us (Triton 1144),
+M=64 349 (1324), M=128 491 (1663), M=256 688 (1856); torch.equal to the
+per-pair W4A8 path. Expected: c=16 step ~-19 ms, c=64 ~-39 ms. Still
+1.35-1.9x above the unique-expert byte floor (phase serialization inside a
+block); MFMA only pays at rows/expert >= ~10 (M >= ~512). Gate: M=9..256 moves
+from W4A16 to W4A8 numerics -> GSM8K at c=32 added to the rc6 validation.
