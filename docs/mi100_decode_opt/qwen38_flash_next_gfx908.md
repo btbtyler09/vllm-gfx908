@@ -579,3 +579,15 @@ change, PPL/GSM8K needed): fp16 for the W8-remat GDN projections (1.4-1.9x),
 fp16 FLA operands (-32..36%, closer to fp32 than bf16), fp16 router/index_qk;
 keep HC mix_down in bf16 (fp16 0.66x at 8192). Together -100..130 ms GPU per
 8192 chunk, -40 ms at 2K.
+
+graph_branch (2026-09-05): fork/join inside the captured step = no. The
+layer DAG is a strict chain (delayed-combine hyper-connections); only three
+independent pairs exist (GDN in_proj_qkvz || in_proj_ba, QSA qkv || indexer,
+the once-per-step PLE input chain). A fork/join section costs +15-16 us on
+ROCm 7.2's segment graph path, short branches do not overlap below ~40 nodes,
+and many short segments drop the whole graph to the classic path (+0.28 us on
+every node): per-layer patterns lose 0.15-1.2 ms/step; the root-level PLE
+fork saves ~38 us at best (patch kept as a template, off). Correction to the
+campaign's node count: ~1,100-1,200 kernel nodes per c=1 step (17 per GDN
+layer, ~45 per QSA layer), i.e. 1.6-2 ms of pure dispatch tax; the QSA decode
+glue is the largest remaining launch-reduction target.
