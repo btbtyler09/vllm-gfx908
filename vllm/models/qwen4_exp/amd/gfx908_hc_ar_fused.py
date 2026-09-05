@@ -53,7 +53,7 @@ _FLAG: bool | None = None
 # (site, T, N, placeholder data_ptr) of the push whose consume is still outstanding.
 _PENDING: tuple[int, int, int, int] | None = None
 STATS = {"fused": 0, "fused_split": 0, "consume_stock": 0, "stock": 0,
-         "push_deferred": 0, "push_stock": 0}
+         "push_deferred": 0, "push_stock": 0, "push_fused": 0}
 # Kernel arithmetic modes: bit0 = exp2-based sigmoid (what Triton's AMD backend emits for
 # tl.sigmoid; with expf 7 of 2.9M combine outputs differ by 1 ulp on catastrophic-cancellation
 # elements), bit1 = fma in the combine.  Measured bit-exact for `out` (agents/hc_gdn_glue).
@@ -163,10 +163,21 @@ def _push_ar():
 # --------------------------------------------------------------------------- push
 def _ar_push_deferred_impl(x: torch.Tensor) -> torch.Tensor:
     global _PENDING
+    from vllm.distributed.device_communicators.gfx908_push_ar import take_fused_push
     from vllm.distributed.parallel_state import get_tp_group
 
     _PENDING = None
     ca, par = _push_ar()
+    # VLLM_GFX908_PUSH_AR_FUSED_PRODUCER: the producing GEMV/reduce already pushed `x` into the
+    # peers' slots, so there is no push launch here at all -- `x` itself is the placeholder the
+    # combine matches on, and the combine does the consume half.
+    rec = take_fused_push(x) if par is not None else None
+    if rec is not None:
+        _, site, t, n = rec
+        _PENDING = (site, t, n, x.data_ptr())
+        par.calls += 1
+        STATS["push_fused"] += 1
+        return x
     if par is not None and ca.should_custom_ar(x):
         if ca._IS_CAPTURING and not torch.cuda.is_current_stream_capturing():
             # cudagraph warm-up pass: the stock path communicates nothing and returns an

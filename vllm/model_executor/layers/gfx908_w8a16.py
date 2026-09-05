@@ -88,6 +88,28 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _CSRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")
+# gfx908_push_epi.cuh (the fused push-AR producer epilogue) lives with the push-AR kernels
+@functools.cache
+def _push_claim_fns():
+    """(claim_fused_push, drop_fused_push) or (None, None) when the fused producer is off."""
+    try:
+        from vllm.distributed.device_communicators.gfx908_push_ar import (
+            claim_fused_push,
+            drop_fused_push,
+            fused_producer_enabled,
+        )
+
+        if not fused_producer_enabled():
+            return None, None
+        return claim_fused_push, drop_fused_push
+    except Exception:
+        return None, None
+
+
+_PUSH_INC = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "distributed", "device_communicators", "csrc",
+)
 _SOURCES = [
     os.path.join(_CSRC_DIR, f)
     for f in (
@@ -201,6 +223,7 @@ def _ext():
         name="gfx908_w8a16_ext",
         sources=_SOURCES,
         build_directory=build_dir,
+        extra_include_paths=[_PUSH_INC],
         extra_cuda_cflags=["-O3", "--offload-arch=gfx908"],
         verbose=False,
     )
@@ -1042,10 +1065,18 @@ def w8a16_gemm(
                 x2 = x2.contiguous()
             out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
             nt, unrl, ks = wcfg
+            # VLLM_GFX908_PUSH_AR_FUSED_PRODUCER: when this GEMV is the producer of a TP
+            # all-reduce (the GDN out_proj, armed by the layer), write the result straight into
+            # the four ranks' push-AR slots and let the collective skip its push launch.
+            claim, drop = _push_claim_fns()
+            pc = claim("w8sw", out) if claim is not None else None
             if _ext().w8sw_gemv(
-                ent.qsw, ent.ssw, x2, out, ent.gs, nt, unrl, ks, _cu_count()
+                ent.qsw, ent.ssw, x2, out, ent.gs, nt, unrl, ks, _cu_count(),
+                *(pc if pc is not None else (None, 0, 0)),
             ):
                 return out.reshape(*x.shape[:-1], n)
+            if pc is not None:
+                drop()              # config declined identically on every rank: the site is skipped
             del out
         if bias is None and 1 <= m <= MFMA_MAX_M:
             cfg = _mfma_cfg(n, k, m)
