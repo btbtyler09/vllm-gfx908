@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 
 import torch
 import torch.nn as nn
@@ -20,7 +21,50 @@ def _on_gfx908() -> bool:
 
     return on_gfx908()
 
+
+# gfx908: small-top_k fast path for `apply_top_k_top_p` (see topk_topp_fastk).
+# Default on; VLLM_GFX908_SAMPLER_FASTK=0 is the escape hatch. Other platforms
+# never take it (they keep the upstream sort / Qrita paths unchanged).
+# Its cost grows ~linearly with the number of rows while the Qrita Triton path
+# is flat (~0.55 ms on MI100), so it is used up to
+# VLLM_GFX908_SAMPLER_FASTK_MAX_ROWS rows (default 12, measured crossover).
+_FASTK_ENV = "VLLM_GFX908_SAMPLER_FASTK"
+_FASTK_MAX_ROWS_ENV = "VLLM_GFX908_SAMPLER_FASTK_MAX_ROWS"
+_FASTK_MAX_ROWS_DEFAULT = 12
+_fastk_enabled: bool | None = None
+_fastk_max_rows: int = _FASTK_MAX_ROWS_DEFAULT
+
+
+def _fastk_enabled_here() -> bool:
+    global _fastk_enabled, _fastk_max_rows
+    if _fastk_enabled is None:
+        val = os.environ.get(_FASTK_ENV, "1").strip().lower()
+        _fastk_enabled = (
+            HAS_TRITON
+            and _on_gfx908()
+            and val not in ("0", "false", "no", "off")
+        )
+        try:
+            _fastk_max_rows = int(
+                os.environ.get(_FASTK_MAX_ROWS_ENV, _FASTK_MAX_ROWS_DEFAULT)
+            )
+        except ValueError:
+            _fastk_max_rows = _FASTK_MAX_ROWS_DEFAULT
+        if _fastk_enabled:
+            logger.info_once(
+                "gfx908: using the small-top_k sampler fast path for batches "
+                "of <= %d rows (VLLM_GFX908_SAMPLER_FASTK=0 disables, "
+                "VLLM_GFX908_SAMPLER_FASTK_MAX_ROWS tunes).",
+                _fastk_max_rows,
+            )
+    return _fastk_enabled
+
+
 if HAS_TRITON:
+    from vllm.v1.sample.ops.topk_topp_fastk import (
+        FASTK_CAP,
+        apply_top_k_top_p_fastk,
+    )
     from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
 
 logger = init_logger(__name__)
@@ -360,8 +404,18 @@ def compiled_random_sample(logits: torch.Tensor) -> torch.Tensor:
 
 
 def apply_top_k_top_p(
-    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
+    logits: torch.Tensor,
+    k: torch.Tensor | None,
+    p: torch.Tensor | None,
+    top_k_max: int | None = None,
 ) -> torch.Tensor:
+    """Apply top-k / top-p masks to the logits (may update them in place).
+
+    `top_k_max` is an optional CPU-known upper bound of `k` over the rows
+    (a row with top_k disabled counts as vocab_size). Callers that know it
+    from host-side metadata pass it so the small-top_k fast path can be
+    selected without a device sync; None means unknown.
+    """
     if p is None and k is None:
         return logits
 
@@ -369,6 +423,19 @@ def apply_top_k_top_p(
         if HAS_TRITON:
             return apply_top_k_top_p_triton(logits, k, p)
         return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
+
+    if (
+        k is not None
+        and top_k_max is not None
+        and 1 <= top_k_max <= FASTK_CAP
+        and logits.dtype == torch.float32
+        and logits.stride(1) == 1
+        and _fastk_enabled_here()
+        and logits.shape[0] <= _fastk_max_rows
+    ):
+        # Every row has top_k enabled and <= FASTK_CAP: exact radix-select
+        # path, no full-vocab sort (gfx908 only, see topk_topp_fastk.py).
+        return apply_top_k_top_p_fastk(logits, k, p)
 
     if HAS_TRITON and logits.shape[0] >= 8:
         return apply_top_k_top_p_triton(logits, k, p)
