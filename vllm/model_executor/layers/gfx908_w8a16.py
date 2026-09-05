@@ -298,7 +298,7 @@ def w8a16_mfma_enabled() -> bool:
     """VLLM_GFX908_W8A16_MFMA=1 (default off) and the W8A16 path is on."""
     global _MFMA_FLAG
     if _MFMA_FLAG is None:
-        if os.environ.get("VLLM_GFX908_W8A16_MFMA", "0") != "1":
+        if os.environ.get("VLLM_GFX908_W8A16_MFMA", "1") != "1":
             _MFMA_FLAG = False
         elif not w8a16_enabled():
             _MFMA_FLAG = False

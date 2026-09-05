@@ -535,3 +535,14 @@ code size: no effect. One bit-exact win integrated: the gate_up slab prologue
 (two-lane Q8_1 staging, hoisted loads, s_load expert id) 9.35 -> 8.88 us at
 M=1 (~-23 us/step). Remaining levers at the launch level: fewer nodes, or
 fork/join of independent per-layer launches inside the captured graph.
+
+### MFMA W8A16 default on (round 9)
+
+`VLLM_GFX908_W8A16_MFMA=1` (0 disables): int8 MFMA GEMM for 5<=M<=64 on the
+GDN/HC/lm_head int8 weights, M=1 served by the swizzled-layout GEMV. Gate on
+the real model: PPL 3.145 (ref 3.145), GSM8K 485/500 (ref 490; within ~1.6
+sigma of a 500-sample run, full-set recheck scheduled with rc6), greedy parity
+c=1 4/16 mean 0.0078 (the M=1 GEMV is within 1 ulp, not bit-exact), TTFT
+571 ms @3.2K / 1.81 s @12.8K (rc5 558 / 1.81), c=1 88.3-90.6, c=4 217-220
+(rc5 209-214), c=16 probe 387 tok/s (rc5 264; the fp16-experts arm alone read
+360 on the same probe).
