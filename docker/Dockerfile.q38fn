@@ -15,6 +15,8 @@ ENV VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_CUSTOM_AR=0 VLLM_MI100_TORCH_COMPI
     VLLM_GFX908_W8A16=1 VLLM_GFX908_W8A16_GS=128 VLLM_GFX908_W8A16_FREE=gdn \
     VLLM_GFX908_SHARED_AS_EXPERT=1 VLLM_GFX908_GDN_FUSED=1
 # Prefill round 1 (2026-09-04): -18% TTFT @1.6K, -21% @12.8K, parity 16/16, PPL 3.145.
+# Rounds 9/10 (rc6, 2026-09-05): MoE prep fold, int8 MFMA for batched decode with a swizzled-layout
+# M=1 GEMV, fp16-compute expert GEMMs at prefill, exact top-k/top-p radix sampler (all code defaults).
 # Round 8 (rc5, 2026-09-04): fused HC chain to M<=4 (code default), HC W8 module split
 # (M<=3 kernels byte-identical to rc4), stable QSA top-k on (code default), MoE M=8192 key.
 ENV VLLM_GFX908_NCCL_DECODE_TUNE=0 VLLM_GFX908_CUSTOM_AR_MAX_SIZE_MB=2 VLLM_GFX908_QSA_NUM_COLUMNS=1 \
