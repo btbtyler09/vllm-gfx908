@@ -701,3 +701,14 @@ lives in the other small-M GEMVs and glue. Not integrated. Side finding:
 under Zipf-skewed routing the multi-row kernel beats per-pair by 1.4x already
 at M=24, so VLLM_GFX908_MOE_MR_MIN_M=24 (set with uniform routing) may be too
 high for real traffic -- check with a real topk_ids histogram.
+
+ar_ship (2026-09-05): push AR in-server on the rc6 image, same window:
+push 10.43-10.48 ms/step (two boots), base 10.79-10.80; c=1 92.2 -> 95.2
+tok/s; greedy c=1 16/16 bit-identical to rc6 (both arms); 1300-request
+mixed-concurrency soak clean (0 timeouts, 0 corrupt, counters equal on all
+ranks). check_and_log() now reports push-AR timeouts every 200 steps.
+Custom all-gather for the logits gather (`VLLM_GFX908_CUSTOM_AG=1`, off):
+23.0 vs 30.4 us in-graph, 46 vs 119 us eager at the c=1 size, loses above
+T~4 (cap 0.25 MB); the gather is eager because compute_logits runs after
+the FULL-graph replay, so the real prize (-0.1..-0.3 ms) is capturing
+compute_logits into the decode graph with a static logits buffer.
