@@ -107,7 +107,7 @@ def fused_producer_enabled() -> bool:
     """VLLM_GFX908_PUSH_AR_FUSED_PRODUCER=1 (default 0): producers push from their epilogue."""
     global _FUSED_FLAG
     if _FUSED_FLAG is None:
-        _FUSED_FLAG = os.environ.get("VLLM_GFX908_PUSH_AR_FUSED_PRODUCER", "0") == "1"
+        _FUSED_FLAG = os.environ.get("VLLM_GFX908_PUSH_AR_FUSED_PRODUCER", "1") == "1"
     return _FUSED_FLAG
 
 

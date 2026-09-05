@@ -57,6 +57,7 @@ def gfx908_boot_summary(model=None) -> None:
         return f"off (HIP path to {top} rows)"
 
     rows.append(("MoE multi-row kernel", _try(mr_line)))
+    rows.append(("MoE W4A8 bf16 epilogue", _onoff(os.environ.get("VLLM_GFX908_W4A8_BF16_EPILOGUE", "1") == "1")))
     rows.append(("MoE prefill GEMM   fp16", _onoff(os.environ.get("VLLM_GFX908_MOE_FP16_COMPUTE", "1") == "1")))
 
     def w8_line():
@@ -102,8 +103,10 @@ def gfx908_boot_summary(model=None) -> None:
         from vllm.distributed.device_communicators import gfx908_push_ar as p
 
         if p.push_ar_requested():
-            fused = os.environ.get("VLLM_GFX908_HC_AR_FUSED", "0") == "1"
-            return "custom push all-reduce (xGMI sentinel)" + (", consumer fused into HC combine" if fused else "")
+            fused = os.environ.get("VLLM_GFX908_HC_AR_FUSED", "1") == "1"
+            prod = os.environ.get("VLLM_GFX908_PUSH_AR_FUSED_PRODUCER", "1") == "1"
+            return ("custom push all-reduce (xGMI sentinel)" + (", consumer fused into HC combine" if fused else "")
+                    + (", producer fused into GEMV epilogues" if prod else ""))
         return "custom one-shot all-reduce"
 
     rows.append(("TP all-reduce", _try(ar_line)))
@@ -112,7 +115,7 @@ def gfx908_boot_summary(model=None) -> None:
     rows.append(("Router", "fused GEMV+softmax+top-k" if os.environ.get("VLLM_GFX908_ROUTER_FUSED", "1") == "1" else "stock"))
     rows.append(("Sampler top-k/top-p", "radix fast path (<=64)" if os.environ.get("VLLM_GFX908_SAMPLER_FASTK", "1") == "1" else "stock"))
     rows.append(("PLE embeddings", "zero-copy pinned host gather" if os.environ.get("VLLM_PLE_ZEROCOPY", "1") == "1" else "device"))
-    rows.append(("PLE fused decode glue", _onoff(os.environ.get("VLLM_GFX908_PLE_GLUE", "0") == "1")))
+    rows.append(("PLE fused decode glue", _onoff(os.environ.get("VLLM_GFX908_PLE_GLUE", "1") == "1")))
     rows.append(("Stable QSA top-k", _onoff(os.environ.get("VLLM_GFX908_QSA_STABLE_TOPK", "1") == "1")))
     rows.append(("Extension loader", "strict" if os.environ.get("VLLM_GFX908_STRICT_EXT", "1") == "1" else "lenient"))
 

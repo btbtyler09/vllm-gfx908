@@ -54,7 +54,11 @@ _KEY_MIN = -(2**63)
 # int32 workspace layout per row
 _WS_HIST = 0  # [4][256]
 _WS_GCNT = _NUM_DIGITS * _NBINS  # 1024: compaction counter
-_WS_NTB = _WS_GCNT + 4  # per-block tie counts [NB_PAD] (slots 1-3 unused)
+_WS_ZERO = _WS_GCNT + 1  # the [0, _WS_ZERO) prefix is what needs zeroing
+_WS_STATE = _WS_GCNT + 4  # carried radix state, one (prefix, kk_rem, above)
+#                           slot per digit: pass D reads slot D-1, writes slot D
+_WS_HAND = _WS_STATE + 3 * _NUM_DIGITS  # handoff to top-p: thr_ord, g, n_t
+_WS_NTB = _WS_HAND + 3  # per-block tie counts [NB_PAD]
 
 
 @triton.jit
@@ -79,33 +83,34 @@ def _digit(o, D: tl.constexpr):
 
 
 @triton.jit
-def _select(hist_ptr, kk, D: tl.constexpr):
-    """Replay the radix selection over the first D digit histograms of a row.
-
-    Returns (prefix, kk_rem, above, hsel): `prefix` is the selected high bits
-    right-aligned as a signed int32 (== thr_ord >> (32 - 8*D)), `kk_rem` the
-    rank still to be resolved inside that bin, `above` the number of elements
-    strictly above the bin, `hsel` the bin's population (after 4 digits: the
-    number of elements exactly equal to the k-th largest).
-    """
+def _step(hist_ptr, prefix, kk, above, D: tl.constexpr):
+    """One digit of the radix selection: identical arithmetic to one iteration
+    of `_select`, but starting from the state the previous pass stored, so a
+    pass never replays the digits before it (exact: the state is int32)."""
     bb = tl.arange(0, 256)
-    prefix = kk * 0
-    above = kk * 0
-    hsel = kk * 0
-    for d in tl.static_range(D):
-        h = tl.load(hist_ptr + d * 256 + bb)
-        cum_top = tl.flip(tl.cumsum(tl.flip(h, 0), 0), 0)  # sum_{b' >= b} h[b']
-        sel = tl.max(tl.where(cum_top >= kk, bb, -1), 0)
-        hsel = tl.sum(tl.where(bb == sel, h, 0), 0)
-        csel = tl.sum(tl.where(bb == sel, cum_top, 0), 0)
-        above_d = csel - hsel
-        kk = kk - above_d
-        above = above + above_d
-        if d == 0:
-            prefix = sel - 128
-        else:
-            prefix = (prefix << 8) | sel
+    h = tl.load(hist_ptr + D * 256 + bb)
+    cum_top = tl.flip(tl.cumsum(tl.flip(h, 0), 0), 0)
+    sel = tl.max(tl.where(cum_top >= kk, bb, -1), 0)
+    hsel = tl.sum(tl.where(bb == sel, h, 0), 0)
+    csel = tl.sum(tl.where(bb == sel, cum_top, 0), 0)
+    above_d = csel - hsel
+    kk = kk - above_d
+    above = above + above_d
+    if D == 0:
+        prefix = sel - 128
+    else:
+        prefix = (prefix << 8) | sel
     return prefix, kk, above, hsel
+
+
+@triton.jit
+def _load_state(ws_row, k_ptr, row, S: tl.constexpr, D: tl.constexpr):
+    """State after D digits, as stored by the previous pass (D == 0: initial)."""
+    if D == 0:
+        kk = tl.load(k_ptr + row)
+        return kk * 0, kk, kk * 0
+    q = S + 3 * D
+    return (tl.load(ws_row + q + 0), tl.load(ws_row + q + 1), tl.load(ws_row + q + 2))
 
 
 @triton.jit
@@ -118,6 +123,7 @@ def _radix_pass_kernel(
     V,
     D: tl.constexpr,
     BLOCK: tl.constexpr,
+    WS_STATE_C: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     b = tl.program_id(1)
@@ -125,13 +131,19 @@ def _radix_pass_kernel(
     m = offs < V
     x = tl.load(x_ptr + row * x_stride + offs, mask=m, other=float("-inf"))
     o = _ordered(x)
-    kk = tl.load(k_ptr + row)
     hist_row = ws_ptr + row * ws_stride
+    kk0 = tl.load(k_ptr + row)
     # Rows with k outside [1, FASTK_CAP] are left untouched by every kernel
     # (insurance only: the caller guarantees the range from CPU metadata).
-    k_ok = (kk >= 1) & (kk <= 64)
+    k_ok = (kk0 >= 1) & (kk0 <= 64)
     if D > 0:
-        prefix, kk, above, hsel = _select(hist_row, kk, D)
+        prefix, kk, above = _load_state(hist_row, k_ptr, row, WS_STATE_C, D - 1)
+        prefix, kk, above, hsel = _step(hist_row, prefix, kk, above, D - 1)
+        # every program of the row computes the identical int32 state; it goes
+        # to this digit's own slot, never over the slot the pass is reading
+        tl.store(hist_row + WS_STATE_C + 3 * D + 0, prefix)
+        tl.store(hist_row + WS_STATE_C + 3 * D + 1, kk)
+        tl.store(hist_row + WS_STATE_C + 3 * D + 2, above)
         matched = m & k_ok & ((o >> (32 - 8 * D)) == prefix)
     else:
         matched = m & k_ok
@@ -154,6 +166,8 @@ def _apply_topk_kernel(
     BLOCK: tl.constexpr,
     WS_GCNT: tl.constexpr,
     WS_NTB: tl.constexpr,
+    WS_STATE_C: tl.constexpr,
+    WS_HAND_C: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     b = tl.program_id(1)
@@ -165,7 +179,12 @@ def _apply_topk_kernel(
     kk = tl.load(k_ptr + row)
     ws_row = ws_ptr + row * ws_stride
     k_ok = (kk >= 1) & (kk <= 64)
-    thr_ord, kk_rem, g, n_t = _select(ws_row, kk, 4)
+    prefix, kkr, above = _load_state(ws_row, k_ptr, row, WS_STATE_C, 3)
+    thr_ord, kk_rem, g, n_t = _step(ws_row, prefix, kkr, above, 3)
+    if HAS_P:
+        tl.store(ws_row + WS_HAND_C + 0, thr_ord)
+        tl.store(ws_row + WS_HAND_C + 1, g)
+        tl.store(ws_row + WS_HAND_C + 2, n_t)
     # top-k: everything strictly below the k-th largest goes to -inf (ties kept)
     below = m & k_ok & (o < thr_ord) & (x != float("-inf"))
     tl.store(xrow + offs, float("-inf"), mask=below)
@@ -179,7 +198,8 @@ def _apply_topk_kernel(
 
 
 @triton.jit
-def _decide(x_ptr, x_stride, k_ptr, p_ptr, ws_ptr, ws_stride, cand_ptr, row):
+def _decide(x_ptr, x_stride, k_ptr, p_ptr, ws_ptr, ws_stride, cand_ptr, row,
+            WS_HAND_C: tl.constexpr):
     """Top-p decision of one row over its survivors; scatters -inf into the
     masked strictly-above-threshold tokens and returns (thr_ord, c) where `c`
     is the number of tied-at-threshold tokens (lowest indices first) that
@@ -188,7 +208,9 @@ def _decide(x_ptr, x_stride, k_ptr, p_ptr, ws_ptr, ws_stride, cand_ptr, row):
     kk = tl.load(k_ptr + row)
     ws_row = ws_ptr + row * ws_stride
     k_ok = (kk >= 1) & (kk <= 64)
-    thr_ord, kk_rem, g, n_t = _select(ws_row, kk, 4)
+    thr_ord = tl.load(ws_row + WS_HAND_C + 0)
+    g = tl.load(ws_row + WS_HAND_C + 1)
+    n_t = tl.load(ws_row + WS_HAND_C + 2)
     g = tl.where(k_ok, g, 0)
     thr = _unordered(thr_ord)
     q = 1.0 - tl.load(p_ptr + row)  # fp32, same expression as the reference
@@ -242,10 +264,14 @@ def _apply_topp_kernel(
     BLOCK: tl.constexpr,
     NB_PAD: tl.constexpr,
     WS_NTB: tl.constexpr,
+    WS_HAND_C: tl.constexpr,
+    WS_ZERO_C: tl.constexpr,
+    ZB: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     b = tl.program_id(1)
-    thr_ord, c = _decide(x_ptr, x_stride, k_ptr, p_ptr, ws_ptr, ws_stride, cand_ptr, row)
+    thr_ord, c = _decide(x_ptr, x_stride, k_ptr, p_ptr, ws_ptr, ws_stride, cand_ptr, row,
+                         WS_HAND_C)
     if c > 0:
         ws_row = ws_ptr + row * ws_stride
         bb = tl.arange(0, NB_PAD)
@@ -259,6 +285,12 @@ def _apply_topp_kernel(
         rank = prefix + tl.cumsum(eqi, 0) - eqi
         mask_t = eq & (rank < c) & (x != float("-inf"))
         tl.store(xrow + offs, float("-inf"), mask=mask_t)
+    # This kernel never reads the histograms (the top-k pass handed over the
+    # three scalars it needs), so it is the one place where the workspace can
+    # be zeroed for the next call without racing a reader: that removes the
+    # per-call memset launch.  Each block program owns a disjoint slice.
+    zz = b * ZB + tl.arange(0, ZB)
+    tl.store(ws_ptr + row * ws_stride + zz, 0, mask=zz < WS_ZERO_C)
 
 
 def apply_top_k_top_p_fastk(
@@ -280,29 +312,67 @@ def apply_top_k_top_p_fastk(
     NB = triton.cdiv(V, _BLOCK)
     NB_PAD = triton.next_power_of_2(NB)
     ws_stride = _WS_NTB + NB_PAD
-    ws = torch.zeros(B, ws_stride, dtype=torch.int32, device=logits.device)
     k32 = k if k.dtype == torch.int32 else k.to(torch.int32)
     has_p = p is not None
-    if has_p:
-        cand = torch.empty(B, 64, dtype=torch.int64, device=logits.device)
+    ZB = triton.next_power_of_2(triton.cdiv(_WS_ZERO, NB))
+    persist = has_p and NB * ZB >= _WS_ZERO
+    if persist:
+        # The top-p kernel re-zeroes the workspace on its way out (it is the
+        # only kernel that reads none of it), so the per-call memset is gone.
+        ws = _workspace(B, ws_stride, logits.device)
+        cand = _candidates(B, logits.device)
         p32 = p if p.dtype == torch.float32 else p.to(torch.float32)
     else:
-        cand = ws  # dummy pointer, never touched
-        p32 = ws
+        ws = torch.zeros(B, ws_stride, dtype=torch.int32, device=logits.device)
+        cand = torch.empty(B, 64, dtype=torch.int64, device=logits.device) if has_p else ws
+        p32 = (p if p.dtype == torch.float32 else p.to(torch.float32)) if has_p else ws
 
     grid = (B, NB)
     for d in range(_NUM_DIGITS):
         _radix_pass_kernel[grid](
             logits, logits.stride(0), k32, ws, ws_stride, V,
-            D=d, BLOCK=_BLOCK, num_warps=8,
+            D=d, BLOCK=_BLOCK, WS_STATE_C=_WS_STATE, num_warps=8,
         )
     _apply_topk_kernel[grid](
         logits, logits.stride(0), k32, ws, ws_stride, cand, V,
-        HAS_P=has_p, BLOCK=_BLOCK, WS_GCNT=_WS_GCNT, WS_NTB=_WS_NTB, num_warps=8,
+        HAS_P=has_p, BLOCK=_BLOCK, WS_GCNT=_WS_GCNT, WS_NTB=_WS_NTB,
+        WS_STATE_C=_WS_STATE, WS_HAND_C=_WS_HAND, num_warps=8,
     )
     if has_p:
         _apply_topp_kernel[grid](
             logits, logits.stride(0), k32, p32, ws, ws_stride, cand, V,
-            BLOCK=_BLOCK, NB_PAD=NB_PAD, WS_NTB=_WS_NTB, num_warps=8,
+            BLOCK=_BLOCK, NB_PAD=NB_PAD, WS_NTB=_WS_NTB, WS_HAND_C=_WS_HAND,
+            WS_ZERO_C=(_WS_ZERO if persist else 0), ZB=ZB, num_warps=8,
         )
     return logits
+
+
+# Persistent, zero-on-creation scratch: the top-p kernel leaves it zeroed for
+# the next call, which is what removes the memset launch.  Keyed by shape, so a
+# CUDA-graph capture always replays against the same pointers.
+_WS_CACHE: dict = {}
+_CAND_CACHE: dict = {}
+
+
+def _workspace(B: int, ws_stride: int, device) -> torch.Tensor:
+    key = (str(device), B, ws_stride)
+    ws = _WS_CACHE.get(key)
+    if ws is None:
+        ws = torch.zeros(B, ws_stride, dtype=torch.int32, device=device)
+        _WS_CACHE[key] = ws
+    return ws
+
+
+def _candidates(B: int, device) -> torch.Tensor:
+    key = (str(device), B)
+    c = _CAND_CACHE.get(key)
+    if c is None:
+        c = torch.empty(B, 64, dtype=torch.int64, device=device)
+        _CAND_CACHE[key] = c
+    return c
+
+
+def reset_workspace() -> None:
+    """Re-zero the cached scratch (only needed if a call was interrupted)."""
+    for ws in _WS_CACHE.values():
+        ws.zero_()
