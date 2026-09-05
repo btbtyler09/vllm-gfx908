@@ -86,7 +86,7 @@ def _ext():
 
 
 def push_ar_requested() -> bool:
-    return os.environ.get("VLLM_GFX908_PUSH_AR", "0") == "1"
+    return os.environ.get("VLLM_GFX908_PUSH_AR", "1") == "1"
 
 
 def _envi(name: str, default: int) -> int:
