@@ -56,6 +56,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from ..common.qsa_cache import QSAForwardMetadata
+from . import gfx908_qsa_glue
 from . import model
 from .indexer_qsa import QSAIndexer
 
@@ -430,6 +431,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         # Set when a dense-causal step skipped the selection, so the buffer
         # holds the previous step's rows.
         self._topk_buffer_stale = False
+        # gfx908 fused decode glue (VLLM_GFX908_QSA_GLUE=1): static, so the
+        # compiled forward never branches on it at runtime.
+        self._gfx908_qsa_glue = gfx908_qsa_glue.qsa_glue_layer_supported(self, vllm_config)
 
         static_context = vllm_config.compilation_config.static_forward_context
         if self.layer_name in static_context:
@@ -580,12 +584,154 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             token_to_req=side_metadata.token_to_req,
         )
 
+    def _run_qsa_glue(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        qkv: torch.Tensor,
+        query: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """gfx908 fused decode glue: the whole q/k/v-projection-to-attention
+        transaction from the raw ``qkv`` GEMV output (see gfx908_qsa_glue.py).
+
+        ``query`` [tokens, heads, head_dim] and ``output`` are written here.
+        """
+
+        metadata = get_forward_context().attn_metadata
+        if isinstance(metadata, list):
+            metadata = metadata[0]
+        if not isinstance(metadata, dict):
+            output.zero_()
+            query.zero_()
+            return
+        main_metadata = cast(FlashAttentionMetadata, metadata[self.layer_name])
+        if self.kv_cache.numel() == 0:
+            raise RuntimeError("QSA main K/V cache is not bound")
+        indexer = self.indexer
+        num_tokens = main_metadata.num_actual_tokens
+        side_metadata = cast(QSAForwardMetadata, metadata[indexer.raw_key_cache.prefix])
+        cmp_metadata = cast(QSAForwardMetadata, metadata[indexer.compressed_key_cache.prefix])
+        if side_metadata.num_actual_tokens != num_tokens:
+            raise RuntimeError("QSA main and side metadata token counts disagree")
+        gate = qkv[:, : self.q_size * 2].view(-1, self.num_heads, 2 * self.head_dim)[
+            :, :, self.head_dim :
+        ]
+        impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
+        from .ops.qsa import qsa_gate_mul_, qsa_mqa_paged, qsa_sparse_paged_attention
+
+        uniform_decode = (
+            num_tokens > 0
+            and int(getattr(main_metadata, "max_query_len", 1) or 1) == 1
+            and not indexer.skip_topk
+        )
+        if uniform_decode:
+            # one row per request: the compressor ring has no cross-row hazard
+            gfx908_qsa_glue.STATS["fused_calls"] += 1
+            iqk, _ = indexer.index_qk_proj(hidden_states[:num_tokens])
+            iq = torch.empty(
+                (num_tokens, indexer.index_n_heads, indexer.index_head_dim),
+                dtype=qkv.dtype,
+                device=qkv.device,
+            )
+            gfx908_qsa_glue.glue_pre(
+                self, qkv, iqk, positions, query, iq, main_metadata, side_metadata,
+                cmp_metadata, num_tokens, mode=3,
+            )
+            logits, visible = qsa_mqa_paged(
+                iq,
+                indexer.compressed_key_cache.kv_cache,
+                cmp_metadata.block_table,
+                cmp_metadata.token_to_req[:num_tokens],
+                cmp_metadata.logical_positions[:num_tokens],
+                cmp_metadata.seq_lens,
+                indexer.compress_ratio,
+                num_columns=indexer._qsa_num_columns(cmp_metadata),
+            )
+            selected = self.topk_indices_buffer[:num_tokens]
+            gfx908_qsa_glue.topk_expand(
+                logits, visible, selected, cmp_metadata.logical_positions,
+                cmp_metadata.seq_lens, cmp_metadata.token_to_req, num_tokens,
+            )
+            self._topk_buffer_stale = False
+            key_cache, value_cache = self.kv_cache.transpose(1, 2).split(self.head_dim, dim=-1)
+            key_cache = canonicalize_singleton_dim_strides(key_cache)
+            value_cache = canonicalize_singleton_dim_strides(value_cache)
+            qsa_sparse_paged_attention(
+                query[:num_tokens],
+                key_cache,
+                value_cache,
+                selected,
+                main_metadata.block_table,
+                side_metadata.token_to_req[:num_tokens],
+                output,
+                gate=gate[:num_tokens],
+                out_rows=num_tokens,
+            )
+            if not qsa_sparse_paged_attention.last_epilogue:
+                # NUM_SPLITS == 1 shape: the kernel wrote output[:num_tokens] directly
+                output[num_tokens:].zero_()
+                qsa_gate_mul_(output[:num_tokens], gate[:num_tokens])
+            return
+
+        # Fallback (prefill, spec-decode verify/draft, index reuse): the main
+        # projection + KV write still run as one launch, then the stock chain.
+        gfx908_qsa_glue.STATS["fallback_calls"] += 1
+        if num_tokens > 0:
+            gfx908_qsa_glue.glue_pre(
+                self, qkv, None, positions, query, None, main_metadata, side_metadata,
+                cmp_metadata, num_tokens, mode=1,
+            )
+        dense_short = self._dense_short_eligible(main_metadata)
+        selected = indexer(
+            hidden_states,
+            positions,
+            self.topk_indices_buffer[:num_tokens],
+            skip_select=dense_short,
+            force_select=getattr(self, "_topk_buffer_stale", False) and indexer.skip_topk,
+        )
+        self._topk_buffer_stale = dense_short
+        if not dense_short and selected.shape != (num_tokens, indexer.output_width):
+            raise RuntimeError("QSA indexer returned an invalid selection shape")
+        if dense_short:
+            impl.forward_dense_causal(query, self.kv_cache, main_metadata, output)
+        elif self._prefill_tiled_eligible(main_metadata):
+            impl.forward_qsa_tiled(
+                self, query, self.kv_cache, main_metadata, output,
+                side_metadata.logical_positions, indexer.compress_ratio,
+            )
+        else:
+            impl.forward_qsa(
+                self, query, None, None, self.kv_cache, main_metadata, output,
+                token_to_req=side_metadata.token_to_req,
+            )
+        if num_tokens > 0:
+            qsa_gate_mul_(output[:num_tokens], gate[:num_tokens])
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+        if self._gfx908_qsa_glue:
+            num_tokens = hidden_states.shape[0]
+            query = torch.empty(
+                (num_tokens, self.num_heads, self.head_dim),
+                dtype=qkv.dtype,
+                device=qkv.device,
+            )
+            attn_output = torch.empty_like(query)
+            torch.ops.vllm.qwen4_exp_qsa_glue_with_output(
+                hidden_states,
+                positions,
+                qkv,
+                query,
+                attn_output,
+                _encode_layer_name(self.layer_name),
+            )
+            output, _ = self.o_proj(attn_output.view(num_tokens, -1))
+            return output
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
         num_tokens = hidden_states.shape[0]
         query = q.view(num_tokens, self.num_heads, self.head_dim)
@@ -662,6 +808,42 @@ direct_register_custom_op(
     op_func=qwen4_exp_qsa_with_output,
     mutates_args=["output"],
     fake_impl=qwen4_exp_qsa_with_output_fake,
+)
+
+
+def qwen4_exp_qsa_glue_with_output(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    qkv: torch.Tensor,
+    query: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    """gfx908 fused decode glue: projection glue + state update + attention."""
+
+    layer_name = _resolve_layer_name(layer_name)
+    layer = get_forward_context().no_compile_layers[layer_name]
+    if not isinstance(layer, Qwen4ExpQSAAttention):
+        raise TypeError(f"{layer_name} is not a Qwen4Exp QSA owner")
+    layer._run_qsa_glue(hidden_states, positions, qkv, query, output)
+
+
+def qwen4_exp_qsa_glue_with_output_fake(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    qkv: torch.Tensor,
+    query: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    del hidden_states, positions, qkv, query, output, layer_name
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_qsa_glue_with_output",
+    op_func=qwen4_exp_qsa_glue_with_output,
+    mutates_args=["query", "output"],
+    fake_impl=qwen4_exp_qsa_glue_with_output_fake,
 )
 
 

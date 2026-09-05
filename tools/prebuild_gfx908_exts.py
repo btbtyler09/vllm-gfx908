@@ -17,6 +17,7 @@ MODULES = [
     "vllm.models.qwen4_exp.amd.gfx908_hc_fused",
     "vllm.model_executor.layers.mamba.gdn.gfx908_gdn_fused",
     "vllm.distributed.device_communicators.gfx908_push_ar",
+    "vllm.models.qwen4_exp.amd.gfx908_qsa_glue",
 ]
 
 build_dir = os.environ.get("VLLM_GFX908_HIP_BUILD_DIR")

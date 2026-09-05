@@ -446,6 +446,108 @@ def _qsa_merge_splitk_kernel(
 
 
 @triton.jit
+def _qsa_merge_splitk_gate_kernel(
+    partial_output_ptr,
+    partial_lse_ptr,
+    output_ptr,
+    gate_ptr,
+    stride_output_row,
+    stride_output_head,
+    stride_gate_row,
+    stride_gate_head,
+    num_rows,
+    num_valid_rows,
+    HEAD_DIM: tl.constexpr,
+    NUM_QUERY_HEADS: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    BLOCK_SPLITS: tl.constexpr,
+    HAS_GATE: tl.constexpr,
+) -> None:
+    """``_qsa_merge_splitk_kernel`` with the gfx908 decode-glue epilogue: rows at
+    or past ``num_valid_rows`` are written as zeros (replacing the caller's
+    ``output.zero_()``) and, with ``HAS_GATE``, the merged head is multiplied by
+    ``sigmoid(gate)`` exactly the way the inductor-compiled
+    ``attn_output * torch.sigmoid(gate)`` computes it (bf16 attention upcast,
+    fp32 sigmoid, one rounding)."""
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    dim_offsets = tl.arange(0, HEAD_DIM)
+    out_ptrs = output_ptr + row * stride_output_row + head * stride_output_head + dim_offsets
+    if row >= num_valid_rows:
+        tl.store(out_ptrs, tl.zeros((HEAD_DIM,), dtype=tl.float32).to(output_ptr.type.element_ty))
+        return
+    split_offsets = tl.arange(0, BLOCK_SPLITS)
+    split_mask = split_offsets < NUM_SPLITS
+    lse = tl.load(
+        partial_lse_ptr + (split_offsets * num_rows + row) * NUM_QUERY_HEADS + head,
+        mask=split_mask,
+        other=-float("inf"),
+    )
+    lse_max = tl.max(lse, axis=0)
+    has_values = lse_max > -float("inf")
+    shifted = tl.where(split_mask & has_values, lse - lse_max, -float("inf"))
+    weights = tl.math.exp2(shifted)
+    denominator = tl.sum(weights, axis=0)
+    partial_output = tl.load(
+        partial_output_ptr
+        + ((split_offsets[:, None] * num_rows + row) * NUM_QUERY_HEADS + head)
+        * HEAD_DIM
+        + dim_offsets[None, :],
+        mask=split_mask[:, None],
+        other=0.0,
+    )
+    merged = tl.sum(partial_output * weights[:, None], axis=0)
+    merged = tl.where(denominator > 0, merged / denominator, 0.0)
+    if HAS_GATE:
+        merged = merged.to(output_ptr.type.element_ty).to(tl.float32)
+        gate = tl.load(
+            gate_ptr + row * stride_gate_row + head * stride_gate_head + dim_offsets
+        ).to(tl.float32)
+        merged = merged * tl.sigmoid(gate)
+    tl.store(out_ptrs, merged.to(output_ptr.type.element_ty))
+
+
+@triton.jit
+def _qsa_gate_mul_kernel(
+    out_ptr,
+    gate_ptr,
+    stride_out_row,
+    stride_gate_row,
+    stride_gate_head,
+    HEAD_DIM: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+) -> None:
+    """In place ``out[row] *= sigmoid(gate[row])`` with inductor's numerics
+    (bf16 upcast, fp32 sigmoid and product, one rounding); one program per row."""
+    row = tl.program_id(0)
+    for head in tl.static_range(0, NUM_HEADS):
+        offs = tl.arange(0, HEAD_DIM)
+        o_ptrs = out_ptr + row * stride_out_row + head * HEAD_DIM + offs
+        value = tl.load(o_ptrs).to(tl.float32)
+        gate = tl.load(gate_ptr + row * stride_gate_row + head * stride_gate_head + offs).to(
+            tl.float32
+        )
+        tl.store(o_ptrs, (value * tl.sigmoid(gate)).to(out_ptr.type.element_ty))
+
+
+def qsa_gate_mul_(out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    """``out[rows, heads, head_dim] *= sigmoid(gate[rows, heads, head_dim])`` in place,
+    one launch, numerically identical to the compiled elementwise multiply."""
+    rows, heads, head_dim = out.shape
+    if gate.shape != out.shape:
+        raise ValueError("QSA gate must match the attention output shape")
+    if out.stride(2) != 1 or out.stride(1) != head_dim or gate.stride(2) != 1:
+        raise ValueError("QSA gate multiply needs row-contiguous heads")
+    if not rows:
+        return out
+    _qsa_gate_mul_kernel[(rows,)](
+        out, gate, out.stride(0), gate.stride(0), gate.stride(1),
+        HEAD_DIM=head_dim, NUM_HEADS=heads, num_warps=4,
+    )
+    return out
+
+
+@triton.jit
 def _store_qsa_rows_kernel(
     cache_ptr,
     slots_ptr,
@@ -1322,8 +1424,19 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    gate: torch.Tensor | None = None,
+    out_rows: int | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA directly over paged BF16 K/V caches.
+
+    gfx908 decode glue (``VLLM_GFX908_QSA_GLUE``): with ``out_rows`` the caller
+    passes the *whole* padded ``out`` buffer and only its first ``out_rows``
+    rows are real; the split-K merge zeroes the rest (instead of a separate
+    ``output.zero_()``) and, with ``gate`` [rows, heads, head_dim], multiplies
+    each head by ``sigmoid(gate)`` in its epilogue.  Both are no-ops for the
+    ``NUM_SPLITS == 1`` shapes, which return ``False`` through
+    ``qsa_sparse_paged_attention.last_epilogue`` so the caller applies them.
+    """
 
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires a GPU and Triton")
@@ -1352,10 +1465,16 @@ def qsa_sparse_paged_attention(
     assert token_to_req.stride(0) == 1
     if out is None:
         out = torch.empty_like(q)
+    out_full = out
+    if out_rows is not None:
+        if out_rows != q.shape[0] or out.shape[0] < out_rows:
+            raise ValueError("QSA out_rows must equal the query rows")
+        out = out[:out_rows]
     if out.shape != q.shape:
         raise ValueError("QSA sparse output must match its query")
     assert out.dtype == q.dtype and out.device == q.device
     assert out.stride(2) == 1
+    qsa_sparse_paged_attention.last_epilogue = False
     if not q.shape[0]:
         return out
 
@@ -1449,6 +1568,32 @@ def qsa_sparse_paged_attention(
     if num_splits == 1:
         return out
 
+    if gate is not None or out_rows is not None:
+        has_gate = gate is not None
+        if has_gate and (gate.shape[0] < q.shape[0] or gate.shape[1:] != q.shape[1:]):
+            raise ValueError("QSA gate must be [rows, heads, head_dim]")
+        _qsa_merge_splitk_gate_kernel[(out_full.shape[0], q.shape[1])](
+            partial_output,
+            partial_lse,
+            out_full,
+            gate if has_gate else out_full,
+            out_full.stride(0),
+            out_full.stride(1),
+            gate.stride(0) if has_gate else 0,
+            gate.stride(1) if has_gate else 0,
+            q.shape[0],
+            q.shape[0],
+            HEAD_DIM=q.shape[2],
+            NUM_QUERY_HEADS=q.shape[1],
+            NUM_SPLITS=num_splits,
+            BLOCK_SPLITS=triton.next_power_of_2(num_splits),
+            HAS_GATE=has_gate,
+            num_warps=2,
+            num_stages=1,
+        )
+        qsa_sparse_paged_attention.last_epilogue = True
+        return out
+
     _qsa_merge_splitk_kernel[(q.shape[0], q.shape[1])](
         partial_output,
         partial_lse,
@@ -1464,6 +1609,9 @@ def qsa_sparse_paged_attention(
         num_stages=1,
     )
     return out
+
+
+qsa_sparse_paged_attention.last_epilogue = False
 
 
 def qsa_store_cache_rows(
@@ -2146,6 +2294,7 @@ __all__ = [
     "expand_qsa_block_indices_cuda",
     "qsa_compress_groups_with_ratio",
     "qsa_dense_causal_paged_attention",
+    "qsa_gate_mul_",
     "qsa_mqa_paged",
     "qsa_prefill_tiled_attention",
     "qsa_select_paged_tokens",
