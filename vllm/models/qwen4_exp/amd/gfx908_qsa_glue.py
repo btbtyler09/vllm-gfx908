@@ -75,7 +75,7 @@ def qsa_glue_enabled() -> bool:
     if _FLAG is None:
         from vllm.platforms.rocm import on_gfx908
 
-        _FLAG = on_gfx908() and os.environ.get("VLLM_GFX908_QSA_GLUE", "0") == "1"
+        _FLAG = on_gfx908() and os.environ.get("VLLM_GFX908_QSA_GLUE", "1") == "1"
         if _FLAG:
             try:
                 _ext()
