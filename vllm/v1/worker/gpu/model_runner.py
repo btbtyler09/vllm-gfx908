@@ -410,6 +410,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             format_gib(m.consumed_memory),
             time_after_load - time_before_load,
         )
+        try:
+            from vllm.platforms.gfx908_banner import gfx908_boot_summary
+
+            gfx908_boot_summary(self.model)
+        except Exception as exc:  # noqa: BLE001 - the banner must never break a boot
+            logger.debug("gfx908 boot banner skipped: %s", exc)
 
         # Initialize the components that require the model.
         self.model_state = init_model_state(

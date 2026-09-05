@@ -30,6 +30,7 @@ from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+ENABLED_LAYERS = 0  # layers on the fused decode path (for the gfx908 boot banner)
 
 GDN_FUSED_MAX_TOKENS = 8
 GDN_FUSED_SPEC_MAX_T = 8        # n + 1 <= 8 draft positions per sequence
@@ -111,7 +112,10 @@ def gdn_fused_layer_supported(layer, vllm_config) -> bool:
         and conv_dtype == torch.bfloat16
         and ssm_dtype == torch.float32
     )
-    logger.info_once("gfx908: fused GDN decode %s for %s", "ENABLED" if ok else "not applicable", layer.prefix)
+    global ENABLED_LAYERS
+    if ok:
+        ENABLED_LAYERS += 1
+    logger.debug("gfx908: fused GDN decode %s for %s", "ENABLED" if ok else "not applicable", layer.prefix)
     return ok
 
 

@@ -49,6 +49,7 @@ import torch
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+ENABLED_LAYERS = 0  # layers on the fused glue path (for the gfx908 boot banner)
 
 _CSRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc", "gfx908_qsa_glue.hip")
 _FLAG: bool | None = None
@@ -137,7 +138,10 @@ def qsa_glue_layer_supported(layer, vllm_config) -> bool:
         and float(idx.q_layernorm.variance_epsilon) == float(idx.k_layernorm.variance_epsilon)
         and getattr(vllm_config.model_config, "dtype", torch.bfloat16) == torch.bfloat16
     )
-    logger.info_once(
+    global ENABLED_LAYERS
+    if ok:
+        ENABLED_LAYERS += 1
+    logger.debug(
         "gfx908: fused QSA decode glue %s for %s", "ENABLED" if ok else "not applicable", layer.layer_name
     )
     return ok

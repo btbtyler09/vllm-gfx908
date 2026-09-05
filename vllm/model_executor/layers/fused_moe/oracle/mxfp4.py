@@ -58,7 +58,10 @@ if has_triton_kernels():
     try:
         from triton_kernels.matmul_ogs import PrecisionConfig
     except (ImportError, AttributeError) as e:
-        logger.error(
+        import torch as _torch
+
+        # triton_kernels (matmul_ogs) is an NVIDIA-only package; on ROCm this is expected.
+        (logger.debug if getattr(_torch.version, "hip", None) else logger.error)(
             "Failed to import Triton kernels. Please make sure your triton "
             "version is compatible. Error: %s",
             e,
