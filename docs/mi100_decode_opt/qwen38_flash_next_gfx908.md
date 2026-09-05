@@ -766,3 +766,11 @@ captured draft metadata present but off). Pure-image validation:
 Campaign totals for Qwen3.8-Flash-Next on 4x MI100 (c=1 decode): 17.5 tok/s
 at bring-up -> 59.6 (rounds 2-3) -> 89 (rc4) -> 91 (rc6) -> 100 (rc7);
 c=16 302 -> 532, c=64 341 -> 582 across rc5 -> rc7.
+
+qsa_glue_spec (2026-09-05): the QSA glue fast path now covers multi-token
+verify rows (`VLLM_GFX908_QSA_GLUE_MAX_Q`, default 1; committed fe3b13c754).
+The compressor ring is not a cross-row hazard in production (ring >= T+3 for
+every spec depth), so the per-row grid stays; 26 -> 8 launches per QSA layer
+at M=3, bit-exact (218 checks incl. six-step verify emulations), expected
+-0.5..-0.7 ms per n=2 verify step. Spec arms (n=2, n=3 at util 0.92) queued
+after rc8.
