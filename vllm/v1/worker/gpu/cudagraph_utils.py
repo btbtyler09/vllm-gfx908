@@ -38,6 +38,7 @@ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
+from vllm.v1.worker.gpu.gfx908_logits_graph import LogitsGraphState, desc_eligible
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup, clear_layer_kv_caches
@@ -476,6 +477,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         decode_query_len: int,
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
+        logits_graph: LogitsGraphState | None = None,
     ):
         super().__init__(
             vllm_config,
@@ -485,6 +487,9 @@ class ModelCudaGraphManager(CudaGraphManager):
             lora_capture_cases=lora_capture_cases,
             varlen_decode=varlen_decode,
         )
+        # gfx908 (VLLM_GFX908_LOGITS_IN_GRAPH=1): lm_head + TP logits gather
+        # recorded into the uniform-decode FULL graphs (see gfx908_logits_graph).
+        self.logits_graph = logits_graph
         self.hidden_states: torch.Tensor | None = None
         self.aux_hidden_states: list[torch.Tensor] = []
         self.use_aux_hidden_state_outputs = False
@@ -601,6 +606,16 @@ class ModelCudaGraphManager(CudaGraphManager):
                         ]
                     for i, aux in enumerate(aux_hidden_states):
                         self.aux_hidden_states[i][:num_tokens] = aux
+                    if self.logits_graph is not None and desc_eligible(desc):
+                        # Uniform decode: the logits rows are hidden_states[:n]
+                        # (logits_indices == arange(n)).  Recorded into the
+                        # graph on the captured pass; the warm-up pass runs it
+                        # eagerly so every lazy init happens outside capture.
+                        # Outside the forward context on purpose: the eager
+                        # path runs compute_logits outside it as well.
+                        self.logits_graph.record(
+                            model, self.hidden_states[:num_tokens], desc
+                        )
                 else:
                     # Non-last PP rank.
                     assert isinstance(model_output, IntermediateTensors)

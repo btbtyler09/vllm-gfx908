@@ -100,6 +100,10 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     ModelCudaGraphManager,
 )
+from vllm.v1.worker.gpu.gfx908_logits_graph import (
+    LogitsGraphState,
+    logits_in_graph_requested,
+)
 from vllm.v1.worker.gpu.cudagraph_utils import (
     profile_cudagraph_memory as _profile_cudagraph_memory,
 )
@@ -650,6 +654,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             decode_query_len=self.decode_query_len,
             lora_capture_cases=self.lora_capture_cases,
             varlen_decode=self.adaptive_verification is not None,
+            logits_graph=self._gfx908_make_logits_graph(cudagraph_mode),
         )
         check_attention_cp_compatibility(self.vllm_config)
         if isinstance(self.speculator, DraftModelSpeculator):
@@ -898,6 +903,48 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return _profile_cudagraph_memory(self)
 
     @torch.inference_mode()
+    @property
+    def _gfx908_logits_graph(self) -> LogitsGraphState | None:
+        mgr = self.cudagraph_manager
+        return None if mgr is None else mgr.logits_graph
+
+    def _gfx908_make_logits_graph(
+        self, cudagraph_mode: CUDAGraphMode
+    ) -> LogitsGraphState | None:
+        """VLLM_GFX908_LOGITS_IN_GRAPH=1: record lm_head + the TP logits
+        gather into the uniform-decode FULL graphs (gfx908_logits_graph).
+
+        Only for the plain sampling configuration: last (and first) PP rank,
+        no batch-sharded sampling, no LoRA, no PCP, a FULL decode mode and a
+        model with ``compute_logits``.  Anything else logs why and stays eager.
+        """
+        if not logits_in_graph_requested():
+            return None
+        why = None
+        if not (self.is_last_pp_rank and self.is_first_pp_rank):
+            why = "pipeline parallelism"
+        elif self.is_pooling_model or self.sampler is None:
+            why = "no sampler"
+        elif self.batch_sharder is not None:
+            why = "batch-sharded sampling"
+        elif self.lora_config is not None:
+            why = "LoRA"
+        elif self.pcp_manager is not None:
+            why = "prefill context parallelism"
+        elif not cudagraph_mode.has_full_cudagraphs():
+            why = f"cudagraph mode {cudagraph_mode.name} has no FULL graphs"
+        elif not hasattr(self.model, "compute_logits"):
+            why = "model has no compute_logits"
+        if why is not None:
+            logger.warning("gfx908: VLLM_GFX908_LOGITS_IN_GRAPH=1 ignored: %s", why)
+            return None
+        logger.info(
+            "gfx908: logits in-graph enabled (lm_head + TP gather recorded into "
+            "the uniform-decode FULL graphs, max_num_reqs=%d)",
+            self.max_num_reqs,
+        )
+        return LogitsGraphState(self.max_num_reqs)
+
     def capture_model(self) -> int:
         assert self.cudagraph_manager is not None
         capture_encoder = (
@@ -1400,6 +1447,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
+        batch_desc: BatchExecutionDescriptor | None = None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         shard_metadata = None
         global_input_batch = input_batch
@@ -1417,8 +1465,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logits = all_to_all_logits(local_logits, shard_metadata)
             logits = logits[:, : self.vocab_size]
         else:
-            sample_hidden_states = hidden_states[input_batch.logits_indices]
-            logits = self.model.compute_logits(sample_hidden_states)
+            logits = None
+            if (lg := self._gfx908_logits_graph) is not None:
+                # gfx908: a uniform-decode FULL replay already produced the
+                # logits inside the graph (lm_head + TP gather); use the
+                # static buffer rows instead of re-running them eagerly.
+                logits = lg.logits_for(batch_desc, input_batch)
+            if logits is None:
+                sample_hidden_states = hidden_states[input_batch.logits_indices]
+                logits = self.model.compute_logits(sample_hidden_states)
 
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
@@ -1816,6 +1871,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_req_ids=finished_req_ids,
             ec_connector_output=ec_connector_output,
             routed_experts=routed_experts,
+            batch_desc=batch_desc,
         )
 
         if not self.is_last_pp_rank:
@@ -1841,6 +1897,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         finished_req_ids = self.execute_model_state.finished_req_ids
         ec_connector_output = self.execute_model_state.ec_connector_output
         routed_experts = self.execute_model_state.routed_experts
+        batch_desc = self.execute_model_state.batch_desc
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1869,7 +1926,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
+            hidden_states, input_batch, grammar_output, batch_desc
         )
 
         if self.pp_handler is not None:
@@ -2115,6 +2172,8 @@ class ExecuteModelState(NamedTuple):
     finished_req_ids: set[str]
     ec_connector_output: ECConnectorOutput | None
     routed_experts: RoutedExpertsTensors | None
+    # gfx908 logits in-graph: the descriptor the step replayed (FULL only).
+    batch_desc: BatchExecutionDescriptor | None = None
 
 
 class BatchReqState(NamedTuple):
@@ -2211,6 +2270,9 @@ def _gfx908_step_end(runner) -> None:
             st["n"] = 0
             st["hist"].clear()
             _gfx908_log_collective_stats()
+            lg = getattr(runner, "_gfx908_logits_graph", None)
+            if lg is not None:
+                logger.info("gfx908 %s", lg.stats_line())
 
 
 def _gfx908_log_collective_stats() -> None:
