@@ -688,3 +688,16 @@ MTP n=2 is now at parity with plain decode (90 vs 91 tok/s) instead of
 -10%; the verify step still runs ~1,700 launches because the small-M GEMVs
 are row-serial (2.5-3.5 ms per extra row). Both flags stay off in rc7;
 the M-amortized small-M GEMV (smallm_gemv agent) is the next spec lever.
+
+smallm_gemv (2026-09-05, negative): an expert-major W4A8 path for 2<=M<=24
+(one weight tile per active expert looped over its rows, bit-exact vs the
+per-pair path) is +2..8% slower at M<=8 and only -5% at M=24. The per-pair
+path's duplicate fetches are already L2 hits, so the small-M cost is the
+per-block latency chain (kernarg -> id -> weight issue -> stage+quant ->
+barrier -> dot) plus the two fixed launches (silu, reduce ~4.4 us), not
+bytes; the brief's targets were below the unique-expert byte floor. The MoE
+contributes only ~0.37 ms of the 2.5-3.5 ms per extra verify row; the slope
+lives in the other small-M GEMVs and glue. Not integrated. Side finding:
+under Zipf-skewed routing the multi-row kernel beats per-pair by 1.4x already
+at M=24, so VLLM_GFX908_MOE_MR_MIN_M=24 (set with uniform routing) may be too
+high for real traffic -- check with a real topk_ids histogram.
