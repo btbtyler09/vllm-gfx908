@@ -62,6 +62,8 @@ def gdn_fused_enabled() -> bool:
             try:
                 _ext()
             except Exception as exc:
+                if os.environ.get("VLLM_GFX908_STRICT_EXT", "1") == "1":
+                    raise RuntimeError("gfx908: fused GDN extension unavailable under its flag; set VLLM_GFX908_STRICT_EXT=0 to fall back") from exc
                 logger.warning_once("gfx908: fused GDN extension unavailable (%s)", exc)
                 _FLAG = False
     return _FLAG

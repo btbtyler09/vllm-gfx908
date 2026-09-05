@@ -144,6 +144,14 @@ def w4a8_enabled() -> bool:
 
                 _FLAG = bool(on_gfx908()) and _ext_active() is not None
             except Exception as exc:  # hipcc missing etc. -> stock paths
+                # 2026-09-05: a silent fallback here hid a build break for a whole night of
+                # measurements (every boot ran the split-K W4A16 path).  Under the explicit flag
+                # a failed build is an error unless VLLM_GFX908_STRICT_EXT=0.
+                if os.environ.get("VLLM_GFX908_STRICT_EXT", "1") == "1":
+                    raise RuntimeError(
+                        "gfx908: VLLM_GFX908_W4A8=1 but the W4A8 extension failed to build; "
+                        "set VLLM_GFX908_STRICT_EXT=0 to fall back to W4A16"
+                    ) from exc
                 logger.warning_once("gfx908: W4A8 GEMV path unavailable (%s); using W4A16", exc)
                 _FLAG = False
             if _FLAG:

@@ -197,6 +197,8 @@ def hc_fused_enabled() -> bool:
             try:
                 _ext()
             except Exception as exc:
+                if os.environ.get("VLLM_GFX908_STRICT_EXT", "1") == "1":
+                    raise RuntimeError("gfx908: fused HC extension unavailable under its flag; set VLLM_GFX908_STRICT_EXT=0 to fall back") from exc
                 logger.warning_once("gfx908: fused HC extension unavailable (%s)", exc)
                 _FLAG = False
     return _FLAG
@@ -217,6 +219,8 @@ def hc_w8_enabled() -> bool:
                 if hc_fused_max_m() > _W8_SMALL_MAX_M:
                     _ext_w8_big()
             except Exception as exc:
+                if os.environ.get("VLLM_GFX908_STRICT_EXT", "1") == "1":
+                    raise RuntimeError("gfx908: HC W8 extension unavailable under its flag; set VLLM_GFX908_STRICT_EXT=0 to fall back") from exc
                 logger.warning_once("gfx908: HC W8 extension unavailable (%s)", exc)
                 _W8_FLAG = False
         else:

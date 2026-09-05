@@ -64,6 +64,8 @@ def hip_gemv_available() -> bool:
     try:
         return _ext() is not None
     except Exception as exc:  # hipcc missing etc. -> stock path
+        if os.environ.get("VLLM_GFX908_STRICT_EXT", "1") == "1":
+            raise RuntimeError("gfx908: HIP W4 GEMV unavailable under its flag; set VLLM_GFX908_STRICT_EXT=0 to fall back") from exc
         logger.warning_once("gfx908: HIP W4 GEMV unavailable (%s); using stock MoE", exc)
         return False
 

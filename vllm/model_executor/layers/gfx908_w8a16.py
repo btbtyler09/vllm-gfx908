@@ -381,6 +381,8 @@ def w8a16_enabled() -> bool:
             try:
                 _ext()
             except Exception as exc:  # hipcc missing etc. -> stock bf16 path
+                if os.environ.get("VLLM_GFX908_STRICT_EXT", "1") == "1":
+                    raise RuntimeError("gfx908: W8A16 extension unavailable under its flag; set VLLM_GFX908_STRICT_EXT=0 to fall back") from exc
                 logger.warning_once("gfx908: W8A16 extension unavailable (%s)", exc)
                 _FLAG = False
         if _FLAG:
@@ -512,6 +514,8 @@ def w4lt_available() -> bool:
 
                 _W4LT_FLAG = bool(on_gfx908()) and _ext_w4lt() is not None
             except Exception as exc:
+                if os.environ.get("VLLM_GFX908_STRICT_EXT", "1") == "1":
+                    raise RuntimeError("gfx908: W4 load-time path unavailable under its flag; set VLLM_GFX908_STRICT_EXT=0 to fall back") from exc
                 logger.warning_once("gfx908: W4 load-time path unavailable (%s)", exc)
                 _W4LT_FLAG = False
             if _W4LT_FLAG:
