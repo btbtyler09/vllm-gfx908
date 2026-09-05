@@ -566,3 +566,16 @@ row), the verify sampler's full-vocab sort (1.6 ms), eager draft metadata,
 NCCL all-gathers on the spec path. Fixes staged: exact radix sampler (now
 default), fused GDN on the spec branch + captured draft metadata (spec_path
 agent, window pending), M-amortized GEMVs (batch_research).
+
+prefill_research (2026-09-05): integrated, exact: per-GEMM MoE configs
+("gemm2" sub-keys; fp16 8192-key GEMM2 -11.4%, 2048-key -9.1%) and FLA
+chunk_delta_h BV=16 on HIP (-13..-17% of that call, bit-exact); ~-10 ms at
+2.5K, ~-30 ms per 16K prompt. Null: GEMM1 BLOCK_K 64/128 in every regime;
+re-autotuning FLA at production T. Wall/microbench ratio for prefill wins is
+0.55-0.7 (host and glue absorb the rest). The 16K c=4 tier (9.0 s) is not
+explained by single-request per-chunk GPU time (~1.2 s per 8192 chunk): a
+c=4 prefill trace is the next diagnostic. Gated candidates (numerics
+change, PPL/GSM8K needed): fp16 for the W8-remat GDN projections (1.4-1.9x),
+fp16 FLA operands (-32..36%, closer to fp32 than bf16), fp16 router/index_qk;
+keep HC mix_down in bf16 (fp16 0.66x at 8192). Together -100..130 ms GPU per
+8192 chunk, -40 ms at 2K.
