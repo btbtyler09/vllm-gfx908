@@ -675,3 +675,16 @@ The batch tiers move 40-70% (multi-row MoE kernel + MFMA + fp16 experts);
 c=1 moves 2% (prep fold + sampler); the 16K tier +13% (fp16 experts, gemm2
 configs, FLA BV16). Against the 2x RTX Pro 6000 NVFP4 reference (c=16 706,
 c=64 1349): c=16 gap 2.3x -> 1.4x, c=64 4.0x -> 2.8x.
+
+### Speculative decode on the rc6 tree (spec_path window, 2026-09-05)
+
+| arm (n=2, c=1 sampled x3) | tok/s | step | notes |
+|---|---|---|---|
+| rc6 tree, sampler fix only | 87.3 / 85.5 / 85.7 | 21.8-26.0 ms | acceptance 0.59, 2.18 tok/step greedy |
+| + `VLLM_GFX908_GDN_FUSED_SPEC=1` | 90.5 / 90.2 / 90.2 | 21.1-25.1 ms | -393 launches/step; c=4 202 either way |
+| + `VLLM_GFX908_DRAFT_CAPTURED_METADATA=1` | 90.4 / 89.7 / 89.6 | | bit-exact, neutral at c=1, -4.6% at c=4 |
+
+MTP n=2 is now at parity with plain decode (90 vs 91 tok/s) instead of
+-10%; the verify step still runs ~1,700 launches because the small-M GEMVs
+are row-serial (2.5-3.5 ms per extra row). Both flags stay off in rc7;
+the M-amortized small-M GEMV (smallm_gemv agent) is the next spec lever.
