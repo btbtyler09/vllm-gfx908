@@ -608,3 +608,20 @@ per-pair W4A8 path. Expected: c=16 step ~-19 ms, c=64 ~-39 ms. Still
 1.35-1.9x above the unique-expert byte floor (phase serialization inside a
 block); MFMA only pays at rows/expert >= ~10 (M >= ~512). Gate: M=9..256 moves
 from W4A16 to W4A8 numerics -> GSM8K at c=32 added to the rc6 validation.
+
+ar_track (2026-09-05, measured on the W4A16-fallback tree; AR numbers are
+kernel-independent): per c=1 step 97 in-graph custom one-shot all-reduces
+at 5 KB (48 layers x 2 + PLE), 1 eager custom AR (pre-step metadata), 1 RCCL
+all-gather (lm_head logits, 121 KB in / 485 KB out, eager, 57 us) -- the only
+RCCL node; the custom all-gather exists but is gated on is_cuda(). In-graph
+ARs run at the floor on rank 0 (median 7.4 us); rank 0 is the critical path
+(0.2-0.3 ms more non-AR work), ranks 1-3 wait ~1.6 ms/step harmlessly, rank 0
+loses ~0.45 ms at the two step-boundary collectives. AR-no-op arm: 13.56 ->
+12.44 ms/step (-1.12 ms = 98 x 7.8 us floor + ~0.35 ms boundary waits).
+4-rank graph-captured microbench at 5 KB: custom one-shot 7.76 us, two-shot
+11.08, RCCL 20.36, push AR 5.33 (keeps its 2.4 us lead under every skew arm;
+random jitter of amplitude S costs ~0.3 S per AR). Ranked: (1) push AR after
+a 3-boot + parity gate, -0.24 ms; (2) fuse the push consumer into the HC
+combine/RMSNorm, -0.10..-0.15; (3) gfx908 custom all-gather + in-graph
+lm_head/logits, -0.1..-0.3; (4) rebalance rank-0-only work, -0.1..-0.2;
+(5) fold the eager AR, -0.02..-0.05. Total -0.55..-0.9 ms/step.
