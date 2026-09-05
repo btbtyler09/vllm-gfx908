@@ -446,3 +446,29 @@ GSM8K 491/500 (ref 490), greedy parity c=1 6/16 mean 0.0046 / c=16 8/16
 0.0063 (batched-path floor), TTFT 3.2K 558 -> 542 ms, 12.8K 1.81 -> 1.72 s,
 c=16 probe 264 -> 360 tok/s (attribution vs the MFMA arm pending).
 fp16 is 2x closer to fp32 than bf16 on these GEMMs (rel-L2 2.4e-3 vs 4.8e-3).
+
+### Speculative decoding on this stack: where the +4% went (spec_research, 2026-09-05)
+
+Per-rank bytes per decode step (from the safetensors headers and the shipped
+W4/W8 paths): HC mixes W8 636 MB (33%), GDN int8 projections 519 MB (27%),
+routed+shared experts W4 365 MB (19%), lm_head int8 159 MB, router bf16
+126 MB, QSA W4 78 MB = 1.91 GB. So "draft with fewer experts" cannot pay: a
+top-2 self-draft still streams 1.64 GB with the same ~1,500 launches
+(~10.4 ms), and layer-skip drafts need >85% greedy agreement. Dead.
+
+The MTP head accepts ~58% at n=2, but the n=2 step costs 22.7 ms:
+verify at M=3 ~18 ms because the spec branch loses the fused GDN glue
+(+180 launches) and the small-M GEMVs are row-serial (W4A8 slab 8.9 us @M=1
+-> 42 us @M=8; in-server slope ~2.5-3.5 ms per extra row vs ~0.3-1.0
+achievable); the verify sampler spends 1.5 ms in aten::sort + cumsum over
+[3, 248320] fp32 because top_k=20/top_p=0.95 from generation_config take the
+PyTorch path below 8 rows (0.2 ms even at plain c=1); the proposer rebuilds
+draft metadata eagerly between draft steps (no
+supports_draft_decode_metadata_update on the QSA builders). Quantizing the
+bf16 draft experts saves ~0.02 ms/pass: a VRAM lever (1.26 -> 0.35 GB/rank),
+not a speed lever. Fix order: sampler top-k fast path (-1.3 ms at n=2,
+-0.15 ms at c=1), draft metadata update in place, GDN fused on the spec
+branch, then M-amortized GEMVs (also the c=2..16 lever). Projected c=1:
+~107 -> ~119 -> ~145 tok/s at n=2. ngram lookup: prose gains nothing, code
++10-15%; needs a V2-runner port. No public EAGLE/DFlash drafter exists for
+Flash-Next.
