@@ -908,7 +908,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Estimate the GPU memory required to capture CUDA graphs."""
         return _profile_cudagraph_memory(self)
 
-    @torch.inference_mode()
     @property
     def _gfx908_logits_graph(self) -> LogitsGraphState | None:
         mgr = self.cudagraph_manager
@@ -951,6 +950,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return LogitsGraphState(self.max_num_reqs)
 
+    @torch.inference_mode()
     def capture_model(self) -> int:
         assert self.cudagraph_manager is not None
         capture_encoder = (
