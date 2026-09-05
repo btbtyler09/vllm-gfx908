@@ -620,13 +620,22 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
         from .ops.qsa import qsa_gate_mul_, qsa_mqa_paged, qsa_sparse_paged_attention
 
-        uniform_decode = (
+        max_query_len = int(getattr(main_metadata, "max_query_len", 1) or 1)
+        fast_path = (
             num_tokens > 0
-            and int(getattr(main_metadata, "max_query_len", 1) or 1) == 1
+            and 1 <= max_query_len <= gfx908_qsa_glue.qsa_glue_max_q()
             and not indexer.skip_topk
         )
-        if uniform_decode:
-            # one row per request: the compressor ring has no cross-row hazard
+        if fast_path and max_query_len > 1:
+            # keep the eager multi-token batches that the fallback would hand to the
+            # dense-short / tiled-prefill kernels on those kernels (bit-for-bit today)
+            fast_path = not (
+                self._dense_short_eligible(main_metadata)
+                or self._prefill_tiled_eligible(main_metadata)
+            )
+        if fast_path:
+            # one row per request, or up to max_q rows per request: the compressor
+            # ring hazard is handled inside qsa_glue_pre (see gfx908_qsa_glue.glue_pre)
             gfx908_qsa_glue.STATS["fused_calls"] += 1
             iqk, _ = indexer.index_qk_proj(hidden_states[:num_tokens])
             iq = torch.empty(
@@ -636,7 +645,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             )
             gfx908_qsa_glue.glue_pre(
                 self, qkv, iqk, positions, query, iq, main_metadata, side_metadata,
-                cmp_metadata, num_tokens, mode=3,
+                cmp_metadata, num_tokens, mode=3, max_query_len=max_query_len,
             )
             logits, visible = qsa_mqa_paged(
                 iq,
@@ -674,7 +683,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 qsa_gate_mul_(output[:num_tokens], gate[:num_tokens])
             return
 
-        # Fallback (prefill, spec-decode verify/draft, index reuse): the main
+        # Fallback (prefill, verify rows beyond max_q, index reuse): the main
         # projection + KV write still run as one launch, then the stock chain.
         gfx908_qsa_glue.STATS["fallback_calls"] += 1
         if num_tokens > 0:

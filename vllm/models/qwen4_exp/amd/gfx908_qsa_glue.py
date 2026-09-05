@@ -18,14 +18,23 @@ scorer, ``qsa_topk_expand``, split-K attention, merge-with-gate):
   merge epilogue   ``sigmoid(gate)`` applied in the split-K merge (inductor's
                    fp32 formula), padded rows zeroed there (no ``output.zero_()``).
 
-Everything else (prefill, MTP verify / draft steps, ``skip_topk`` index reuse,
+Rows with up to ``VLLM_GFX908_QSA_GLUE_MAX_Q`` query tokens per request (default
+1; 4 covers MTP verify at n <= 3 and small multi-token decode requests) take the
+same fast path: every kernel of it is per row except the compressor ring, whose
+only cross-row hazard is a later row of the same request overwriting a ring slot
+an earlier row still has to pool from.  Within a request the ring reads are at
+positions below the request's first row and the stores at its own rows, so the
+per-row grid is hazard-free whenever ``ring_size >= max_query_len + 3`` -- true
+of every spec-verify batch, since the ring is sized ``4 * ceil((4 + n) / 4)``
+for ``n + 1`` rows.  Narrower rings (no spec decode, ring 4) with multi-token
+rows use the kernel's per-request grid (all rows of a request in one workgroup,
+ring stores after a barrier).
+
+Everything else (prefill, longer verify rows, ``skip_topk`` index reuse,
 dense-short and tiled prefill) takes the fallback inside the same op: the main
 projection still runs through ``qsa_glue_pre`` in main-only mode (no cross-row
 hazard there) and the stock indexer / attention code follows, with the gate
-applied by ``qsa_gate_mul`` (same formula as the compiled multiply).  The one
-cross-row hazard that forces the ``max_query_len == 1`` gate is the compressor
-ring: a later row of the same request may overwrite a ring slot an earlier row
-still has to pool from.
+applied by ``qsa_gate_mul`` (same formula as the compiled multiply).
 
 Fixed per-rank shapes (Qwen3.8-Flash-Next TP4): 6 q heads / 1 kv head x 256,
 rotary_dim 64, MRoPE section of 3 (interleaved), indexer 4 + 1 heads x 128,
@@ -43,6 +52,7 @@ logger = init_logger(__name__)
 
 _CSRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc", "gfx908_qsa_glue.hip")
 _FLAG: bool | None = None
+_MAX_Q: int | None = None
 # bit 2: norm output stays fp32 into the RoPE (what inductor's fused kernel does),
 # bits 0-1: fp-contraction form of the rotation (1 = fma(x1, cos, ...)).  Modes
 # 4/5/6 all reproduce the compiled projection bit for bit (agents/qsa_glue).
@@ -85,6 +95,19 @@ def qsa_glue_enabled() -> bool:
     return _FLAG
 
 
+def qsa_glue_max_q() -> int:
+    """Largest per-request query length the fast path takes
+    (``VLLM_GFX908_QSA_GLUE_MAX_Q``, default 1, clamped to 1..4)."""
+    global _MAX_Q
+    if _MAX_Q is None:
+        try:
+            value = int(os.environ.get("VLLM_GFX908_QSA_GLUE_MAX_Q", "1"))
+        except ValueError:
+            value = 1
+        _MAX_Q = max(1, min(4, value))
+    return _MAX_Q
+
+
 def qsa_glue_layer_supported(layer, vllm_config) -> bool:
     """Static (init-time) eligibility of one Qwen4ExpQSAAttention owner."""
     if not qsa_glue_enabled():
@@ -120,14 +143,21 @@ def qsa_glue_layer_supported(layer, vllm_config) -> bool:
     return ok
 
 
-def glue_pre(layer, qkv, iqk, positions, query, iq, main_md, raw_md, cmp_md, num_rows, mode):
+def glue_pre(layer, qkv, iqk, positions, query, iq, main_md, raw_md, cmp_md, num_rows, mode, max_query_len=1):
     """One launch.  mode bit 0: main q/k/v (query out + KV cache); bit 1: indexer
-    q (``iq`` out) + compressor ring + compressed cache.  ``num_rows`` workgroups."""
+    q (``iq`` out) + compressor ring + compressed cache.  One workgroup per row,
+    or -- when the indexer part runs on multi-token rows and the ring is narrower
+    than ``max_query_len + 3`` -- one workgroup per request (rows per workgroup =
+    ``max_query_len``, 2..4) so the ring stores follow every row's ring reads."""
     idx = layer.indexer
     rope = layer.rotary_emb
     cos_sin = rope._match_cos_sin_cache_dtype(qkv)  # bf16 [max_pos, 64]
     key_cache, value_cache = layer.kv_cache.transpose(1, 2).split(layer.head_dim, dim=-1)
     section = rope.mrope_section
+    ring_size = int(idx.raw_key_cache.key_cache.shape[1])
+    tq = 1
+    if max_query_len > 1 and (mode & 2) and ring_size < max_query_len + 3:
+        tq = int(max_query_len)
     _ext().qsa_glue_pre(
         qkv, iqk, positions, cos_sin,
         layer.q_norm.weight, layer.k_norm.weight, idx.q_layernorm.weight, idx.k_layernorm.weight,
@@ -136,7 +166,7 @@ def glue_pre(layer, qkv, iqk, positions, query, iq, main_md, raw_md, cmp_md, num
         idx.raw_key_cache.key_cache, raw_md.slot_mapping, idx.raw_key_cache.rope_position_cache,
         raw_md.block_table, cmp_md.token_to_req, cmp_md.query_start_loc, cmp_md.logical_positions,
         cmp_md.slot_mapping, idx.compressed_key_cache.kv_cache,
-        int(section[1]), int(section[2]), ROPE_MODE, int(num_rows), int(mode),
+        int(section[1]), int(section[2]), ROPE_MODE, int(num_rows), int(mode), tq,
     )
 
 
@@ -145,4 +175,4 @@ def topk_expand(logits, visible, out, logical_positions, seq_lens, token_to_req,
     _ext().qsa_topk_expand(logits, visible, out, None, logical_positions, seq_lens, token_to_req, int(rows))
 
 
-__all__ = ["glue_pre", "qsa_glue_enabled", "qsa_glue_layer_supported", "topk_expand", "STATS"]
+__all__ = ["glue_pre", "qsa_glue_enabled", "qsa_glue_layer_supported", "qsa_glue_max_q", "topk_expand", "STATS"]

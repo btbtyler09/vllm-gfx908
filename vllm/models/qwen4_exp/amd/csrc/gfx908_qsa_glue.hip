@@ -9,9 +9,13 @@
 //    Replaces 18 launches (3 inductor norm/rope kernels, reshape_and_cache_flash, grouped norm x2,
 //    cos/sin gather + 2 contiguous copies + mrope x2, compress, store x3).
 //    Every cross-row hazard is the compressor ring: row B's ring store may alias a slot row A of the
-//    same request still needs.  The host gate therefore requires max_query_len == 1 (one row per
-//    request), which is the shape of every captured decode graph; rows of different requests use
-//    different ring blocks.  No cross-workgroup dependency inside the kernel.
+//    same request still needs.  Rows of different requests use different ring blocks, and within a
+//    request the ring reads are at positions < chunk_start while the stores are at positions
+//    chunk_start .. chunk_start + T - 1, so the per-row grid (TQ = 1) is hazard-free whenever
+//    ring_size >= T + 3 (uniform decode T = 1; every spec-verify batch, whose ring is sized
+//    4 * ceil((4 + n) / 4) >= n + 4 for T = n + 1 rows).  Narrower rings with T > 1 rows use the
+//    per-request grid (TQ = T, template below): all rows of a request in one workgroup, ring stores
+//    after a barrier.  No cross-workgroup dependency inside the kernel either way.
 //
 //  qsa_topk_expand (grid = rows, 512 threads)
 //    deterministic top-512 of logits[row, :visible] (32-bit radix select, 11/11/10-bit digits) with the
@@ -225,79 +229,125 @@ __device__ __forceinline__ void compress_chain(const GlueArgs& a, int row, int l
   (void)irow;
 }
 
-__global__ void __launch_bounds__(256) qsa_glue_pre_kernel(const GlueArgs a) {
-  const int row = blockIdx.x;
+// raw key + int64 MRoPE positions of one row into the compressor ring (one warp)
+__device__ __forceinline__ void ring_store(const GlueArgs& a, int row, int lane, const long* p3) {
+  const long rslot = a.raw_slots[row];
+  if (rslot >= 0 && rslot < a.ring_blocks * a.ring_size) {
+    const uint16_t* irow = a.iqk + (long)row * a.s_iqk;
+    const long blk = rslot / a.ring_size, tok = rslot % a.ring_size;
+    uint16_t* dst = a.ring + blk * a.ring_bs + tok * a.ring_ts;
+    dst[lane] = irow[512 + lane];
+    dst[lane + 64] = irow[512 + lane + 64];
+    if (a.rope != nullptr && lane < 3) a.rope[blk * a.rope_bs + tok * a.rope_ts + lane * a.rope_ds] = p3[lane];
+  }
+}
+
+// TQ = rows per workgroup (4 warps per row, warp = 4 * local_row + job).
+//   TQ == 1: grid = rows, one workgroup per row (uniform decode, or any batch whose ring is wide
+//            enough that no row's ring store aliases a slot another row of the same request pools
+//            from: ring_size >= max_query_len + 3 -- the spec-decode ring, 4 * ceil((4 + n) / 4),
+//            guarantees that for every verify batch of n + 1 rows).
+//   TQ > 1:  grid = num_reqs + ceil(rows / TQ); workgroup g < num_reqs owns request g's rows
+//            [qsl[g], min(qsl[g+1], qsl[g] + TQ)) (host gate: max_query_len <= TQ), the rest cover
+//            the unmapped padded rows [qsl[num_reqs], rows) in slices of TQ (main projection only:
+//            their slots are all -1).  The ring / RoPE-position stores of every row run after a
+//            workgroup barrier, i.e. after every row of the request has pooled what it needs from
+//            the ring, which is the stock order (compress, then store).  The only cross-row hazard
+//            of this kernel is therefore closed inside one workgroup; workgroups never wait on
+//            each other.
+template <int TQ>
+__global__ void __launch_bounds__(256 * TQ) qsa_glue_pre_kernel(const GlueArgs a) {
   const int tid = threadIdx.x, lane = tid & 63, warp = tid >> 6;
-  const bool do_main = (a.mode & 1) != 0, do_idx = (a.mode & 2) != 0;
-  long p3[3];
-#pragma unroll
-  for (int ax = 0; ax < 3; ++ax) p3[ax] = a.pos[ax * a.s_pos + row];
-  const uint16_t* qrow = a.qkv + (long)row * a.s_qkv;
-  const uint16_t* irow = a.iqk + (long)row * a.s_iqk;
-  uint16_t* qdst = a.query + (long)row * (6 * 256);
-  uint16_t* idst = a.iq + (long)row * (4 * 128);
-  // Job split (11 norm jobs + the compress chain over 4 warps; the chain has ~5 dependent
-  // round trips so it shares a warp with only two short jobs):
-  //   warp 0: compress chain, main q h0,  idx q h0
-  //   warp 1: main q h1, h2,               idx q h1
-  //   warp 2: main q h3, h4,               idx q h2
-  //   warp 3: main q h5, main k (+KV write), v copy, idx q h3, raw ring + rope-position stores
-  // Every warp issues all of its independent loads (x, weights, cos/sin) before the first reduce.
-  float c = 0.f, s = 0.f;
-  rope_cs(a.cs, p3, a.max_pos, lane, a.sec_h3, a.sec_w3, c, s);
-  if (warp == 0) {
-    float xq[4], xi[2];
-    if (do_main) load_head<256>(qrow, lane, xq);
-    if (do_idx) load_head<128>(irow, lane, xi);
-    if (do_idx) compress_chain(a, row, lane, irow);
-    if (do_main) main_q_head(a, xq, c, s, lane, qdst);
-    if (do_idx) idx_q_head(a, xi, c, s, lane, idst);
-  } else if (warp < 3) {
-    const int h0 = (warp == 1) ? 1 : 3;
-    float xa[4], xb[4], xi[2];
-    if (do_main) {
-      load_head<256>(qrow + h0 * 512, lane, xa);
-      load_head<256>(qrow + (h0 + 1) * 512, lane, xb);
-    }
-    if (do_idx) load_head<128>(irow + warp * 128, lane, xi);
-    if (do_main) {
-      main_q_head(a, xa, c, s, lane, qdst + h0 * 256);
-      main_q_head(a, xb, c, s, lane, qdst + (h0 + 1) * 256);
-    }
-    if (do_idx) idx_q_head(a, xi, c, s, lane, idst + warp * 128);
+  const int lrow = warp >> 2, job = warp & 3;
+  int row;
+  bool active;
+  if constexpr (TQ == 1) {
+    row = blockIdx.x;
+    active = true;
   } else {
-    float xq[4], xk[4], xi[2];
-    if (do_main) {
-      load_head<256>(qrow + 5 * 512, lane, xq);
-      load_head<256>(qrow + 3072, lane, xk);
+    const int g = blockIdx.x;
+    int base, count;
+    if (g < a.num_reqs) {
+      const int s = a.qsl[g], e = a.qsl[g + 1];
+      base = s;
+      count = e - s < TQ ? e - s : TQ;
+    } else {
+      base = a.qsl[a.num_reqs] + (g - a.num_reqs) * TQ;
+      count = TQ;
     }
-    if (do_idx) load_head<128>(irow + 3 * 128, lane, xi);
-    if (do_main) {
-      main_q_head(a, xq, c, s, lane, qdst + 5 * 256);
-      float y[4];
-      norm_rope_vals<256, false, false>(xk, a.kw, a.eps_main, c, s, lane, a.rope_mode, y);
-      const long mslot = a.main_slots[row];
-      if (mslot >= 0) {
-        const long blk = mslot / a.main_block, off = mslot % a.main_block;
-        const long base = blk * a.kv_bs + off * a.kv_ps;
+    row = base + lrow;
+    active = (lrow < count) && (row >= 0) && (row < a.rows);
+  }
+  const bool do_main = (a.mode & 1) != 0, do_idx = (a.mode & 2) != 0;
+  long p3[3] = {0, 0, 0};
+  if (active) {
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          a.kc[base + lane + 64 * j] = f2bf(y[j]);
-          a.vc[base + lane + 64 * j] = qrow[3328 + lane + 64 * j];
+    for (int ax = 0; ax < 3; ++ax) p3[ax] = a.pos[ax * a.s_pos + row];
+    const uint16_t* qrow = a.qkv + (long)row * a.s_qkv;
+    const uint16_t* irow = a.iqk + (long)row * a.s_iqk;
+    uint16_t* qdst = a.query + (long)row * (6 * 256);
+    uint16_t* idst = a.iq + (long)row * (4 * 128);
+    // Job split (11 norm jobs + the compress chain over 4 warps; the chain has ~5 dependent
+    // round trips so it shares a warp with only two short jobs):
+    //   job 0: compress chain, main q h0,  idx q h0
+    //   job 1: main q h1, h2,               idx q h1
+    //   job 2: main q h3, h4,               idx q h2
+    //   job 3: main q h5, main k (+KV write), v copy, idx q h3, raw ring + rope-position stores
+    // Every warp issues all of its independent loads (x, weights, cos/sin) before the first reduce.
+    float c = 0.f, s = 0.f;
+    rope_cs(a.cs, p3, a.max_pos, lane, a.sec_h3, a.sec_w3, c, s);
+    if (job == 0) {
+      float xq[4], xi[2];
+      if (do_main) load_head<256>(qrow, lane, xq);
+      if (do_idx) load_head<128>(irow, lane, xi);
+      if (do_idx) compress_chain(a, row, lane, irow);
+      if (do_main) main_q_head(a, xq, c, s, lane, qdst);
+      if (do_idx) idx_q_head(a, xi, c, s, lane, idst);
+    } else if (job < 3) {
+      const int h0 = (job == 1) ? 1 : 3;
+      float xa[4], xb[4], xi[2];
+      if (do_main) {
+        load_head<256>(qrow + h0 * 512, lane, xa);
+        load_head<256>(qrow + (h0 + 1) * 512, lane, xb);
+      }
+      if (do_idx) load_head<128>(irow + job * 128, lane, xi);
+      if (do_main) {
+        main_q_head(a, xa, c, s, lane, qdst + h0 * 256);
+        main_q_head(a, xb, c, s, lane, qdst + (h0 + 1) * 256);
+      }
+      if (do_idx) idx_q_head(a, xi, c, s, lane, idst + job * 128);
+    } else {
+      float xq[4], xk[4], xi[2];
+      if (do_main) {
+        load_head<256>(qrow + 5 * 512, lane, xq);
+        load_head<256>(qrow + 3072, lane, xk);
+      }
+      if (do_idx) load_head<128>(irow + 3 * 128, lane, xi);
+      if (do_main) {
+        main_q_head(a, xq, c, s, lane, qdst + 5 * 256);
+        float y[4];
+        norm_rope_vals<256, false, false>(xk, a.kw, a.eps_main, c, s, lane, a.rope_mode, y);
+        const long mslot = a.main_slots[row];
+        if (mslot >= 0) {
+          const long blk = mslot / a.main_block, off = mslot % a.main_block;
+          const long base = blk * a.kv_bs + off * a.kv_ps;
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            a.kc[base + lane + 64 * j] = f2bf(y[j]);
+            a.vc[base + lane + 64 * j] = qrow[3328 + lane + 64 * j];
+          }
         }
       }
-    }
-    if (do_idx) {
-      idx_q_head(a, xi, c, s, lane, idst + 3 * 128);
-      const long rslot = a.raw_slots[row];
-      if (rslot >= 0 && rslot < a.ring_blocks * a.ring_size) {
-        const long blk = rslot / a.ring_size, tok = rslot % a.ring_size;
-        uint16_t* dst = a.ring + blk * a.ring_bs + tok * a.ring_ts;
-        dst[lane] = irow[512 + lane];
-        dst[lane + 64] = irow[512 + lane + 64];
-        if (a.rope != nullptr && lane < 3) a.rope[blk * a.rope_bs + tok * a.rope_ts + lane * a.rope_ds] = p3[lane];
+      if (do_idx) {
+        idx_q_head(a, xi, c, s, lane, idst + 3 * 128);
+        if constexpr (TQ == 1) ring_store(a, row, lane, p3);
       }
     }
+  }
+  if constexpr (TQ > 1) {
+    // every ring / RoPE-position read of this request's rows (compress_chain) is complete
+    __syncthreads();
+    if (active && do_idx && job == 3) ring_store(a, row, lane, p3);
   }
 }
 
@@ -463,7 +513,8 @@ void qsa_glue_pre(torch::Tensor qkv, c10::optional<torch::Tensor> iqk_opt, torch
                   torch::Tensor value_cache, torch::Tensor main_slots, int64_t main_block, torch::Tensor ring,
                   torch::Tensor raw_slots, c10::optional<torch::Tensor> rope, torch::Tensor raw_table,
                   torch::Tensor tok2req, torch::Tensor qsl, torch::Tensor logpos, torch::Tensor cmp_slots,
-                  torch::Tensor cmp, int64_t sec_h, int64_t sec_w, int64_t rope_mode, int64_t num_actual_rows, int64_t mode) {
+                  torch::Tensor cmp, int64_t sec_h, int64_t sec_w, int64_t rope_mode, int64_t num_actual_rows, int64_t mode,
+                  int64_t tq) {
   GlueArgs a;
   const int rows_padded = (int)num_actual_rows;  // grid: one workgroup per row
   const bool do_idx = (mode & 2) != 0;
@@ -517,8 +568,21 @@ void qsa_glue_pre(torch::Tensor qkv, c10::optional<torch::Tensor> iqk_opt, torch
   a.rows = (int)num_actual_rows; a.num_reqs = (int)(qsl.numel() - 1);
   a.sec_h3 = (int)(3 * sec_h); a.sec_w3 = (int)(3 * sec_w); a.rope_mode = (int)rope_mode; a.mode = (int)mode;
   auto st = c10::hip::getCurrentHIPStream().stream();
+  TORCH_CHECK(tq >= 1 && tq <= 4, "qsa_glue_pre: tq (rows per workgroup) must be 1..4");
   if (rows_padded > 0) {
-    hipLaunchKernelGGL(qsa_glue_pre_kernel, dim3(rows_padded), dim3(256), 0, st, a);
+    if (tq == 1) {
+      hipLaunchKernelGGL(qsa_glue_pre_kernel<1>, dim3(rows_padded), dim3(256), 0, st, a);
+    } else {
+      // one workgroup per (padded) request + enough TQ-row slices for the unmapped padded rows
+      const unsigned grid = (unsigned)a.num_reqs + (unsigned)((rows_padded + tq - 1) / tq);
+      if (tq == 2) {
+        hipLaunchKernelGGL(qsa_glue_pre_kernel<2>, dim3(grid), dim3(512), 0, st, a);
+      } else if (tq == 3) {
+        hipLaunchKernelGGL(qsa_glue_pre_kernel<3>, dim3(grid), dim3(768), 0, st, a);
+      } else {
+        hipLaunchKernelGGL(qsa_glue_pre_kernel<4>, dim3(grid), dim3(1024), 0, st, a);
+      }
+    }
   }
 }
 
