@@ -246,7 +246,10 @@ class AutoGPTQConfig(QuantizationConfig):
             if not check_moe_marlin_supports_layer(
                 layer, self.group_size, allow_tile_padding=not self.desc_act
             ):
-                logger.warning_once(
+                import torch as _torch
+
+                # Marlin is an NVIDIA kernel; on ROCm this is expected for every MoE layer.
+                (logger.debug if getattr(_torch.version, "hip", None) else logger.warning_once)(
                     f"Layer '{prefix}' is not supported by GPTQMoeMarlin. "
                     "Falling back to Moe WNA16 kernels."
                 )

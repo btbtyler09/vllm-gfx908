@@ -2269,7 +2269,7 @@ def is_set(name: str):
 
 def validate_environ(hard_fail: bool) -> None:
     # gfx908/MI100 fork knobs are read directly by their modules; they are not unknown.
-    _fork_prefixes = ("VLLM_GFX908_", "VLLM_PLE_", "VLLM_MI100_", "VLLM_UVA_", "VLLM_ROCM_USE_AITER_FP4_ASM_GEMM")
+    _fork_prefixes = ("VLLM_GFX908_", "VLLM_PLE_", "VLLM_MI100_", "VLLM_UVA_", "VLLM_GDN_", "VLLM_ROCM_USE_AITER_FP4_ASM_GEMM")
     for env in os.environ:
         if env.startswith(_fork_prefixes):
             continue
