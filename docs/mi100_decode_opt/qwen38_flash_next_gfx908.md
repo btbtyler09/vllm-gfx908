@@ -736,3 +736,33 @@ GSM8K reference on the pure rc5 image with the same protocol (2026-09-05):
 full set 1278/1319 (rc6 1276), batched c=32 subset 482/500 (rc6 485). The
 485-vs-490 gap seen on the MFMA gate was subset/ordering noise; the rc6
 numerics (MFMA + swizzled GEMV + fp16 experts + multi-row MoE) are neutral.
+
+### Release rc7 (2026-09-05): `btbtyler09/vllm-rocm-gfx908:v0.28.0rc7.dev-q38fn`
+
+Tree 382966cbdd (rc6 + QSA decode glue on + push AR on + strict loaders +
+gemm2 configs + FLA BV16; logits-in-graph, custom AG, GDN spec kernel and
+captured draft metadata present but off). Pure-image validation:
+
+| gate | rc7 | rc6 |
+|---|---|---|
+| c=1 probes (400 tok) | 100.3-101.0 tok/s | 90.7-91.2 |
+| c=4 / c=16 / c=48 probes | 264 / 644 / 905 | 244 / 629 / 888 |
+| PPL (64 windows) | 3.1451 | 3.1488 |
+| GSM8K full 1319 / batched c=32 (500) | 1282 (97.2%) / 485 | 1276 / 485 (rc5 1278 / 482) |
+| greedy parity c=1 vs rc4 / c=16 vs rc5 | 6/16 / 4/16 (floor class) | 4/16 / 7/16 |
+| TTFT 3.2K (warm) | 505-550 ms | 519-530 ms |
+
+12-tier (mixed corpus, `benchmark_Qwen3.8-Flash-Next-GPTQ-4bit_rc7.md`):
+
+| tier | rc6 | rc7 |
+|---|---|---|
+| Single user TTFT / TPOT | 500 ms / 11.2 ms | 511 ms / **10.3 ms** |
+| Decode stress c=1 | 91.3 tok/s | **100.3 tok/s** |
+| 16K c=4 tok/s, TTFT / TPOT | 130.6, 8.32 s / 19.0 ms | 132.9, 9.08 s / 18.0 ms |
+| Short context c=16 | 437 | 466 |
+| Mixed c=8 | 323 | 343 |
+| c=4 / c=16 / c=32 / c=64 / c=128 | 208 / 509 / 534 / 483 / 539 | 223 / 532 / 547 / 582 / 549 |
+
+Campaign totals for Qwen3.8-Flash-Next on 4x MI100 (c=1 decode): 17.5 tok/s
+at bring-up -> 59.6 (rounds 2-3) -> 89 (rc4) -> 91 (rc6) -> 100 (rc7);
+c=16 302 -> 532, c=64 341 -> 582 across rc5 -> rc7.
