@@ -19,6 +19,12 @@ from .utils import FLA_CHUNK_SIZE, use_cuda_graph
 NUM_WARPS = [2, 4, 8, 16]
 # Triton's AMD backend fails to lower this kernel with num_stages=4.
 _CHUNK_DELTA_H_NUM_STAGES = [2, 3] if torch.version.hip else [2, 3, 4]
+# gfx908 (MI100, 120 CUs): the recurrence grid is (V/BV) x HV programs; at the
+# TP4 Qwen3.8-Flash-Next shape (HV=12, V=128) BV=32 gives 48 programs, so
+# BV=16 (96 programs) is 27-38% faster on chunk_delta_h and bit-exact.  The
+# autotuner picks BV=16/num_warps=4 at T=64 (the production warm-up) as well
+# as at T=2048/8192, so it needs no warm-up change.
+_CHUNK_DELTA_H_BV = [16, 32, 64] if torch.version.hip else [32, 64]
 
 
 @triton.heuristics(
@@ -36,7 +42,7 @@ _CHUNK_DELTA_H_NUM_STAGES = [2, 3] if torch.version.hip else [2, 3, 4]
         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4]
         for num_stages in _CHUNK_DELTA_H_NUM_STAGES
-        for BV in [32, 64]
+        for BV in _CHUNK_DELTA_H_BV
     ],
     key=["H", "K", "V", "BT"],
     use_cuda_graph=use_cuda_graph,

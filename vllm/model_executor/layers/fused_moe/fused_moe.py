@@ -790,6 +790,33 @@ def cast_to_fp16_sat(src: torch.Tensor) -> torch.Tensor:
 
 # NOTE(zyongye): we can remove all the wna16 kernel
 # once we drop off sm75 support
+def _gfx908_gemm_config(
+    config: dict[str, Any], gemm: int | None, size_k: int
+) -> dict[str, Any]:
+    """Resolve a tuned-config entry for one of the two MoE GEMMs.
+
+    A gfx908 config entry may carry ``"gemm1"`` / ``"gemm2"`` sub-dicts with
+    per-GEMM overrides for the gate|up (K=hidden) and down (K=intermediate)
+    launches -- any key except BLOCK_SIZE_M, which is the moe_align_block_size
+    padding unit shared by both.  The sub-dicts are always stripped (the
+    launcher forwards ``**config`` to the Triton kernel); ``gemm=None`` (the
+    functional ``fused_experts`` path) uses the base entry unchanged, so an
+    entry with sub-dicts behaves exactly like today there.  BLOCK_SIZE_K is
+    clamped to a divisor of K because the kernel's B load is unmasked along K
+    (the down GEMM's K=160 only admits 32).
+    """
+    base = {k: v for k, v in config.items() if k not in ("gemm1", "gemm2")}
+    sub = config.get(f"gemm{gemm}") if gemm in (1, 2) else None
+    if sub:
+        base.update({k: v for k, v in sub.items() if k != "BLOCK_SIZE_M"})
+    bk = base.get("BLOCK_SIZE_K")
+    if bk and size_k % bk != 0:
+        while bk > 16 and size_k % bk != 0:
+            bk //= 2
+        base["BLOCK_SIZE_K"] = bk
+    return base
+
+
 def invoke_fused_moe_wna16_triton_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -807,10 +834,14 @@ def invoke_fused_moe_wna16_triton_kernel(
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
     block_shape: list[int] | None,
+    gemm: int | None = None,
 ):
     assert B_scale is not None and B_scale.ndim == 3
     assert B_zp is None or B_zp.ndim == 3
     assert block_shape is not None and block_shape[0] == 0
+
+    # gfx908: per-GEMM tuned overrides (see _gfx908_gemm_config).
+    config = _gfx908_gemm_config(config, gemm, A.size(1))
 
     M = A.size(0)
     num_tokens = M * top_k
