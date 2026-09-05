@@ -51,13 +51,21 @@ from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 
-W4A8_MAX_TOKENS = 8
+# batch_research 2026-09-05: the W4A8 GEMV path beats the Triton gptq_awq MoE at every M measured up to 256
+# (agents/batch_research/REPORT.md); above MOE_MR_MIN_M rows the expert-deduplicated multi-row kernels run.
+W4A8_MAX_TOKENS = int(os.environ.get("VLLM_GFX908_W4A8_MAX_M", "256"))
+DENSE_W4A8_MAX_TOKENS = 8            # dense projections keep the per-row GEMV only at decode M
+MOE_MR_MIN_M = int(os.environ.get("VLLM_GFX908_MOE_MR_MIN_M", "24"))
+# multi-row kernel configuration (measured best, M = 48..256): LDS-staged slab, 8 waves/block, 8 staged rows,
+# occupancy-forced (pf=4), 960 persistent blocks; rowlane 4 waves/block, 960 blocks; sort chunk 16 rows.
+MR_CFG = dict(rc=16, wpb=8, rcs=8, pf1=4, blocks=960, wpb2=4, blocks2=960, pf2=0)
 GS = 32
 _SLAB_K = (2560, 1536)          # K values instantiated for the slab kernels (SLAB_CASE in the .hip)
 _ROWLANE_K = 160
 _CSRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")
 _CSRC = os.path.join(_CSRC_DIR, "gfx908_w4a8.hip")
 _CSRC_F16 = os.path.join(_CSRC_DIR, "gfx908_w4f16.hip")
+_CSRC_MR = os.path.join(_CSRC_DIR, "gfx908_moe_mr.hip")
 _MODES = ("int8", "f16")
 _FLAG: bool | None = None
 _MODE: str | None = None
@@ -88,6 +96,17 @@ def _load(name: str, src: str, subdir: str):
 def _ext():
     """int8-activation (W4A8) extension."""
     return _load("gfx908_w4a8_ext", _CSRC, "w4a8")
+
+
+@functools.cache
+def _ext_mr():
+    """expert-deduplicated multi-row kernels (int8 mode only)."""
+    return _load("gfx908_moe_mr_ext", _CSRC_MR, "moe_mr")
+
+
+def moe_mr_enabled() -> bool:
+    """VLLM_GFX908_MOE_MR (default 1): multi-row flow for M > MOE_MR_MIN_M (int8 mode only)."""
+    return os.environ.get("VLLM_GFX908_MOE_MR", "1") == "1" and w4a8_mode() == "int8"
 
 
 @functools.cache
@@ -673,6 +692,148 @@ def moe_w4a8(
     return output
 
 
+# --------------------------------------------------------------------------- #
+# expert-deduplicated ("multi-row") flow for batched decode, agents/batch_research (2026-09-05).
+# Same arithmetic as moe_w4a8 (bit-identical output), but the pairs are sorted by expert and one
+# block streams an expert's weight tile once for all of its rows (csrc/gfx908_moe_mr.hip):
+#   expert_sort -> slab_mr_lds (gate_up) -> silu_mul_quant -> rowlane_mr (down) -> weighted-sum reduce.
+# The work lists are data dependent but the grids are persistent (fixed block count), so the
+# launch sequence is cudagraph-stable.
+# --------------------------------------------------------------------------- #
+_MR_BUFS: dict[tuple, tuple] = {}
+
+
+def _mr_bufs(P: int, E: int, rc: int, device):
+    key = (P, E, rc, str(device))
+    t = _MR_BUFS.get(key)
+    if t is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        t = tuple(torch.empty(P, dtype=torch.int32, device=device) for _ in range(5)) + (
+            torch.empty(P + (E + 2) * rc, dtype=torch.int32, device=device),   # wl_tok
+            torch.empty(E + 1, dtype=torch.int32, device=device),              # uniq_e
+            torch.zeros(4, dtype=torch.int32, device=device),                  # counters
+        )
+        _MR_BUFS[key] = t
+    return t
+
+
+def _mr_gemvs(ext, w1_i, w1_scale, w2_i, w2_scale, x8, xs, xsum, row_tok, row_exp, E, has_extra,
+              extra1, extra2, dev, cfg=None):
+    """sort + gate_up + silu*mul + down for P rows -> fp32 [P, K] partials, or None during capture
+    before the work-list buffers exist."""
+    cfg = cfg or MR_CFG
+    P = row_exp.numel()
+    N1 = w1_i.shape[1]
+    K = w2_i.shape[1]
+    bufs = _mr_bufs(P, E, cfg["rc"], dev)
+    if bufs is None:
+        return None
+    order, otok, wl_e, wl_r0, wl_cnt, wl_tok, uniq, counters = bufs
+    ext.expert_sort(row_exp, row_tok, E, has_extra, cfg["rc"], order, otok, wl_e, wl_r0, wl_cnt,
+                    wl_tok, uniq, counters)
+    wx1, sx1 = _extra_pair(extra1, dev)
+    wx2, sx2 = _extra_pair(extra2, dev)
+    part1 = torch.empty((P, N1), dtype=torch.float32, device=dev)
+    ext.gemv_slab_mr_lds(w1_i, w1_scale, x8, xs, xsum, order, otok, wl_e, wl_r0, wl_cnt, counters,
+                         part1, cfg["wpb"], cfg["rcs"], cfg["blocks"], wx1, sx1, cfg["pf1"], cfg["rc"])
+    i8, isc, isum = silu_mul_quant(part1)
+    part2 = torch.empty((P, K), dtype=torch.float32, device=dev)
+    # the down projection's activation is per pair (row_self == arange): its token table is `order`
+    ext.gemv_rowlane_mr(w2_i, w2_scale, i8, isc, isum, order, order, wl_e, wl_r0, wl_cnt, counters,
+                        part2, cfg["wpb2"], cfg["blocks2"], wx2, sx2, cfg["pf2"])
+    return part2
+
+
+def moe_w4a8_mr(
+    output, hidden_states, w1_i, w2_i, w1_scale, w2_scale, topk_weights,
+    row_token, row_self, row_expert, mul_routed_weight: bool, shared=None,
+):
+    """moe_w4a8 with expert deduplication (int8 mode). Returns output or None (caller falls back)."""
+    from vllm.model_executor.layers.fused_moe.gfx908_moe_hip import _moe_reduce_weighted_sum_kernel
+
+    if not moe_mr_enabled():
+        return None
+    M, K = hidden_states.shape
+    P = row_expert.numel()
+    topk = P // M
+    E = w1_i.shape[0]
+    N1 = w1_i.shape[1]
+    K2 = N1 // 2
+    if K not in _SLAB_K or K2 != _ROWLANE_K or N1 % 32 != 0:   # slab: (N1/4) % 8 == 0 (8 waves/block)
+        return None
+    ext = _ext_mr()
+    dev = hidden_states.device
+    extra1 = extra2 = None
+    wsum = topk_weights.reshape(-1).to(torch.float32)
+    rows = topk
+    if shared is not None:
+        if not (mul_routed_weight and shared_pack_applies(shared, E, N1, K, K2)):
+            return None
+        fr = _fused_rows(M, topk, dev)
+        if fr is None:
+            return None
+        row_token, row_self, row_expert_f, wcomb = fr
+        ids = row_expert.view(M, topk)
+        tkw = topk_weights.reshape(M, topk).to(torch.float32).contiguous()
+        w1x, s1x, w2x, s2x, wg = shared
+        extra1, extra2 = (w1x, s1x), (w2x, s2x)
+        x8, xs, xsum = quant_q8_gate(hidden_states, wg, ids, tkw, row_expert_f, wcomb, E)
+        row_expert = row_expert_f
+        wsum = wcomb.view(-1)
+        rows = topk + 1
+    else:
+        x8, xs, xsum = quant_q8(hidden_states)
+    part2 = _mr_gemvs(ext, w1_i, w1_scale, w2_i, w2_scale, x8, xs, xsum, row_token, row_expert, E,
+                      shared is not None, extra1, extra2, dev)
+    if part2 is None:
+        return None
+    rb2 = 256
+    _moe_reduce_weighted_sum_kernel[(triton.cdiv(K, rb2), M)](
+        part2, wsum, output, K,
+        0, part2.stride(0), output.stride(0),
+        TOPK=rows, SPLIT_K=1, BLOCK=rb2, MUL_W=mul_routed_weight,
+    )
+    return output
+
+
+_DENSE_ROWS: dict[tuple, tuple] = {}
+
+
+def shared_expert_mr(x, pack):
+    """The un-fused shared expert for M > DENSE_W4A8_MAX_TOKENS through the multi-row kernels
+    (the expert is one item of rc rows at a time instead of being streamed once per token)."""
+    from vllm.model_executor.layers.gfx908_shared_expert import _reduce_gate_kernel
+
+    w1x, s1x, w2x, s2x, wg = pack
+    M, K = x.shape
+    H = w2x.shape[1]
+    N1 = w1x.shape[1]
+    if K not in _SLAB_K or N1 // 2 != _ROWLANE_K or N1 % 32 != 0 or H % 64 != 0:
+        return None
+    key = (M, str(x.device))
+    t = _DENSE_ROWS.get(key)
+    if t is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        # E = 0 routed experts: every row is the "extra" expert #0
+        t = (torch.arange(M, device=x.device, dtype=torch.int32), torch.zeros(M, device=x.device, dtype=torch.int32))
+        _DENSE_ROWS[key] = t
+    rt, re = t
+    x8, xs, xsum = quant_q8(x)
+    part2 = _mr_gemvs(_ext_mr(), w1x, s1x, w2x, s2x, x8, xs, xsum, rt, re, 0, True, (w1x, s1x), (w2x, s2x),
+                      x.device)
+    if part2 is None:
+        return None
+    out = torch.empty((M, H), dtype=x.dtype, device=x.device)
+    rb2 = 1024
+    _reduce_gate_kernel[(triton.cdiv(H, rb2), M)](
+        part2, x, wg, out, H, K, 0, part2.stride(0), x.stride(0), out.stride(0),
+        SPLIT_K=1, BLOCK=rb2, BLOCK_K=1024,
+    )
+    return out
+
+
 def shared_pack(wq1, ws1, wq2, ws2, wg):
     """Repack the shared expert's dense [K, N/8] weights into the routed [1, N, K/8] layout (cached
     by data_ptr) and return (w1, s1, w2, s2, w_gate), or None (unsupported shape / graph capture
@@ -734,6 +895,10 @@ def shared_expert_w4a8(x, wq1, ws1, wq2, ws2, wg):
     pack = shared_pack(wq1, ws1, wq2, ws2, wg)
     if pack is None:
         return None
+    if M > DENSE_W4A8_MAX_TOKENS:
+        # per-row GEMVs would stream the expert once per token: use the multi-row kernels
+        out = shared_expert_mr(x, pack) if moe_mr_enabled() else None
+        return out
     return shared_expert_from_pack(x, pack)
 
 
@@ -824,7 +989,7 @@ def dense_w4a8_gemv(a, b_q, scales):
 
     M, K = a.shape
     N = b_q.shape[1] * 8
-    if M > W4A8_MAX_TOKENS or a.dtype != torch.bfloat16 or K not in _SLAB_K or N % 4 != 0:
+    if M > DENSE_W4A8_MAX_TOKENS or a.dtype != torch.bfloat16 or K not in _SLAB_K or N % 4 != 0:
         return None
     p = dense_weight_nk(b_q, scales)
     if p is None:

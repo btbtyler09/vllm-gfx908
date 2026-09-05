@@ -22,7 +22,10 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.gfx908_w4a8 import (
+    MOE_MR_MIN_M,
+    moe_mr_enabled,
     moe_w4a8,
+    moe_w4a8_mr,
     moe_w4a8_applies,
     shared_arm,
     shared_expert_from_pack,
@@ -33,7 +36,7 @@ from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 
-MOE_HIP_MAX_TOKENS = 8
+MOE_HIP_MAX_TOKENS = int(os.environ.get("VLLM_GFX908_MOE_HIP_MAX_M", "256"))  # batch_research 2026-09-05
 _LAYOUT_LOGGED = False
 _CSRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc", "gfx908_w4gemv.hip")
 
@@ -190,6 +193,19 @@ def gfx908_moe_hip(
 
     if w4a8_enabled() and moe_w4a8_applies(K, N1, group_size, hidden_states.dtype):
         # VLLM_GFX908_W4A8=1: int8-activation dot4 GEMVs, no split-K (gfx908_w4a8.py)
+        # VLLM_GFX908_MOE_MR=1 (default): above MOE_MR_MIN_M rows use the expert-deduplicated flow,
+        # which streams each active expert's slice once instead of once per (token, expert) pair.
+        if moe_mr_enabled() and M > MOE_MR_MIN_M:
+            out = moe_w4a8_mr(
+                output, hidden_states, w1_i, w2_i, w1_scale, w2_scale, topk_weights,
+                row_token, row_self, row_expert, mul_routed_weight, shared=shared,
+            )
+            if out is not None:
+                if shared is None:
+                    shared_arm(w1.shape[0], N1, K, K2, mul_routed_weight)
+                    if pending is not None:
+                        out += shared_expert_from_pack(pending[0], pending[1])
+                return out
         out = moe_w4a8(
             output, hidden_states, w1_i, w2_i, w1_scale, w2_scale, topk_weights,
             row_token, row_self, row_expert, mul_routed_weight, shared=shared,

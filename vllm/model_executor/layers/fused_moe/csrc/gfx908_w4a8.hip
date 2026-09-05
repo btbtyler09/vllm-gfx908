@@ -531,7 +531,15 @@ __global__ void __launch_bounds__(256) w4a8_slab_prep_gate_kernel(
     if (l == LPR - 1) out[(long)p * N + n] = 0.f;
     return;
   }
-  const float acc = w4a8_slab_prep_body_hoist<K, LPR>(wbase, sbase, x, t, n, l, xl, xsl, xsuml);
+  // batch_research 2026-09-05: the hoisted body needs K/32 % LPR == 0 (two lanes per group); the K = 160
+  // instantiation (G = 5) kept in SLABPG_CASE tripped its static_assert and broke the whole extension build,
+  // so fall back to the plain body where the hoisted one is not applicable (same value either way).
+  float acc;
+  if constexpr (G % LPR == 0 && 2 * G <= 256) {
+    acc = w4a8_slab_prep_body_hoist<K, LPR>(wbase, sbase, x, t, n, l, xl, xsl, xsuml);
+  } else {
+    acc = w4a8_slab_prep_body<K, LPR>(wbase, sbase, x, t, n, l, xl, xsl, xsuml);
+  }
   if (l == LPR - 1) out[(long)p * N + n] = acc;
 }
 
