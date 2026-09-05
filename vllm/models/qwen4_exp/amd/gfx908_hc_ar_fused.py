@@ -231,6 +231,13 @@ def _hc_combine_norm_ar_impl(
     p = _take_pending(block)
     ca, par = (None, None) if p is None else _push_ar()
     if p is None or par is None or hc != 4 or residual.stride(1) != 1 or inj.stride(1) != 1:
+        if p is not None and par is not None:
+            # a pending push whose fused consumer does not apply: `block` is only a placeholder,
+            # so the slot must still be consumed into it (and re-armed) before the stock combine
+            _ext().consume(block.view(p[1], p[2]), par.ptrs[par.rank]
+                           + p[0] * par.world_size * par.slot_elems * 2,
+                           par.slot_elems, par.stats, par.max_spin, p[0], par.spin_stats)
+            STATS["consume_stock"] += 1
         STATS["stock"] += 1
         return _hc_combine_norm(residual, block, inj, w, eps, hc)
     site, T, N, _ = p
@@ -265,6 +272,13 @@ def _hc_combine_ar_impl(
     p = _take_pending(block)
     ca, par = (None, None) if p is None else _push_ar()
     if p is None or par is None or hc != 4 or residual.stride(1) != 1 or inj.stride(1) != 1:
+        if p is not None and par is not None:
+            # a pending push whose fused consumer does not apply: `block` is only a placeholder,
+            # so the slot must still be consumed into it (and re-armed) before the stock combine
+            _ext().consume(block.view(p[1], p[2]), par.ptrs[par.rank]
+                           + p[0] * par.world_size * par.slot_elems * 2,
+                           par.slot_elems, par.stats, par.max_spin, p[0], par.spin_stats)
+            STATS["consume_stock"] += 1
         STATS["stock"] += 1
         return _hc_combine(residual, block, inj, hc)
     site, T, N, _ = p
