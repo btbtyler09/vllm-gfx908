@@ -280,6 +280,105 @@ __device__ __forceinline__ void q8_group(const uint4* __restrict__ src, uint32_t
 }
 
 // ---------------------------------------------------------------------------------------------
+// isa_research (2026-09-05): the gate-fold slab's critical path in front of its staging barrier is
+// three dependent scalar round trips + one 32-element Q8_1 chain on 80 of 256 lanes, and only then
+// do the weight loads issue.  Three bit-exact changes take the M=1 kernel from 9.35 to 8.88 us cold
+// (-5%, agents/isa_research/bench_variants2.log; M=4 25.1 -> 22.7):
+//   * SPLITQ: two lanes per group.  max and the int sum are order-free, so exchanging them with one
+//     DPP quad_perm swap each gives the same d / inv / q / dsum as q8_group (151 VALU on the critical
+//     path instead of 249, 35 VGPR instead of 47);
+//   * HOIST: with the staging that cheap, the weight/scale loads are issued BEFORE the staging and
+//     stay in flight across the barrier (59 VGPR, 4 waves/SIMD -- measured better than 5 waves without);
+//   * the pair's token is p / (topk+1) (the layout invariant the kernel already relies on for `slot`),
+//     the expert id is one s_load_dword, and all scalar kernargs are fetched in one batch at entry.
+__device__ __forceinline__ float w4a8_swap1_f(float v) { return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0xB1, 0xf, 0xf, true)); }
+__device__ __forceinline__ int w4a8_swap1_i(int v) { return __builtin_amdgcn_mov_dpp(v, 0xB1, 0xf, 0xf, true); }
+
+// Half of one Q8_1 group (16 bf16) on one lane; the partner lane (xor 1) holds the other half.
+__device__ __forceinline__ void q8_group_half(const uint4* __restrict__ src2, uint32_t o[4], float& d,
+                                              float& dsum) {
+  uint4 v[2];
+  v[0] = src2[0]; v[1] = src2[1];
+  float amax = 0.f;
+#pragma unroll
+  for (int b = 0; b < 2; ++b) {
+    const uint32_t dw[4] = {v[b].x, v[b].y, v[b].z, v[b].w};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      amax = fmaxf(amax, fabsf(__uint_as_float(dw[j] << 16)));
+      amax = fmaxf(amax, fabsf(__uint_as_float(dw[j] & 0xFFFF0000u)));
+    }
+  }
+  amax = fmaxf(amax, w4a8_swap1_f(amax));
+  d = amax / 127.f;
+  const float inv = amax > 0.f ? 127.f / amax : 0.f;
+  int qsum = 0;
+#pragma unroll
+  for (int b = 0; b < 2; ++b) {
+    const uint32_t dw[4] = {v[b].x, v[b].y, v[b].z, v[b].w};
+    int q[8];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      q[2 * j] = __float2int_rn(__uint_as_float(dw[j] << 16) * inv);
+      q[2 * j + 1] = __float2int_rn(__uint_as_float(dw[j] & 0xFFFF0000u) * inv);
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) qsum += q[j];
+    o[2 * b] = (q[0] & 0xFF) | ((q[2] & 0xFF) << 8) | ((q[4] & 0xFF) << 16) | ((q[6] & 0xFF) << 24);
+    o[2 * b + 1] = (q[1] & 0xFF) | ((q[3] & 0xFF) << 8) | ((q[5] & 0xFF) << 16) | ((q[7] & 0xFF) << 24);
+  }
+  qsum += w4a8_swap1_i(qsum);
+  dsum = d * (float)qsum;
+}
+
+// The gate-fold slab body: weight loads hoisted, two-lane staging.  Same value as w4a8_slab_prep_body.
+template <int K, int LPR>
+__device__ __forceinline__ float w4a8_slab_prep_body_hoist(
+    const uint32_t* __restrict__ wbase, const uint16_t* __restrict__ sbase,
+    const uint32_t* __restrict__ x, int tok, int n, int l,
+    uint32_t* __restrict__ xl, float* __restrict__ xsl, float* __restrict__ xsuml) {
+  constexpr int G = K / 32, GPL = (G + LPR - 1) / LPR;
+  static_assert(G % LPR == 0 && 2 * G <= 256, "hoisted gate-fold body: K/32 % LPR == 0, two lanes per group");
+  const uint4* xg = reinterpret_cast<const uint4*>(x) + (long)tok * (K / 8);
+  const uint16_t* sp = sbase + (long)n * G + l;
+  const uint4* wp4 = reinterpret_cast<const uint4*>(wbase + (long)n * (K / 8)) + l;
+  uint4 q[GPL];
+  uint32_t sc[GPL];
+#pragma unroll
+  for (int j = 0; j < GPL; ++j) { q[j] = wp4[LPR * j]; sc[j] = sp[LPR * j]; }
+  __builtin_amdgcn_sched_barrier(0);   // weight loads in flight across the staging + barrier
+  {
+    const int g = threadIdx.x >> 1, h = threadIdx.x & 1;
+    if (g < G) {
+      uint32_t o[4];
+      float d, dsum;
+      q8_group_half(xg + (long)g * 4 + 2 * h, o, d, dsum);
+      reinterpret_cast<uint4*>(xl)[2 * g + h] = make_uint4(o[0], o[1], o[2], o[3]);
+      if (h == 0) { xsl[g] = d; xsuml[g] = dsum; }
+    }
+  }
+  __syncthreads();
+  float acc = 0.f;
+#pragma unroll
+  for (int j = 0; j < GPL; ++j) {
+    const int g = l + LPR * j;
+    const uint4 xa = reinterpret_cast<const uint4*>(xl)[2 * g];
+    const uint4 xb = reinterpret_cast<const uint4*>(xl)[2 * g + 1];
+    const uint32_t qw[4] = {q[j].x, q[j].y, q[j].z, q[j].w};
+    const int xd[8] = {(int)xa.x, (int)xa.y, (int)xa.z, (int)xa.w,
+                       (int)xb.x, (int)xb.y, (int)xb.z, (int)xb.w};
+    int sumi = 0;
+#pragma unroll
+    for (int wd = 0; wd < 4; ++wd) {
+      sumi = dot4(qw[wd] & 0x0F0F0F0Fu, xd[2 * wd], sumi);
+      sumi = dot4((qw[wd] >> 4) & 0x0F0F0F0Fu, xd[2 * wd + 1], sumi);
+    }
+    acc += bf2f(sc[j]) * (xsl[g] * (float)sumi - 8.f * xsuml[g]);
+  }
+  return reduce_lpr<LPR>(acc);
+}
+
+// ---------------------------------------------------------------------------------------------
 // D1 with the ACTIVATION PREP FOLDED IN (VLLM_GFX908_MOE_PREP_FOLD=1).
 //
 // Same geometry and same math as w4a8_slab_kernel, but the block reads the pair's activation as
@@ -402,6 +501,11 @@ __global__ void __launch_bounds__(256) w4a8_slab_prep_gate_kernel(
     int N, int P, int E, long stride_we, long stride_se,
     const uint32_t* __restrict__ w_extra, const uint16_t* __restrict__ s_extra,
     int nbase, GateArgs ga) {
+  // kernarg prefetch: every scalar argument the slab path touches is forced into SGPRs here, so the
+  // compiler emits the kernarg s_loads in one batch at entry instead of lazily across the branches.
+  asm volatile("" :: "s"(w), "s"(s), "s"(x), "s"(out), "s"(N), "s"(P), "s"(E), "s"(stride_we), "s"(stride_se),
+               "s"(w_extra), "s"(s_extra), "s"(nbase), "s"(ga.topk_ids), "s"(ga.topk), "s"(ga.x2), "s"(ga.wg2),
+               "s"(ga.row_exp), "s"(ga.wcomb), "s"(ga.khalf), "s"(ga.topk_w));
   if ((int)blockIdx.x >= nbase) { gate_row(ga, (int)blockIdx.x - nbase); return; }
   constexpr int ROWS = 64 / LPR, G = K / 32;
   __shared__ __align__(16) uint32_t xl[K / 4];
@@ -411,16 +515,23 @@ __global__ void __launch_bounds__(256) w4a8_slab_prep_gate_kernel(
   const int tile0 = __builtin_amdgcn_readfirstlane(blockIdx.x * 4);
   const int p = tile0 / tiles_per_p;
   const int n = ((tile0 + wv) % tiles_per_p) * ROWS + r;
-  const int t = row_tok[p];
-  const int slot = p - t * (ga.topk + 1);
-  const int e = (slot == ga.topk) ? E : ga.topk_ids[t * ga.topk + slot];
+  // row p = m*(topk+1) + slot (the layout the shared-as-expert flow builds and this kernel already
+  // relies on for `slot`), so the token needs no row_tok load, and the expert id is one scalar load.
+  const int stride = ga.topk + 1;
+  const int t = p / stride;
+  const int slot = p - t * stride;
+  const int* tp = ga.topk_ids + __builtin_amdgcn_readfirstlane(t * ga.topk + slot);
+  int ev;
+  asm volatile("s_load_dword %0, %1, 0x0\n\ts_waitcnt lgkmcnt(0)" : "=s"(ev) : "s"(tp) : "memory");
+  const int e = (slot == ga.topk) ? E : ev;
+  (void)row_tok;
   const uint32_t* wbase;
   const uint16_t* sbase;
   if (!pick_expert(e, E, w, s, stride_we, stride_se, w_extra, s_extra, wbase, sbase)) {
     if (l == LPR - 1) out[(long)p * N + n] = 0.f;
     return;
   }
-  const float acc = w4a8_slab_prep_body<K, LPR>(wbase, sbase, x, t, n, l, xl, xsl, xsuml);
+  const float acc = w4a8_slab_prep_body_hoist<K, LPR>(wbase, sbase, x, t, n, l, xl, xsl, xsuml);
   if (l == LPR - 1) out[(long)p * N + n] = acc;
 }
 
