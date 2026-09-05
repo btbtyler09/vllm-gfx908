@@ -521,3 +521,17 @@ at int8 experts (0.7% RTN error, acceptance-safe), -862 MB at W4 gs32 (9% error,
 acceptance-gated). Non-target time in the n=2 step: 4.2 ms = sampler
 sort/cumsum 1.64 + 3x lm_head 0.57 + glue 0.39 + 7 NCCL all-gathers 0.38
 (28-64 us each, 4-8x the custom AR) + draft dense 0.35 + draft MoE 0.16.
+
+isa_research (2026-09-05): the hot kernels are clean at the instruction level
+(dwordx4 streams, loads batched before the first s_waitcnt, DPP reductions,
+v_dot4c with SGPR operands, no spills). Non-applicable on gfx908: dot8 int4
+(needs int4 activations; dot phase ~1% of the kernel), buffer_load...lds
+(dword only), SGPR kernarg preload (dropped), code-object size (0 in
+isolation). A graph node is 1.44 us start-to-start (0.5-0.6 us CP gap +
+0.8-1.0 us wave-visible empty kernel) plus 0.34 us/node of replay overhead;
+each extra kernarg s_load miss +0.32 us; 1024-thread workgroups ~2x per WG;
+independent graph branches overlap (-0.35 us/node); VGPRs, LDS, waves_per_eu,
+code size: no effect. One bit-exact win integrated: the gate_up slab prologue
+(two-lane Q8_1 staging, hoisted loads, s_load expert id) 9.35 -> 8.88 us at
+M=1 (~-23 us/step). Remaining levers at the launch level: fewer nodes, or
+fork/join of independent per-layer launches inside the captured graph.
