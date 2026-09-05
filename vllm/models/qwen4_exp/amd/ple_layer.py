@@ -35,7 +35,7 @@ from ..common.ple import PLEVocabParallelEmbedding
 # The mmap PLE table (VLLM_PLE_MMAP) is platform-neutral (np.memmap + thread
 # pool + plain H2D copies); the module lives in the nvidia tree upstream.
 from ..nvidia import ple_mmap
-from vllm.models.qwen4_exp.amd import gfx908_ple_zc
+from vllm.models.qwen4_exp.amd import gfx908_ple_glue, gfx908_ple_zc
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -1285,6 +1285,22 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         embeddings = self.ple_embedding(input_ids, query_start_loc, ngram_context)
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
+        # NOTE: the layer returns hidden_states + PLE(...); the decoder layer no
+        # longer re-adds the residual (it is folded into the fused kernel).
+        if gfx908_ple_glue.ple_glue_enabled():
+            output = torch.empty_like(hidden_states)
+            torch.ops.vllm.gfx908_ple_glue_body(
+                hidden_states, key, value, output, self.prefix
+            )
+            return output
+        return self.ple_body_eager(hidden_states, key, value)
+
+    def ple_body_eager(
+        self,
+        hidden_states: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
         token_count = hidden_states.shape[0]
         key = key.reshape(token_count, self.hc_count, self.hidden_size)
         query = hidden_states.reshape(token_count, self.hc_count, self.hidden_size)
@@ -1300,7 +1316,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             conv_output,
             self.prefix,
         )
-        return gated_value.flatten(-2) + conv_output
+        return hidden_states + (gated_value.flatten(-2) + conv_output)
 
 
 def qwen4_exp_amd_ple_ngram_embedding(

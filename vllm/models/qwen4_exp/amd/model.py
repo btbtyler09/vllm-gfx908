@@ -323,7 +323,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
             if input_ids is None or query_start_loc is None or ngram_context is None:
                 raise RuntimeError("PLE inputs were not prepared")
-            hidden_states = hidden_states + self.ple(
+            # Qwen4ExpPLELayer.forward returns hidden_states + PLE(...) so that
+            # the gfx908 fused glue can fold the residual add into its kernel.
+            hidden_states = self.ple(
                 hidden_states,
                 input_ids,
                 query_start_loc,
