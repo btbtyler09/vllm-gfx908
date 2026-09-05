@@ -756,11 +756,14 @@ def gfx908_moe_fp16_safe() -> bool:
     return os.environ.get("VLLM_GFX908_MOE_FP16_SAFE", "1") == "1"
 
 
-_TL_STORE_DTYPE = {
-    torch.bfloat16: tl.bfloat16,
-    torch.float16: tl.float16,
-    torch.float32: tl.float32,
-}
+def _tl_store_dtype(dtype: torch.dtype):
+    # Resolved lazily: at image-build time vLLM's triton placeholder has no dtype attributes,
+    # and a module-level dict broke every fused_moe import in the prebuild (2026-09-05).
+    return {
+        torch.bfloat16: tl.bfloat16,
+        torch.float16: tl.float16,
+        torch.float32: tl.float32,
+    }[dtype]
 
 
 @triton.jit
@@ -850,7 +853,11 @@ def invoke_fused_moe_wna16_triton_kernel(
     # MoE (gfx908: 184.6 vs 92.3 TFLOP/s) can still hand a bf16 tensor to
     # moe_sum.  For every existing caller C.dtype == the compute dtype, so this
     # is a no-op there.
-    out_type = _TL_STORE_DTYPE.get(C.dtype, compute_type)
+    out_type = (
+        _tl_store_dtype(C.dtype)
+        if C.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        else compute_type
+    )
 
     EM = sorted_token_ids.size(0)
     if A.size(0) < config["BLOCK_SIZE_M"]:
