@@ -654,7 +654,7 @@ Pure-image validation, TP4, util 0.90:
 | long-context determinism (4 x ~6K) | 4/4 | 4/4 |
 | TTFT 3.2K / 12.8K (probe, warm) | 519-530 ms / 1.66 s | 558 ms / 1.81 s |
 | PPL (64 windows) | 3.1488 | 3.1488 |
-| GSM8K full (1319) / batched c=32 (500) | 1276/1319 = 0.9674 / 485/500 = 0.9700 | (rc5: 490/500 at c=8) |
+| GSM8K full (1319) / batched c=32 (500) | 1276/1319 = 0.9674 / 485/500 = 0.9700 | 1278/1319 = 0.9689 / 482/500 = 0.9640 (same protocol) |
 
 The c=1 parity shift vs rc4 is the M=1 swizzled W8 GEMV (within 1 bf16 ulp
 on 0.02-0.04% of outputs, not bit-exact); c=16 is at the batched-path floor.
@@ -731,3 +731,8 @@ rc7 (push AR after its parity + soak gate). Expected rc7 c=1: ~9.5 ms/step,
 ~104-105 tok/s. Note: the r11 push-AR arm was invalid (serve.sh's env list
 overrode the arm's --env; harness fixed), so its evidence is the ar_ship
 window's two boots + base.
+
+GSM8K reference on the pure rc5 image with the same protocol (2026-09-05):
+full set 1278/1319 (rc6 1276), batched c=32 subset 482/500 (rc6 485). The
+485-vs-490 gap seen on the MFMA gate was subset/ordering noise; the rc6
+numerics (MFMA + swizzled GEMV + fp16 experts + multi-row MoE) are neutral.
