@@ -510,3 +510,14 @@ costs more per token than at 48, i.e. the batched MoE kernel (padding, gather,
 bf16-rate MFMA) is the limit above c~32, not residency. The lever for those
 tiers is the mid-M MoE kernel (batch_research), not memory; the memory work
 matters for long-context residency (16K c=4 and beyond).
+
+mtp_draft (2026-09-05): the draft layer is one full QSA+MoE decoder layer in
+bf16 (4.97 GiB of mtp.* tensors, 1.2 GB/rank of experts resident), but a draft
+pass touches only ~297 MB/rank (25 distinct experts, int8 lm_head shared with
+the target) and both draft passes are FULL-cudagraph replays already at their
+byte/launch floor (~1 ms). Quantizing the draft saves ~0.2 ms/step (1%);
+`VLLM_GFX908_MTP_QUANT=w8|w8moe|w4` (patch, off) is a VRAM lever: -562 MB/rank
+at int8 experts (0.7% RTN error, acceptance-safe), -862 MB at W4 gs32 (9% error,
+acceptance-gated). Non-target time in the n=2 step: 4.2 ms = sampler
+sort/cumsum 1.64 + 3x lm_head 0.57 + glue 0.39 + 7 NCCL all-gathers 0.38
+(28-64 us each, 4-8x the custom AR) + draft dense 0.35 + draft MoE 0.16.
