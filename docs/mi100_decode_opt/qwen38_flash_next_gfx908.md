@@ -774,3 +774,45 @@ every spec depth), so the per-row grid stays; 26 -> 8 launches per QSA layer
 at M=3, bit-exact (218 checks incl. six-step verify emulations), expected
 -0.5..-0.7 ms per n=2 verify step. Spec arms (n=2, n=3 at util 0.92) queued
 after rc8.
+
+## Round 12/13 (2026-09-05/06): adjacent-op fusions after the step map
+
+Round-12 arms (logits path captured in the decode graph, HC-AR consumer
+fused into the HC combine, GDN in_proj merge, bf16 W4A8 epilogue) and the
+rc8 decision run under the three-boot protocol (`chain_r12/r13/rc8.sh`);
+results land in the rc8 release note below. Round-13 fusion candidates were
+researched by three agents while the arms ran (GPU2/GPU3, <=1.5 GB, <2 min).
+
+### HC RMSNorm into the mix_down prologue: bit-exact, and a regression (do not ship)
+
+Agent hc_norm_prologue (patch `VLLM_GFX908_HC_NORM_PROLOGUE`, default off,
+kept out of the tree). Recomputing HC combine + RMSNorm inside the mix_down
+W8 GEMV prologue removes the `hc_combine_norm` launch (3 -> 2 per module)
+but costs MORE than the launch it deletes: the GEMV is a 120-workgroup
+kernel where every workgroup stages the whole [M, 10240] activation, so the
+combine+norm runs 120x (10240 elements per CU) instead of once on a 4-WG
+grid (2560 elements per CU). Ablation: VALU-bound (dropping the 20 KB/WG
+affine stream buys 0.2 us, dropping 40 KB of stores 0.0 us, dropping four
+int32 divisions per slot 1.5-6 us). Prologue adds 6.6-8.2 us; the kernel it
+deletes is 4.2 us including its launch.
+
+| M | stock (combine_norm + GEMV), warm/rot/evict us | fold | delta/module |
+|---|---|---|---|
+| 1 | 10.89 / 12.33 / 14.16 | 13.60 / 14.82 / 16.24 | +2.1..+2.7 |
+| 2 | 13.59 / 14.77 / 15.86 | 21.38 / 23.10 / 24.85 | +7.8..+9.0 |
+| 3 | 15.78 / 17.73 / 17.45 | 28.13 / 34.74 / 29.53 | +12..+17 |
+
+Over 96 modules: +0.20..+0.26 ms/step at M=1. Bit-exact was achieved
+(reduction partition copied from hc_gdn_glue; 16 modes x 3 seeds x M=1..3,
+graph == eager), so the result is structural, not an implementation defect.
+Composing it with the push-AR consumer fold is not additive (both delete the
+same launch; a triple fold makes the 4-peer reduce 120x redundant, +4.2 us
+at M=1). Rule: a fusion's grid must be proportional to the fused work, not
+to the CU count; folding a small pass into a CU-wide GEMV replicates it
+per workgroup. What would remove this launch is a cooperative prologue with
+one 120-WG grid barrier (~-1 us/module, deadlock-fragile under co-residency)
+-- not pursued.
+
+Measurement note from the same agent: the first graph capture of a freshly
+loaded code object mis-measures badly (63 us for a 14.8 us kernel); warm every
+arm with an eager call plus a throwaway capture before timing.
