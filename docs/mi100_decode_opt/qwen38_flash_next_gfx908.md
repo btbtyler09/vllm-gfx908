@@ -625,3 +625,18 @@ a 3-boot + parity gate, -0.24 ms; (2) fuse the push consumer into the HC
 combine/RMSNorm, -0.10..-0.15; (3) gfx908 custom all-gather + in-graph
 lm_head/logits, -0.1..-0.3; (4) rebalance rank-0-only work, -0.1..-0.2;
 (5) fold the eager AR, -0.02..-0.05. Total -0.55..-0.9 ms/step.
+
+## Round 10 (2026-09-05): rc6 candidate tree, three-boot confirmation
+
+Tree 6492cc676b (rc5 + prep fold + MFMA with the swizzled M=1 GEMV + fp16
+experts + radix sampler + V6 prologue with the build fix + multi-row MoE
+kernel (M 24..256) + gemm2 configs + FLA BV16 + strict loaders; QSA glue off),
+pure rc5 image + overlay, step timer on 1200-token c=1 windows:
+
+| boot | c=1 ms/step | c=1 tok/s | c=4 tok/s (ms/step) |
+|---|---|---|---|
+| 1 | 10.79 | 91.7-92.1 | 240 (15.8) |
+| 2 | 10.77 | 92.0-92.3 | 245.5 (15.8) |
+| 3 | R10B3_MS | R10B3_TOKS | R10B3_C4 |
+
+vs rc5 (11.01-11.17 / 88.7-89.9 / 208-214): c=1 -0.3 ms (+3%), c=4 +15%.
