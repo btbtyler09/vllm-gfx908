@@ -838,3 +838,30 @@ slot is a same-pass read/write race). Compaction + top-p replay not merged
 (unbounded tie rescan cannot be captured). Held as a patch
 (`agents/ple_glue/patch/sampler_merge.patch`) because it changes the default
 path un-gated; goes in after rc8 with its own parity + three-boot arm.
+
+### Push-AR producer folded into GEMV/reduce epilogues (agent push_ar_producer, 2026-09-05)
+
+The sentinel-ordering problem the brief worried about does not exist: the
+push AR pre-arms each slot with the bf16 -0.0 sentinel and the payload is the
+flag, owned per element, so a producer spread over 20-120 workgroups needs no
+release fence, arrival counter or per-slice sentinel. (The alternative,
+counter + `__threadfence_system` + last-WG flag, costs +0.85 us at T=1 on the
+producer alone, more than the fusion saves.) Four real ranks, graph-captured,
+bit-exact:
+
+| producer | sites/step | saved at T=1 | ms/step |
+|---|---:|---:|---:|
+| GDN out_proj (w8sw GEMV, M<=4) | 36 | 1.17 us | -0.042 |
+| MoE weighted reduce (HIP, fma-matched, replaces the Triton reduce) | 48 | 0.71 us | -0.034 |
+| QSA o_proj (W4A8 slab, needs W4A8_BF16_OUT) | 12 | 0.80 us | -0.010 |
+
+Total -0.09 ms/step at c=1 (~0.9%), -0.15 at c=48 (MoE only). 16-byte
+stores staged through LDS were the difference from the earlier lane-63
+attempt. Stock instantiations unchanged (108/108 identical registers, within
++-0.09 us). Parked on branch `r14-push-producer` (b357a58fbb, env
+`VLLM_GFX908_PUSH_AR_FUSED_PRODUCER`, default off) because it edits the hot
+GEMV code objects and rc8's bake was already queued; its three-boot arm runs
+on the rc8 image (check `stats_dict()["fused"]`: claims == taken == 96 per
+step, drained == 0). The HC_AR_FUSED fallback bug it found (pending push
+never consumed when hc != 4 / non-unit strides) is fixed on the release
+branch ahead of rc8.
