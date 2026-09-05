@@ -131,6 +131,11 @@ class GatedResidual(nn.Module):
         from .gfx908_hc_fused import hc_fused_enabled, hc_shard_enabled
 
         self._gfx908_hc_shard = hc_shard_enabled()
+        # Push-AR consumer fused into this module's combine (+norm):
+        # VLLM_GFX908_HC_AR_FUSED=1 (default off).  Static per module.
+        from .gfx908_hc_ar_fused import hc_ar_fused_enabled
+
+        self._gfx908_hc_ar_fused = hc_ar_fused_enabled() and config.hc_count == 4
         if use_combine:
             from .gfx908_hc_fused import (
                 hc_w4_enabled,
@@ -197,14 +202,26 @@ class GatedResidual(nn.Module):
         block's mix. Its combine with ``block_output`` is fused with this
         module's input RMSNorm.
         """
-        hidden_states, xn = hc_combine_norm(
-            hidden_states,
-            prev_block_output,
-            prev_injection,
-            self.hc_norm.weight,
-            self.config.rms_norm_eps,
-            self.hc_count,
-        )
+        if self._gfx908_hc_ar_fused:
+            from .gfx908_hc_ar_fused import hc_combine_norm_ar
+
+            hidden_states, xn = hc_combine_norm_ar(
+                hidden_states,
+                prev_block_output,
+                prev_injection,
+                self.hc_norm.weight,
+                self.config.rms_norm_eps,
+                self.hc_count,
+            )
+        else:
+            hidden_states, xn = hc_combine_norm(
+                hidden_states,
+                prev_block_output,
+                prev_injection,
+                self.hc_norm.weight,
+                self.config.rms_norm_eps,
+                self.hc_count,
+            )
 
         if self.use_combine and self._gfx908_hc_fused_applies(xn):
             block_input, injection = self._gfx908_hc_fused_mix(xn)
@@ -270,6 +287,10 @@ class GatedResidual(nn.Module):
         block_output: torch.Tensor,
         injection: torch.Tensor,
     ) -> torch.Tensor:
+        if self._gfx908_hc_ar_fused:
+            from .gfx908_hc_ar_fused import hc_combine_ar
+
+            return hc_combine_ar(hidden_states, block_output, injection, self.hc_count)
         return hc_combine(hidden_states, block_output, injection, self.hc_count)
 
     @property

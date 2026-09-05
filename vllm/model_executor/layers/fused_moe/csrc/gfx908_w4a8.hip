@@ -20,6 +20,20 @@
 #include <cstdint>
 
 __device__ __forceinline__ float bf2f(uint32_t v) { return __uint_as_float(v << 16); }
+// bf16 output epilogue (VLLM_GFX908_W4A8_BF16_OUT): the dense slab GEMVs (QSA qkv / index_qk /
+// o_proj) feed a Triton SPLIT_K=1 "reduce" that is a bare fp32 -> bf16 RNE cast.  Storing bf16
+// straight from the slab drops that launch; RNE here == torch/Triton RNE, so the result is bit-exact.
+__device__ __forceinline__ uint16_t f2bf_rne(float f) {
+  uint32_t u = __float_as_uint(f);
+  if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t)((u >> 16) | 0x40);   // NaN stays NaN
+  u += 0x7fffu + ((u >> 16) & 1u);
+  return (uint16_t)(u >> 16);
+}
+__device__ __forceinline__ void slab_store(float* __restrict__ out, long i, float v, int obf) {
+  // The Triton reduce computes 0.0f + v before the cast, which turns -0.0 into +0.0; do the same.
+  if (obf) reinterpret_cast<uint16_t*>(out)[i] = f2bf_rne(0.0f + v);
+  else out[i] = v;
+}
 
 __device__ __forceinline__ int dot4(uint32_t a, int b, int c) {
 #ifdef W4A8_ASM_DOT4
@@ -181,7 +195,8 @@ __global__ void __launch_bounds__(64 * WPB) w4a8_slab_kernel(
     const uint32_t* __restrict__ w, const uint16_t* __restrict__ s, const int8_t* __restrict__ x8,
     const float* __restrict__ xs, const float* __restrict__ xsum, const int* __restrict__ row_tok,
     const int* __restrict__ row_exp, float* __restrict__ out, int N, int P, int E, long stride_we,
-    long stride_se, const uint32_t* __restrict__ w_extra, const uint16_t* __restrict__ s_extra) {
+    long stride_se, const uint32_t* __restrict__ w_extra, const uint16_t* __restrict__ s_extra,
+    int obf) {
   constexpr int ROWS = 64 / LPR, G = K / 32, GPL = (G + LPR - 1) / LPR;
   const int lane = threadIdx.x & 63, r = lane / LPR, l = lane % LPR;
   const int tiles_per_p = N / ROWS;
@@ -193,7 +208,7 @@ __global__ void __launch_bounds__(64 * WPB) w4a8_slab_kernel(
   const uint32_t* wbase;
   const uint16_t* sbase;
   if (!pick_expert(e, E, w, s, stride_we, stride_se, w_extra, s_extra, wbase, sbase)) {
-    if (l == LPR - 1) out[(long)p * N + n] = 0.f;
+    if (l == LPR - 1) slab_store(out, (long)p * N + n, 0.f, obf);
     return;
   }
   const uint4* wp = reinterpret_cast<const uint4*>(wbase + (long)n * (K / 8)) + l;
@@ -232,7 +247,7 @@ __global__ void __launch_bounds__(64 * WPB) w4a8_slab_kernel(
     acc += bf2f(sc[j]) * (sx[j] * (float)sumi - 8.f * sxs[j]);
   }
   acc = reduce_lpr<LPR>(acc);
-  if (l == LPR - 1) out[(long)p * N + n] = acc;
+  if (l == LPR - 1) slab_store(out, (long)p * N + n, acc, obf);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -462,7 +477,7 @@ __global__ void __launch_bounds__(256) w4a8_slab_prep_kernel(
     const uint32_t* __restrict__ w, const uint16_t* __restrict__ s, const uint32_t* __restrict__ x,
     const int* __restrict__ row_tok, const int* __restrict__ row_exp, float* __restrict__ out,
     int N, int P, int E, long stride_we, long stride_se,
-    const uint32_t* __restrict__ w_extra, const uint16_t* __restrict__ s_extra) {
+    const uint32_t* __restrict__ w_extra, const uint16_t* __restrict__ s_extra, int obf) {
   constexpr int ROWS = 64 / LPR, G = K / 32;
   __shared__ __align__(16) uint32_t xl[K / 4];    // K int8, de-interleaved per 8
   __shared__ float xsl[G], xsuml[G];
@@ -475,11 +490,11 @@ __global__ void __launch_bounds__(256) w4a8_slab_prep_kernel(
   const uint32_t* wbase;
   const uint16_t* sbase;
   if (!pick_expert(e, E, w, s, stride_we, stride_se, w_extra, s_extra, wbase, sbase)) {
-    if (l == LPR - 1) out[(long)p * N + n] = 0.f;   // block-uniform: no barrier below is reached
+    if (l == LPR - 1) slab_store(out, (long)p * N + n, 0.f, obf);   // block-uniform: no barrier below is reached
     return;
   }
   const float acc = w4a8_slab_prep_body<K, LPR>(wbase, sbase, x, t, n, l, xl, xsl, xsuml);
-  if (l == LPR - 1) out[(long)p * N + n] = acc;
+  if (l == LPR - 1) slab_store(out, (long)p * N + n, acc, obf);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -808,7 +823,8 @@ static void check_gemv(const at::Tensor& w, const at::Tensor& s, const at::Tenso
   TORCH_CHECK(w.scalar_type() == at::kInt || w.scalar_type() == at::kByte);
   TORCH_CHECK(row_tok.scalar_type() == at::kInt && row_exp.scalar_type() == at::kInt);
   TORCH_CHECK(row_tok.is_contiguous() && row_exp.is_contiguous() && row_tok.numel() == row_exp.numel());
-  TORCH_CHECK(out.scalar_type() == at::kFloat && out.is_contiguous());
+  TORCH_CHECK((out.scalar_type() == at::kFloat || out.scalar_type() == at::kBFloat16) && out.is_contiguous(),
+              "out must be contiguous fp32 (or bf16 for the direct-cast epilogue of gemv_slab / gemv_slab_prep)");
   TORCH_CHECK(w.dim() == 3 && s.dim() == 3 && s.size(1) == w.size(1) && s.size(2) == K / 32);
   TORCH_CHECK(out.size(0) == row_tok.numel() && out.size(1) == w.size(1));
 }
@@ -829,10 +845,11 @@ static void launch_slab(const at::Tensor& w, const at::Tensor& s, const at::Tens
     w4a8_slab_kernel<K, LPR, WPB><<<blocks, 64 * WPB, 0, stream>>>(
         reinterpret_cast<const uint32_t*>(w.data_ptr()), reinterpret_cast<const uint16_t*>(s.data_ptr()),
         reinterpret_cast<const int8_t*>(x8.data_ptr()), xs.data_ptr<float>(), xsum.data_ptr<float>(),
-        row_tok.data_ptr<int32_t>(), row_exp.data_ptr<int32_t>(), out.data_ptr<float>(), N, P, E,
+        row_tok.data_ptr<int32_t>(), row_exp.data_ptr<int32_t>(), (float*)out.data_ptr(), N, P, E,
         (long)N * (K / 8), (long)N * (K / 32),
         w_extra.numel() ? reinterpret_cast<const uint32_t*>(w_extra.data_ptr()) : nullptr,
-        w_extra.numel() ? reinterpret_cast<const uint16_t*>(s_extra.data_ptr()) : nullptr);
+        w_extra.numel() ? reinterpret_cast<const uint16_t*>(s_extra.data_ptr()) : nullptr,
+        out.scalar_type() == at::kBFloat16 ? 1 : 0);
   }
 }
 
@@ -870,10 +887,11 @@ static void launch_slab_prep(const at::Tensor& w, const at::Tensor& s, const at:
     w4a8_slab_prep_kernel<K, LPR><<<(tiles + 3) / 4, 256, 0, stream>>>(
         reinterpret_cast<const uint32_t*>(w.data_ptr()), reinterpret_cast<const uint16_t*>(s.data_ptr()),
         reinterpret_cast<const uint32_t*>(x.data_ptr()),
-        row_tok.data_ptr<int32_t>(), row_exp.data_ptr<int32_t>(), out.data_ptr<float>(), N, P, E,
+        row_tok.data_ptr<int32_t>(), row_exp.data_ptr<int32_t>(), (float*)out.data_ptr(), N, P, E,
         (long)N * (K / 8), (long)N * (K / 32),
         w_extra.numel() ? reinterpret_cast<const uint32_t*>(w_extra.data_ptr()) : nullptr,
-        w_extra.numel() ? reinterpret_cast<const uint16_t*>(s_extra.data_ptr()) : nullptr);
+        w_extra.numel() ? reinterpret_cast<const uint16_t*>(s_extra.data_ptr()) : nullptr,
+        out.scalar_type() == at::kBFloat16 ? 1 : 0);
   }
 }
 

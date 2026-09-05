@@ -252,11 +252,31 @@ def prep_fold_applies(N: int, K: int, P: int) -> bool:
     )
 
 
+_BF16_OUT: bool | None = None
+
+
+def bf16_out_enabled() -> bool:
+    """VLLM_GFX908_W4A8_BF16_OUT (default off): the dense slab GEMVs (QSA qkv_proj /
+    index_qk_proj / o_proj) store bf16 straight from the slab epilogue instead of fp32 +
+    the Triton SPLIT_K=1 cast launch.  Bit-exact (RNE both ways, -0.0 canonicalised like the
+    Triton reduce); -1 launch per dense GEMV (36 per decode step).  int8 mode only."""
+    global _BF16_OUT
+    if _BF16_OUT is None:
+        _BF16_OUT = (
+            os.environ.get("VLLM_GFX908_W4A8_BF16_OUT", "0") == "1"
+            or os.environ.get("VLLM_GFX908_W4A8_BF16_EPILOGUE", "0") == "1"
+        ) and w4a8_mode() == "int8"
+        if _BF16_OUT:
+            logger.info_once("gfx908: dense W4A8 GEMVs store bf16 directly (VLLM_GFX908_W4A8_BF16_OUT=1)")
+    return _BF16_OUT
+
+
 def _reset_env_cache():
     """Re-read VLLM_GFX908_W4A8 / _MODE / _SHARED_AS_EXPERT / _PREP_FOLD (tests only;
     extensions stay cached)."""
-    global _FLAG, _MODE, _SHARED_AS_EXPERT, _PREP_FOLD, _SILU_FOLD
+    global _FLAG, _MODE, _SHARED_AS_EXPERT, _PREP_FOLD, _SILU_FOLD, _BF16_OUT
     _SILU_FOLD = None
+    _BF16_OUT = None
     _FLAG = None
     _MODE = None
     _SHARED_AS_EXPERT = None
@@ -1004,6 +1024,16 @@ def dense_w4a8_gemv(a, b_q, scales):
         return None
     rt, re = _rows(M, a.device)
     fold = prep_fold_applies(N, K, M)
+    if bf16_out_enabled():
+        # bf16 epilogue: the slab kernel stores RNE(bf16) itself, no cast launch.
+        c = torch.empty((M, N), dtype=torch.bfloat16, device=a.device)
+        wx, sx = _no_extra(a.device)
+        if fold:
+            _ext().gemv_slab_prep(p[0], p[1], a, rt, re, c, 16, wx, sx)
+        else:
+            x8, xs, xsum = quant_q8(a)
+            _ext().gemv_slab(p[0], p[1], x8, xs, xsum, rt, re, c, 16, 1 if N <= 512 else 4, wx, sx)
+        return c
     if w4a8_mode() == "f16":
         part = (
             gemv_slab_f16_prep(p[0], p[1], a, rt, re) if fold

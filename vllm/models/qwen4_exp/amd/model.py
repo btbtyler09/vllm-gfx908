@@ -294,6 +294,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
             hc_config,
             prefix=maybe_prefix(prefix, "mlp_hyper_connection"),
         )
+        # gfx908 (VLLM_GFX908_HC_AR_FUSED=1): the attention / MoE all-reduces are
+        # issued here as deferred pushes and consumed inside the next HC combine.
+        from .gfx908_hc_ar_fused import defer_layer_all_reduces, hc_ar_fused_enabled
+
+        self._gfx908_defer_ar = hc_ar_fused_enabled() and defer_layer_all_reduces(self)
 
     def forward(
         self,
@@ -342,12 +347,18 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )
         else:
             raise ValueError("Invalid layer_type")
+        if self._gfx908_defer_ar:
+            from .gfx908_hc_ar_fused import ar_push_deferred
+
+            attn_out = ar_push_deferred(attn_out)
 
         mlp_hc = self.mlp_hyper_connection
         hidden_states, block_input, injection = mlp_hc.combine_and_mix(
             hidden_states, attn_out, injection
         )
         mlp_out = self.mlp(block_input)
+        if self._gfx908_defer_ar:
+            mlp_out = ar_push_deferred(mlp_out)
         return hidden_states, mlp_out, injection
 
 

@@ -526,11 +526,78 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Static so torch.compile sees no data-dependent branch; the runtime
         # decode/M<=8 check lives inside the opaque core op.
         self._gfx908_gdn_fused = gfx908_gdn_fused_layer_supported(self, vllm_config)
+        # gfx908 (VLLM_GFX908_GDN_MERGED_PROJ=1, default off): in_proj_qkvz and in_proj_ba
+        # become ONE W8A16 GEMV over a [4096 + 24 (+ pad), 2560] int8 weight, saving the
+        # separate bf16 wvSplitK launch for the 24-row b/a projection every decode step.
+        # NOT bit-exact for b/a (int8 gs128 instead of bf16; ~1.2% rel L2 on those 24
+        # columns, see agents/hc_gdn_glue/REPORT.md) -> PPL / GSM8K gate required.
+        self._gfx908_merged_proj = False
+        self._gfx908_merged_nq = self._gfx908_merged_nba = 0
+        if self._gfx908_gdn_fused and (
+            os.environ.get("VLLM_GFX908_GDN_MERGED_PROJ", "0") == "1"
+            or os.environ.get("VLLM_GFX908_GDN_INPROJ_MERGE", "0") == "1"
+        ):
+            self._gfx908_install_merged_proj()
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+
+    # -- gfx908 merged in_proj (VLLM_GFX908_GDN_MERGED_PROJ=1) -------------------------
+    def _gfx908_install_merged_proj(self) -> None:
+        """Wrap in_proj_qkvz's process_weights_after_loading: concatenate in_proj_ba's
+        bf16 rows under the qkvz rows (zero-padded to a multiple of 64 so the merged
+        shape is in the W8A16 tables and every MFMA config stays legal), then let the
+        stock hook quantize / free the merged weight.  in_proj_ba keeps its bf16 weight
+        (0.12 MB) as the fallback."""
+        from vllm.model_executor.layers.gfx908_w8a16 import W8A16_SHAPES, w8a16_enabled
+
+        qkvz, ba = self.in_proj_qkvz, self.in_proj_ba
+        nq = int(qkvz.output_size_per_partition)
+        nba = int(ba.output_size_per_partition)
+        k = int(self.hidden_size)
+        nm = -(-(nq + nba) // 64) * 64
+        qm = getattr(qkvz, "quant_method", None)
+        if (
+            not w8a16_enabled()
+            or (nm, k) not in W8A16_SHAPES
+            or nba != 2 * (self.num_v_heads // self.tp_size)
+            or type(getattr(ba, "quant_method", None)).__name__ != "UnquantizedLinearMethod"
+            or type(qm).__name__ != "UnquantizedLinearMethod"
+            or getattr(qm, "_gfx908_merged_wrapped", False)
+        ):
+            logger.info_once(
+                "gfx908: GDN merged in_proj not applicable (nq=%d nba=%d k=%d w8a16=%s)",
+                nq, nba, k, w8a16_enabled(),
+            )
+            return
+        orig = qm.process_weights_after_loading
+        layer_self = self
+
+        def wrapped(mod, _orig=orig):
+            wq, wb = mod.weight, layer_self.in_proj_ba.weight
+            if (
+                wq.dim() == 2 and wb.dim() == 2 and wq.dtype == torch.bfloat16
+                and wb.dtype == torch.bfloat16 and not wq.is_meta and not wb.is_meta
+                and tuple(wq.shape) == (nq, k) and tuple(wb.shape) == (nba, k)
+            ):
+                merged = torch.empty((nm, k), dtype=torch.bfloat16, device=wq.device)
+                merged[:nq].copy_(wq.data)
+                merged[nq:nq + nba].copy_(wb.data)
+                merged[nq + nba:].zero_()
+                mod.weight.data = merged           # the stock hook quantizes/frees this
+                layer_self._gfx908_merged_proj = True
+                layer_self._gfx908_merged_nq = nq
+                layer_self._gfx908_merged_nba = nba
+                logger.info_once(
+                    "gfx908: GDN in_proj_qkvz + in_proj_ba merged into one [%d, %d] W8A16 GEMV",
+                    nm, k,
+                )
+            _orig(mod)
+
+        qm.process_weights_after_loading = wrapped
+        qm._gfx908_merged_wrapped = True
 
     def _fused_gdn_decode_unsupported_reason(
         self, vllm_config: VllmConfig
@@ -871,8 +938,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # there is no z_out buffer/copy and no self.norm call here.  The op
             # zeroes the buffer itself when it takes the stock path.
             num_tokens = hidden_states.size(0)
-            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
+            if self._gfx908_merged_proj:
+                # one GEMV: [M, 4096 | 24 | pad]; the fused core kernel takes row strides
+                merged, _ = self.in_proj_qkvz(hidden_states)
+                nq, nba = self._gfx908_merged_nq, self._gfx908_merged_nba
+                mixed_qkvz = merged[:, :nq]
+                ba = merged[:, nq:nq + nba]
+            else:
+                mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+                ba, _ = self.in_proj_ba(hidden_states)
             core_attn_out = torch.empty(
                 (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
                 dtype=hidden_states.dtype,
@@ -1837,6 +1911,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ):
                 return
             core_attn_out.zero_()  # stock path below expects a zeroed buffer
+            if not mixed_qkvz.is_contiguous():   # merged-projection views (prefill / M > 8)
+                mixed_qkvz = mixed_qkvz.contiguous()
+            if not ba.is_contiguous():
+                ba = ba.contiguous()
         mixed_qkv, output_gate_flat = mixed_qkvz.split(
             [qkv_size, self.value_dim // self.tp_size], dim=-1
         )

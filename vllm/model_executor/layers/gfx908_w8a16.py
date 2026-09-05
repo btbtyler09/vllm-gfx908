@@ -129,18 +129,22 @@ _W4LT_FREE: bool | None = None
 #   (4096, 2560)  GDN in_proj_qkvz (per rank)
 #   (2560, 1536)  GDN out_proj
 #   (62080, 2560) lm_head
-W8A16_SHAPES = frozenset({(4096, 2560), (2560, 1536), (62080, 2560)})
+#   (4160, 2560)  GDN in_proj_qkvz + in_proj_ba merged (VLLM_GFX908_GDN_MERGED_PROJ=1):
+#                 4096 + 24 rows, zero-padded to a multiple of 64 so every MFMA nw config
+#                 of the 4096 shape stays legal (260 n-tiles)
+W8A16_SHAPES = frozenset({(4096, 2560), (4160, 2560), (2560, 1536), (62080, 2560)})
 
 # Shapes whose bf16 master copy may be released under VLLM_GFX908_W8A16_FREE=gdn.
 # lm_head (62080, 2560) is excluded: it runs at M = #sequences every decode step,
 # so rematerialising its 318 MB per step costs far more than the 164 MB the int8
 # copy duplicates.  ``all`` adds it anyway (N-chunked dequant).
-W8A16_FREE_SHAPES_GDN = frozenset({(4096, 2560), (2560, 1536)})
+W8A16_FREE_SHAPES_GDN = frozenset({(4096, 2560), (4160, 2560), (2560, 1536)})
 
 # (YTILE, UNRL, LPR, KS) per shape and M, from the microbench sweeps
 # (agents/w8a16/REPORT.md "Recommended dispatch").
 _CFG: dict[tuple[int, int], dict[int, tuple[int, int, int, int]]] = {
     (4096, 2560): {1: (2, 1, 32, 1), 2: (4, 1, 32, 1), 3: (4, 1, 32, 1), 4: (4, 1, 32, 2)},
+    (4160, 2560): {1: (2, 1, 32, 1), 2: (4, 1, 32, 1), 3: (4, 1, 32, 1), 4: (4, 1, 32, 2)},
     (2560, 1536): {1: (2, 1, 32, 1), 2: (2, 1, 32, 1), 3: (2, 1, 32, 1), 4: (2, 1, 32, 1)},
     (62080, 2560): {1: (8, 1, 32, 1), 2: (4, 1, 32, 1), 3: (4, 1, 32, 1), 4: (4, 1, 32, 1)},
 }
@@ -239,6 +243,10 @@ _MFMA_CFG: dict[tuple[int, int], dict[int, tuple[int, int, int, int]]] = {
     (4096, 2560): {1: (16, 1, 4, 1), 2: (16, 1, 4, 1), 4: (16, 1, 4, 1),
                    8: (16, 1, 4, 1), 16: (16, 2, 4, 1), 32: (16, 4, 4, 1),
                    48: (16, 2, 4, 1), 64: (16, 2, 4, 1)},
+    # merged in_proj (4096 + 24 + pad): same configs as 4096 (260 n-tiles, nw | 260)
+    (4160, 2560): {1: (16, 1, 4, 1), 2: (16, 1, 4, 1), 4: (16, 1, 4, 1),
+                   8: (16, 1, 4, 1), 16: (16, 2, 4, 1), 32: (16, 4, 4, 1),
+                   48: (16, 2, 4, 1), 64: (16, 2, 4, 1)},
     (2560, 1536): {1: (16, 1, 4, 1), 2: (16, 1, 4, 1), 4: (16, 1, 4, 1),
                    8: (16, 1, 4, 1), 16: (16, 2, 4, 1), 32: (16, 2, 6, 2),
                    48: (16, 2, 6, 1), 64: (16, 2, 6, 1)},
@@ -253,6 +261,7 @@ _MFMA_BUCKETS = (1, 2, 4, 8, 16, 32, 48, 64)
 _MFMA_BEATS_STOCK: dict[tuple[int, int], int] = {
     (62080, 2560): 64,    # lm_head: 1.41-2.47x vs stock at 5 <= M <= 64
     (4096, 2560): 64,    # gdn in_proj_qkvz: 1.21-2.44x vs stock at 5 <= M <= 64
+    (4160, 2560): 64,    # merged gdn in_proj (same kernel, +1.5% rows)
     (2560, 1536): 64,    # gdn out_proj: 1.17-1.89x vs stock at 5 <= M <= 64
 }
 
@@ -264,6 +273,7 @@ _MFMA_BEATS_STOCK: dict[tuple[int, int], int] = {
 # is absent from this table falls through to it.
 _WSW_CFG: dict[tuple[int, int], dict[int, tuple[int, int, int]]] = {
     (4096, 2560): {1: (1, 1, 4)},
+    (4160, 2560): {1: (1, 1, 4)},
     (2560, 1536): {1: (1, 1, 8)},
     (62080, 2560): {1: (2, 1, 1)},
 }
