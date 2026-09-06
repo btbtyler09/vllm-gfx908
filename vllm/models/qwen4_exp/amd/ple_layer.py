@@ -1290,6 +1290,10 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         if gfx908_ple_glue.ple_glue_enabled():
             cmp = os.environ.get("VLLM_GFX908_PLE_GLUE_CMP", "0")
             output = torch.empty_like(hidden_states)
+            if os.environ.get("VLLM_GFX908_PLE_GLUE_NOOP", "0") == "1":
+                # diagnostics: same buffer protocol, no custom op in between
+                output.copy_(self.ple_body_eager(hidden_states, key, value))
+                return output
             if cmp != "0" and not torch.cuda.is_current_stream_capturing():
                 # diagnostics: direct eager body vs the custom-op path on identical inputs
                 ref = self.ple_body_eager(hidden_states, key, value)
