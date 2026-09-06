@@ -1021,3 +1021,24 @@ Smoke boot of the same tree (overlay, step timer): 9.17-9.20 ms/step, c=1
 tok/s (rc8); c=64 341 -> 582 across rc5 -> rc8. GSM8K 1275 is the low end of
 the 1275-1287 release series (rounding-level differences move a handful of
 questions); flagged, not treated as a regression.
+
+### Halo run at 290 W (2026-09-06 15:00 UTC): rc8 image, warm, full 12-tier
+
+Power cap raised 200 -> 290 W on all four MI100s (sudoless wrapper), pure rc8
+boot, warm-up (3x c=1, c=4/16/48), then probes and the full 12-tier; restored
+to 200 W after. Probes: c=1 107.9-108.3 tok/s (1200 tok), 108.3 (2048 tok),
+c=4 280.3, step timer 9.16-9.20 ms.
+
+| tier | rc8 @200 W | rc8 @290 W |
+|---|---|---|
+| Single user TTFT / TPOT | 499 ms / 9.56 ms | 576 ms / 9.37 ms |
+| Decode stress c=1 | 105.7 | 107.3 |
+| 16K c=4 tok/s, TTFT / TPOT | 141.2, 8.27 s / 16.8 ms | 147.6, 7.75 s / 16.2 ms |
+| Short context c=16 | 460.2 | 496.5 |
+| Mixed c=8 | 353.7 | 358.7 |
+| c=2 / c=4 / c=8 / c=16 | 134.4 / 229.7 / 365.5 / 543.6 | 133.8 / 233.5 / 376.5 / 571.2 |
+| c=32 / c=64 / c=128 | 555.8 / 581.5 / 556.0 | 570.9 / 619.0 / 587.9 |
+
++45% power buys 2% at c=1 (the decode step is launch-bound, not
+power-bound) and 5-8% at c>=16 / 16K where the MoE GEMMs and prefill run
+at the clock ceiling. Report: `benchmark_Qwen3.8-Flash-Next-GPTQ-4bit_rc8_290W.md`.
