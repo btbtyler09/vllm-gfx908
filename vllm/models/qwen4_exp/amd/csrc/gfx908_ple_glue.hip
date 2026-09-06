@@ -141,7 +141,7 @@ __global__ __launch_bounds__(NT) void ple_glue_k(
     unsigned short* __restrict__ normalized,     // [T, C] or nullptr (debug)
     float* __restrict__ dbg,                     // [T*HC, 4] or nullptr (debug)
     int HG, int HC, int64_t s_slot, int64_t s_ch, int64_t s_j,
-    int slen, int ksz, int dil, int64_t null_id, float eps, float inv_sqrt_h,
+    int slen, int ksz, int dil, int64_t null_id, int64_t nslots, float eps, float inv_sqrt_h,
     int fuse_res) {
   __shared__ float smem[4 * NW];
   constexpr int SL = (SKSZ - 1) * SDIL;      // conv_state_len, compile time
@@ -166,7 +166,8 @@ __global__ __launch_bounds__(NT) void ple_glue_k(
 
   // ---- the channels this workgroup owns, and everything they need ---------
   long slot = sidx64 ? sidx64[t] : (long)sidx32[t];
-  const bool valid = (slot != null_id);
+  // padded / dummy rows may carry -1 or out-of-range block ids: treat them as null
+  const bool valid = (slot != null_id) && (slot >= 0) && (slot < nslots);
   const bool hinit = valid && (has_init ? has_init[t] : true);
   if (!valid) slot = 0;  // never index the state with an unvalidated slot
 
@@ -349,7 +350,7 @@ void ple_glue(at::Tensor hidden, at::Tensor key, at::Tensor value,
         s64, s32, hi, \
         reinterpret_cast<unsigned short*>(out.data_ptr<at::BFloat16>()), np, dbgp, \
         HG, (int)hc, conv_state.stride(0), conv_state.stride(1), conv_state.stride(2), \
-        slen, ksz, (int)dil, null_id, (float)eps, \
+        slen, ksz, (int)dil, null_id, (int64_t)conv_state.size(0), (float)eps, \
         (float)(1.0 / std::sqrt((double)HG)), fuse_res ? 1 : 0 \
         );                                                            \
   }
