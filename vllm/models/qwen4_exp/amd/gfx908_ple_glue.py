@@ -265,6 +265,7 @@ def _check_body(layer, hidden_states, key, value, output, mode: int) -> bool:
     return True
 
 
+_PTR_N = 0
 _LAST_LAYER = None  # VLLM_GFX908_PLE_GLUE_CMP: identity check from the layer
 
 
@@ -276,8 +277,16 @@ def _ple_glue_body(
     layer_name: str,
 ) -> None:
     layer = get_forward_context().no_compile_layers[layer_name]
-    global _LAST_LAYER
+    global _LAST_LAYER, _PTR_N
     _LAST_LAYER = layer
+    if os.environ.get("VLLM_GFX908_PLE_GLUE_LOG", "0") == "2" and _PTR_N < 40:
+        _PTR_N += 1
+        logger.info(
+            "gfx908 PLE PTR #%d T=%d cap=%s h=%#x k=%#x v=%#x out=%#x h_contig=%s out_contig=%s",
+            _PTR_N, hidden_states.shape[0], torch.cuda.is_current_stream_capturing(),
+            hidden_states.data_ptr(), key.data_ptr(), value.data_ptr(), output.data_ptr(),
+            hidden_states.is_contiguous(), output.is_contiguous(),
+        )
     mode = _check_mode()
     if mode and not torch.cuda.is_current_stream_capturing():
         # A/B every call; never do this while capturing (the clones would be
