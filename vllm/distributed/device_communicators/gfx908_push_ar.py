@@ -101,6 +101,38 @@ _FUSED_SAFE: bool | None = None
 _ARM: tuple | None = None       # (kinds, T, N) a producer may claim
 _CLAIM: tuple | None = None     # (par, site, T, N, data_ptr) after a producer pushed
 FUSED_STATS: dict[str, int] = {"claims": 0, "taken": 0, "dropped": 0, "drained": 0, "armed": 0}
+# Why a producer did not claim.  One counter per gate of ``claim_fused_push`` plus a one-time
+# INFO line with the offered (kind, shape, dtype, contiguous) against the armed values: a fused
+# producer that silently never fires is otherwise indistinguishable from one that is simply
+# not on the hot path (this is exactly how VLLM_GFX908_PUSH_AR_FUSED_PRODUCER shipped inert).
+FUSED_SKIPS: dict[str, int] = {}
+_MISS_LOGGED = False
+_DRAIN_LOGGED: set = set()
+
+
+def _drain_log(msg: str, kind: str, *args) -> None:
+    """One ERROR per producer kind: under pushmode 2 a drained claim means the all-reduce just
+    reduced the producer's *uninitialised* local tensor, i.e. the model output is wrong."""
+    if kind in _DRAIN_LOGGED:
+        return
+    _DRAIN_LOGGED.add(kind)
+    logger.error(msg, kind, *args)
+
+
+def _miss(reason: str, kind: str, out=None, arm=None) -> None:
+    global _MISS_LOGGED
+    FUSED_SKIPS[reason] = FUSED_SKIPS.get(reason, 0) + 1
+    if not _MISS_LOGGED and reason != "no_arm":
+        _MISS_LOGGED = True
+        logger.info(
+            "gfx908 push AR fused producer: first declined claim (%s): offered kind=%r "
+            "shape=%s dtype=%s contiguous=%s; armed=%r",
+            reason, kind,
+            tuple(out.shape) if out is not None else None,
+            out.dtype if out is not None else None,
+            out.is_contiguous() if out is not None else None,
+            arm,
+        )
 
 
 def fused_producer_enabled() -> bool:
@@ -160,29 +192,52 @@ def claim_fused_push(kind: str, out: torch.Tensor):
     which keeps the site sequence aligned).
     """
     global _ARM, _CLAIM
-    if _ARM is None or _CLAIM is not None or not fused_producer_enabled():
+    if not fused_producer_enabled():
         return None
-    kinds, t, n = _ARM
-    if kind not in kinds or out.dim() != 2 or out.shape[0] != t or out.shape[1] != n:
+    if _ARM is None:
+        _miss("no_arm", kind)
+        return None
+    if _CLAIM is not None:
+        _miss("claim_pending", kind, out, _ARM)
+        return None
+    arm = _ARM
+    kinds, t, n = arm
+    if kind not in kinds:
+        _miss("kind", kind, out, arm)
+        return None
+    if out.dim() != 2 or out.shape[0] != t or out.shape[1] != n:
+        _miss("shape", kind, out, arm)
         return None
     if out.dtype is not torch.bfloat16 or not out.is_contiguous():
+        _miss("dtype", kind, out, arm)
         return None
     par = _tp_push_ar()
-    if par is None or not par.eligible(out):
+    if par is None:
+        _miss("no_par", kind, out, arm)
+        return None
+    if not par.eligible(out):
+        _miss("ineligible", kind, out, arm)
         return None
     ca = par.ca
     # exactly the gate the all-reduce entry point applies, so a claimed message can never miss
     # its consume: `custom_all_reduce` returns None (stock path) when this is False
     if not ca.should_custom_ar(out):
+        _miss("should_custom_ar", kind, out, arm)
         return None
     if ca._IS_CAPTURING and not torch.cuda.is_current_stream_capturing():
+        _miss("warmup", kind, out, arm)
         return None          # cudagraph warm-up pass: communicate nothing
     site = par._next_site()
     if site is None:
+        _miss("no_site", kind, out, arm)
         return None
+    logger.info_once(
+        "gfx908 push AR fused producer: first claim taken (kind=%s shape=%s)", kind, (t, n)
+    )
     _ARM = None
-    _CLAIM = (par, site, t, n, out.data_ptr())
+    _CLAIM = (par, site, t, n, out.data_ptr(), kind)
     FUSED_STATS["claims"] += 1
+    FUSED_SKIPS["claim_" + kind] = FUSED_SKIPS.get("claim_" + kind, 0) + 1
     return (par.ptrs, (site * par.world_size + par.rank) * par.slot_elems, _fused_pushmode())
 
 
@@ -202,12 +257,22 @@ def take_fused_push(x: torch.Tensor):
     c = _CLAIM
     if c is None:
         return None
-    par, site, t, n, ptr = c
+    par, site, t, n, ptr, kind = c
     if ptr != x.data_ptr() or x.numel() != t * n:
+        _drain_log(
+            "gfx908 push AR fused producer: DRAIN kind=%s claimed (t,n)=%s ptr=%#x; "
+            "all-reduce got shape=%s numel=%d ptr=%#x (ptr match=%s) -- under the default "
+            "pushmode 2 the producer's local output was never written, so this all-reduce just "
+            "reduced uninitialised memory: the arm names a producer whose output tensor is not "
+            "the all-reduce's input",
+            kind, (t, n), ptr, tuple(x.shape), x.numel(), x.data_ptr(), ptr == x.data_ptr(),
+        )
+        FUSED_SKIPS["drain_" + kind] = FUSED_SKIPS.get("drain_" + kind, 0) + 1
         _drain_claim()
         return None
     _CLAIM = None
     FUSED_STATS["taken"] += 1
+    FUSED_SKIPS["taken_" + kind] = FUSED_SKIPS.get("taken_" + kind, 0) + 1
     return par, site, t, n
 
 
@@ -222,7 +287,7 @@ def _drain_claim() -> None:
     _CLAIM = None
     if c is None:
         return
-    par, site, t, n, _ = c
+    par, site, t, n = c[0], c[1], c[2], c[3]
     try:
         scratch = torch.empty((t, n), dtype=torch.bfloat16, device=par.device)
         _ext().consume(
@@ -413,6 +478,7 @@ class PushAllreduce:
             "timeouts": v[0], "max_spin": v[1], "waves_spun": v[2],
             "last_timeout_site": v[3], "last_timeout_row": v[4], "last_timeout_col": v[5],
             "calls": self.calls, "fallbacks": self.fallbacks, "fused": dict(FUSED_STATS),
+            "fused_skips": dict(FUSED_SKIPS),
         }
 
     def check_and_log(self, tag: str = "") -> bool:

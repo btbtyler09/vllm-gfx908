@@ -299,16 +299,27 @@ class Qwen4ExpDecoderLayer(nn.Module):
         from .gfx908_hc_ar_fused import defer_layer_all_reduces, hc_ar_fused_enabled
 
         self._gfx908_defer_ar = hc_ar_fused_enabled() and defer_layer_all_reduces(self)
-        self._gfx908_hidden_size = config.hidden_size
-        self._gfx908_arm_fused_push = None
+        # VLLM_GFX908_PUSH_AR_FUSED_PRODUCER: let the block's last projection (GDN out_proj via
+        # w8sw_gemv, QSA o_proj via the W4A8 dense slab) write its result straight into the four
+        # ranks' push-AR slots, so the all-reduce that follows costs a consume and no push launch.  The arm is keyed on (producer kind, output
+        # shape); every other GEMV in the block has a different width (GDN in_proj 4096/4160,
+        # QSA qkv 3584, index_qk 640).
+        #
+        # The arm rides on the HC mix custom op (which produces `block_input`, so data flow puts
+        # it immediately before the block) and NOT on plain Python here: this forward is compiled
+        # by @support_torch_compile, so anything that is not a custom op runs only while dynamo
+        # traces the model.  The producers are reached through custom ops and run during
+        # cudagraph capture / eager passes, i.e. never in the same pass as a traced-away arm --
+        # arming here armed exactly 96 times in a whole server run and claimed nothing.
         try:
             from vllm.distributed.device_communicators.gfx908_push_ar import (
-                arm_fused_push,
                 fused_producer_enabled,
             )
 
             if fused_producer_enabled():
-                self._gfx908_arm_fused_push = arm_fused_push
+                from .gfx908_hc_fused import ARM_ATTN
+
+                self.attn_hyper_connection._gfx908_arm_kind = ARM_ATTN
         except Exception:
             pass
 
@@ -352,14 +363,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         else:
             hidden_states, block_input, injection = attn_hc.mix(hidden_states)
 
-        # VLLM_GFX908_PUSH_AR_FUSED_PRODUCER: let the block's last projection (GDN out_proj via
-        # w8sw_gemv, QSA o_proj via the W4A8 dense slab) write its result straight into the four
-        # ranks' push-AR slots, so the all-reduce below costs a consume and no push launch.  The
-        # arm is keyed on (producer kind, output shape); every other GEMV in the block has a
-        # different width (GDN in_proj 4096/4160, QSA qkv 3584, index_qk 640).
-        _arm = self._gfx908_arm_fused_push
-        if _arm is not None:
-            _arm(("w8sw", "slab"), block_input.shape[0], self._gfx908_hidden_size)
+        # (the fused push-AR producer is armed inside the HC mix op above, see __init__)
         if self.layer_type == "linear_attention":
             attn_out = self.linear_attn(hidden_states=block_input)
         elif self.layer_type == "full_attention":
@@ -378,8 +382,6 @@ class Qwen4ExpDecoderLayer(nn.Module):
         hidden_states, block_input, injection = mlp_hc.combine_and_mix(
             hidden_states, attn_out, injection
         )
-        if _arm is not None:
-            _arm("moe_reduce", block_input.shape[0], self._gfx908_hidden_size)
         mlp_out = self.mlp(block_input)
         if self._gfx908_defer_ar:
             mlp_out = ar_push_deferred(mlp_out)

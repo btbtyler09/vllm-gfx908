@@ -858,12 +858,56 @@ def _hc_mix_local(
     return hc_gate_mix(xn, gate, hc_count), injection
 
 
+# --------------------------------------------------------------------------- fused push-AR arm
+# VLLM_GFX908_PUSH_AR_FUSED_PRODUCER: the arm that lets the block's last projection push its
+# result into the peers' push-AR slots MUST run wherever the producer runs.  The producers are
+# reached through custom ops (``rocm_unquantized_gemm_gfx908``, the MoE reduce), so they execute
+# during cudagraph capture and eager passes; plain Python in ``Qwen4ExpDecoderLayer.forward``
+# only ever runs while dynamo *traces* the model -- once -- which is why arming from there left
+# the feature inert in the server (armed 96, claims 0).  The arm therefore rides on this op,
+# which produces ``block_input`` and so is ordered immediately before the block by data flow.
+ARM_ATTN = 1     # the block's last projection: GDN out_proj (w8sw) / QSA o_proj (W4A8 slab)
+# ARM_MOE (the MoE weighted-sum reduce) is deliberately absent: the all-reduce that follows the
+# MoE does NOT receive the reduce's output tensor.  MoERunner.forward finishes with
+# ``result = shared_output + fused_output`` (moe_runner.py), a fresh tensor, and before that
+# FusedMoEModularKernel copies ``fused_out`` out of its workspace unless the two are aliased.
+# Measured on 4 ranks: 1326/1326 ``moe_reduce`` claims were drained, and because pushmode 2
+# leaves the producer's local tensor uninitialised the model's output was garbage.  The producer
+# for that site is the shared+routed add, not the reduce.
+_ARM_KINDS = {ARM_ATTN: ("w8sw", "slab")}
+
+
+@functools.cache
+def _arm_fused_push_fn():
+    try:
+        from vllm.distributed.device_communicators.gfx908_push_ar import (
+            arm_fused_push,
+            fused_producer_enabled,
+        )
+
+        return arm_fused_push if fused_producer_enabled() else None
+    except Exception:
+        return None
+
+
+def _arm_fused_push(arm_kind: int, t: int, n: int) -> None:
+    kinds = _ARM_KINDS.get(arm_kind)
+    if kinds is None:
+        return
+    fn = _arm_fused_push_fn()
+    if fn is not None:
+        fn(kinds, t, n)
+
+
 def _hc_mix_impl(
     xn: torch.Tensor, w_down: torch.Tensor, w_up: torch.Tensor,
-    hc_count: int, lora_rank: int, hidden: int,
+    hc_count: int, lora_rank: int, hidden: int, arm_kind: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Opaque op. Dispatches on the *real* row count at run time, so the M
-    gates below never become torch.compile guards on a symbolic batch size."""
+    gates below never become torch.compile guards on a symbolic batch size.
+
+    ``arm_kind`` (0 = none) arms the fused push-AR producer for the block this mix feeds;
+    see the comment above ``ARM_ATTN``."""
     if hc_shard_applies(xn.shape[0]):
         block_input, injection = hc_shard_mix(
             xn,
@@ -876,11 +920,16 @@ def _hc_mix_impl(
         # The fake_impl promises contiguous outputs and inductor bakes those
         # strides into the graph; never hand back a view of a wider buffer.
         assert block_input.is_contiguous() and injection.is_contiguous()
-        return block_input, injection
-    return _hc_mix_local(xn, w_down, w_up, hc_count, lora_rank, hidden)
+    else:
+        block_input, injection = _hc_mix_local(
+            xn, w_down, w_up, hc_count, lora_rank, hidden
+        )
+    if arm_kind:
+        _arm_fused_push(arm_kind, block_input.shape[0], hidden)
+    return block_input, injection
 
 
-def _hc_mix_fake(xn, w_down, w_up, hc_count, lora_rank, hidden):
+def _hc_mix_fake(xn, w_down, w_up, hc_count, lora_rank, hidden, arm_kind=0):
     return (
         xn.new_empty((xn.shape[0], hidden)),
         xn.new_empty((xn.shape[0], hc_count)),
@@ -894,8 +943,10 @@ direct_register_custom_op(
 )
 
 
-def hc_fused_mix(xn, w_down, w_up, hc_count, lora_rank, hidden):
-    return torch.ops.vllm.gfx908_hc_fused_mix(xn, w_down, w_up, hc_count, lora_rank, hidden)
+def hc_fused_mix(xn, w_down, w_up, hc_count, lora_rank, hidden, arm_kind=0):
+    return torch.ops.vllm.gfx908_hc_fused_mix(
+        xn, w_down, w_up, hc_count, lora_rank, hidden, arm_kind
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -158,6 +158,9 @@ class GatedResidual(nn.Module):
                 # before any cudagraph capture.
                 install_hc_w8_prepare(self)
 
+    # VLLM_GFX908_PUSH_AR_FUSED_PRODUCER: which producer the fused mix arms (0 = none).
+    _gfx908_arm_kind: int = 0
+
     def mix(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
@@ -279,6 +282,10 @@ class GatedResidual(nn.Module):
             self.hc_count,
             self.lora_rank,
             self.hidden_size,
+            # VLLM_GFX908_PUSH_AR_FUSED_PRODUCER: arm the block this mix feeds (0 = never).
+            # Set by Qwen4ExpDecoderLayer; the arm has to happen inside the op because this
+            # method is traced away by torch.compile (see gfx908_hc_fused.ARM_ATTN).
+            self._gfx908_arm_kind,
         )
 
     def combine(
