@@ -310,7 +310,7 @@ def _fallback_body(layer):
     VLLM_GFX908_PLE_GLUE_COMPILED_FALLBACK=1 the body is torch.compile'd standalone (dynamic
     shapes, no cudagraphs; the nested short-conv custom op stays opaque), recovering the fusion.
     """
-    if os.environ.get("VLLM_GFX908_PLE_GLUE_COMPILED_FALLBACK", "0") != "1":
+    if os.environ.get("VLLM_GFX908_PLE_GLUE_COMPILED_FALLBACK", "1") != "1":
         return layer.ple_body_eager
     if torch.cuda.is_current_stream_capturing():
         return layer.ple_body_eager  # never compile / warm up under a capture
