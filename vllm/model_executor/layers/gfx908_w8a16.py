@@ -217,7 +217,9 @@ def _ext():
     build_dir = os.environ.get(
         "VLLM_GFX908_HIP_BUILD_DIR", os.path.expanduser("~/.cache/vllm/gfx908_w4gemv")
     )
-    os.makedirs(build_dir, exist_ok=True)
+    from vllm.platforms.gfx908_ext import hashed_build_dir
+
+    build_dir = hashed_build_dir(build_dir, "w8a16", list(_SOURCES), [_PUSH_INC])
     logger.info_once("gfx908: building/loading HIP W8A16 GEMV extension in %s", build_dir)
     return load(
         name="gfx908_w8a16_ext",

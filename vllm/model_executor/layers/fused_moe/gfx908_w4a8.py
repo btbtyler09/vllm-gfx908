@@ -103,8 +103,9 @@ def _load(name: str, src: str, subdir: str):
     base = os.environ.get(
         "VLLM_GFX908_HIP_BUILD_DIR", os.path.expanduser("~/.cache/vllm/gfx908_w4gemv")
     )
-    build_dir = os.path.join(base, subdir)
-    os.makedirs(build_dir, exist_ok=True)
+    from vllm.platforms.gfx908_ext import hashed_build_dir
+
+    build_dir = hashed_build_dir(base, subdir, [src], [_PUSH_INC])
     logger.info_once("gfx908: building/loading HIP %s GEMV extension in %s", subdir, build_dir)
     return load(
         name=name,

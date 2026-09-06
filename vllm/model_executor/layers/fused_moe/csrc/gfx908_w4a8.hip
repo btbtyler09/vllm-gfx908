@@ -20,6 +20,7 @@
 #include <vector>
 #include <c10/hip/HIPStream.h>
 #include <cstdint>
+static inline hipStream_t cur_stream() { return c10::hip::getCurrentHIPStream().stream(); }
 
 __device__ __forceinline__ float bf2f(uint32_t v) { return __uint_as_float(v << 16); }
 // bf16 output epilogue (VLLM_GFX908_W4A8_BF16_OUT): the dense slab GEMVs (QSA qkv / index_qk /
