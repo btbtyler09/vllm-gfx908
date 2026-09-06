@@ -986,3 +986,38 @@ prefill or mixed step (all of them at the 48-request cap) ran the body as
 e1343cd539): `VLLM_GFX908_PLE_GLUE_COMPILED_FALLBACK` compiles the fallback
 body standalone (dynamic shapes, no cudagraphs, nested short-conv op stays
 opaque): c=48 863/834, coherence 5/16. rc8 rebaked from e1343cd539.
+
+### Release candidate rc8 (2026-09-06): `btbtyler09/vllm-rocm-gfx908:v0.28.0rc8.dev-q38fn` (tree e1343cd539)
+
+Five levers on: HC-AR consumer fuse (split kernels, counters at model
+build), W4A8 bf16 epilogue, fused push-AR producer (present; claims 0 in
+the server, inert -- to debug), merged sampler radix passes, PLE decode
+glue (splitting op, compiled fallback body). Pure-image validation:
+
+| gate | rc8 | rc7 |
+|---|---|---|
+| c=1 probes (400 tok) | 107.7-108.2 tok/s | 100.3-101.0 |
+| c=4 / c=16 / c=48 probes | 272 / 661 / 923 | 264 / 644 / 905 |
+| greedy parity c=1 / c=16 | 5/16 / 5/16 (floor) | 6/16 / 4/16 |
+| long-context determinism (4 prompts) | 48/48 | 48/48 |
+| PPL (64 windows) | 3.1407 | 3.1451 |
+| GSM8K full 1319 / batched c=32 (500) | 1275 (96.7%) / 486 | 1282 / 485 |
+| TTFT 2.5K warm | ~500 ms | 505-550 |
+
+12-tier (mixed corpus, 200 W):
+
+| tier | rc7 | rc8 |
+|---|---|---|
+| Single user TTFT / TPOT | 511 ms / 10.32 ms | 499 ms / 9.56 ms |
+| Decode stress c=1 | 100.3 tok/s | 105.7 |
+| 16K c=4 tok/s, TTFT / TPOT | 132.9, 9.08 s / 18.0 ms | 141.2, 8.27 s / 16.8 ms |
+| Short context c=16 | 465.9 | 460.2 |
+| Mixed c=8 | 343.3 | 353.7 |
+| c=2 / c=4 / c=8 / c=16 | 130.0 / 222.5 / 358.4 / 531.8 | 134.4 / 229.7 / 365.5 / 543.6 |
+| c=32 / c=64 / c=128 | 546.5 / 582.4 / 549.1 | 555.8 / 581.5 / 556.0 |
+
+Smoke boot of the same tree (overlay, step timer): 9.17-9.20 ms/step, c=1
+107.7-108.2. Campaign c=1 decode: 17.5 -> 59.6 -> 89 -> 91 -> 100 -> ~106-108
+tok/s (rc8); c=64 341 -> 582 across rc5 -> rc8. GSM8K 1275 is the low end of
+the 1275-1287 release series (rounding-level differences move a handful of
+questions); flagged, not treated as a regression.
