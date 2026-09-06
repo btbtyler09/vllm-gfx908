@@ -295,7 +295,35 @@ def _ple_glue_body(
             return
     if not _force_fallback() and _try_fused(layer, hidden_states, key, value, output):
         return
-    output.copy_(layer.ple_body_eager(hidden_states, key, value))
+    output.copy_(_fallback_body(layer)(hidden_states, key, value))
+
+
+_COMPILED_BODY: dict[int, object] = {}
+
+
+def _fallback_body(layer):
+    """The eager PLE body for prefill / mixed / spec batches.
+
+    Because this op is a piecewise splitting op, inductor no longer sees the PLE body and the
+    fallback ran as ~10 unfused eager passes over [T, 10240] -- at c>=32 every step carries
+    prefill rows, which cost the rc8 12-tier 10-18% at c=32..128.  With
+    VLLM_GFX908_PLE_GLUE_COMPILED_FALLBACK=1 the body is torch.compile'd standalone (dynamic
+    shapes, no cudagraphs; the nested short-conv custom op stays opaque), recovering the fusion.
+    """
+    if os.environ.get("VLLM_GFX908_PLE_GLUE_COMPILED_FALLBACK", "0") != "1":
+        return layer.ple_body_eager
+    if torch.cuda.is_current_stream_capturing():
+        return layer.ple_body_eager  # never compile / warm up under a capture
+    fn = _COMPILED_BODY.get(id(layer))
+    if fn is None:
+        try:
+            fn = torch.compile(layer.ple_body_eager, dynamic=True, fullgraph=False)
+            logger.info_once("gfx908: PLE glue fallback body compiled standalone (dynamic shapes)")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning_once("gfx908: PLE glue compiled fallback unavailable (%s); eager body", exc)
+            fn = layer.ple_body_eager
+        _COMPILED_BODY[id(layer)] = fn
+    return fn
 
 
 def _ple_glue_body_fake(
