@@ -795,9 +795,12 @@ class Worker(WorkerBase):
         ):
             GiB = lambda b: round(b / GiB_bytes, 2)
             diff = abs(cuda_graph_memory_bytes - self.cudagraph_memory_estimate)
+            from vllm.platforms.graph_api_name import graph_api_name
+
             logger.info(
-                "CUDA graph pool memory: %s GiB (actual), %s GiB (estimated), "
+                "%s graph pool memory: %s GiB (actual), %s GiB (estimated), "
                 "difference: %s GiB (%.1f%%).",
+                graph_api_name(),
                 GiB(cuda_graph_memory_bytes),
                 GiB(self.cudagraph_memory_estimate),
                 GiB(diff),

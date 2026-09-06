@@ -122,7 +122,7 @@ def _cnt(par, n: int) -> torch.Tensor | None:
         if torch.cuda.is_current_stream_capturing():
             logger.warning_once(
                 "gfx908 HC-AR: the split consumer's arrival counters were first needed "
-                "inside a cudagraph capture (width %d); falling back to the single-workgroup "
+                "inside a HIP graph capture (width %d); falling back to the single-workgroup "
                 "kernel. Call prepare_counters(hidden_size) before capture to keep the split "
                 "kernel.", n,
             )

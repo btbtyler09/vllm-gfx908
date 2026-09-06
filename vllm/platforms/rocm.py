@@ -1029,7 +1029,7 @@ class RocmPlatform(Platform):
                     CUDAGraphMode.FULL_AND_PIECEWISE,
                 ):
                     logger.info_once(
-                        "gfx908 (MI100): forcing FULL_DECODE_ONLY CUDA "
+                        "gfx908 (MI100): forcing FULL_DECODE_ONLY HIP "
                         "graphs (PIECEWISE hangs at TP>1)."
                     )
                     compilation_config.cudagraph_mode = (
@@ -1140,12 +1140,12 @@ class RocmPlatform(Platform):
                     os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"
                     logger.info_once(
                         "gfx908 (MI100): setting TORCH_NCCL_BLOCKING_WAIT=1 for "
-                        "MTP CUDA graph capture (avoids ProcessGroupNCCL "
+                        "MTP HIP graph capture (avoids ProcessGroupNCCL "
                         "watchdog HIP-event queries during capture)."
                     )
                 elif _needs_blocking_wait and blocking_wait != "1":
                     logger.warning_once(
-                        "gfx908 (MI100): MTP CUDA graph capture may fail "
+                        "gfx908 (MI100): MTP HIP graph capture may fail "
                         "because TORCH_NCCL_BLOCKING_WAIT=%r. Set it to 1.",
                         blocking_wait,
                     )
@@ -1170,7 +1170,7 @@ class RocmPlatform(Platform):
             if parallel_config.decode_context_parallel_size > 1:
                 logger.warning_once(
                     "Decode context parallel (DCP) is enabled, which is "
-                    "incompatible with full CUDA graphs. "
+                    "incompatible with full HIP graphs. "
                     "Overriding cudagraph_mode to PIECEWISE."
                 )
                 compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
@@ -1178,7 +1178,7 @@ class RocmPlatform(Platform):
             elif parallel_config.prefill_context_parallel_size > 1:
                 logger.warning_once(
                     "Prefill context parallel (PCP) is enabled, which is "
-                    "incompatible with full CUDA graphs. "
+                    "incompatible with full HIP graphs. "
                     "Overriding cudagraph_mode to PIECEWISE."
                 )
                 compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE

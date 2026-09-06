@@ -318,7 +318,7 @@ class CudaGraphManager:
     def capture(
         self,
         create_forward_fn: CreateForwardFn,
-        progress_bar_desc: str = "Capturing CUDA graphs",
+        progress_bar_desc: str | None = None,
     ) -> None:
         """Capture CUDA graphs.
 
@@ -347,6 +347,9 @@ class CudaGraphManager:
                     # per-graph memory deltas.
                     descs = descs[: self._max_full_descs_to_capture]
                 if is_global_first_rank():
+                    if progress_bar_desc is None:
+                        from vllm.platforms.graph_api_name import graph_api_name
+                        progress_bar_desc = f"Capturing {graph_api_name()} graphs"
                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
                 for desc in descs:
                     # Prepare inputs and get forward function
@@ -508,7 +511,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         has_lora: bool = False,
         use_aux_hidden_state_outputs: bool = False,
         lora_capture_hook: Callable[[int, int, int], None] | None = None,
-        progress_bar_desc: str = "Capturing CUDA graphs",
+        progress_bar_desc: str | None = None,
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
@@ -629,6 +632,9 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             return forward_fn
 
+        if progress_bar_desc is None:
+            from vllm.platforms.graph_api_name import graph_api_name
+            progress_bar_desc = f"Capturing {graph_api_name()} graphs"
         super().capture(create_forward_fn, progress_bar_desc)
 
     def run_fullgraph(
