@@ -900,3 +900,34 @@ single-lever arm would have hit just the same:
 
 Four-lever tree (PLE off) measured 9.28-9.30 ms/step, c=1 106.7-106.9,
 c=4 264 (vs rc7 9.57-9.61 / 103.5-104.0). Five-lever tree pending.
+
+### Five levers served garbage; four validated (2026-09-06 early morning)
+
+The five-lever image measured 9.08-9.10 ms/step / 109 tok/s and produced
+stuttering text ("The The user user is is"): greedy parity 0/16 with
+divergence at token 0-3, long-context runs emitting 5-9 tokens, while PPL
+(teacher-forced) was unchanged. Throughput probes cannot see this;
+`ablate.sh` now prints a greedy-parity coherence line per boot. Coherence
+bisect on the pure image: `VLLM_GFX908_PLE_GLUE=0` alone restores 7/16
+identical (floor class). PLE glue default off (014dfd6971); off-server the
+kernel matches the inductor body to 1 ulp at every T (agent
+ple_glue_correct), so the defect is in-server plumbing; CHECK / FORCE_FALLBACK
+/ LOG knobs added (d81c6b3d7f) and three in-server checks queued.
+
+rc8 candidate = four levers (HC-AR consumer fuse + W4A8 bf16 epilogue,
+fused push-AR producer, merged sampler passes), image
+`v0.28.0rc8.dev-q38fn` from 014dfd6971, pure-image validation (not pushed
+yet; Tyler asked for the PLE glue fix first):
+
+| gate | rc8 (4 levers) | rc7 |
+|---|---|---|
+| c=1 probes (400 tok) | 104.2-105.0 tok/s | 100.3-101.0 |
+| c=4 / c=16 / c=48 probes | 274 / 663 / 857 | 264 / 644 / 905 |
+| greedy parity c=1 / c=16 | 7/16 / 5/16 (floor) | 6/16 / 4/16 |
+| long-context determinism (4 prompts, 5.5-6K) | 48/48 identical | 48/48 |
+| PPL (64 windows) | 3.1451 | 3.1451 |
+| GSM8K full 1319 / batched c=32 (500) | 1282 (97.2%) / 485 | 1282 / 485 |
+| TTFT 2.5K warm | 506-526 ms | 505-550 ms |
+
+Overlay smoke boot of the same tree: 9.28-9.30 ms/step, c=1 106.7-106.9,
+c=4 264 (vs rc7 9.57-9.61 / 103.5-104.0).
