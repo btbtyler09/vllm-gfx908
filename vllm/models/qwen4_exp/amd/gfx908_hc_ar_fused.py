@@ -228,8 +228,9 @@ def _ar_log(where: str, block: torch.Tensor, p) -> None:
     global _LOG_N
     if os.environ.get("VLLM_GFX908_HC_AR_LOG", "0") != "1" or _LOG_N >= 240:
         return
-    if (block.shape[0] if block.dim() == 2 else -1) > 64:
-        return  # decode-sized calls only (the profiling prefill would eat the budget)
+    T_ = block.shape[0] if block.dim() == 2 else -1
+    if T_ > 2 or (where != "_hc_combine_ar_impl" and T_ > 1):
+        return  # the PLE-layer combine-only consumer at T<=2, others at T=1 only
     _LOG_N += 1
     pend = _PENDING
     logger.info(
