@@ -865,3 +865,38 @@ on the rc8 image (check `stats_dict()["fused"]`: claims == taken == 96 per
 step, drained == 0). The HC_AR_FUSED fallback bug it found (pending push
 never consumed when hc != 4 / non-unit strides) is fixed on the release
 branch ahead of rc8.
+
+## rc8 "gold" (2026-09-06): everything on at once, and what it cost
+
+At Tyler's call the rc8 tree flipped every candidate on in one commit
+(HC-AR consumer fuse + W4A8 bf16 epilogue, fused push-AR producer, merged
+sampler passes, PLE glue) instead of one three-boot arm each. Five boots
+died before the tree served; each failure was an integration defect that a
+single-lever arm would have hit just the same:
+
+1. `NameError: ext` in the fused MoE reduce call (producer patch only ran in
+   its harness) -> 1c39abbbc6.
+2. `cur_stream()` undefined in `gfx908_w4a8.hip` -> 20 compile errors, and
+   torch's `cpp_extension.load` handed back the rc7 image's stale `.so`
+   with no error in the log; the boot then died on the OLD kernel's dtype
+   check. Fix: content-hashed build dirs (`vllm/platforms/gfx908_ext.py`)
+   + an off-GPU prebuild of all 16 extensions as a pre-boot gate, compiled
+   into a host volume the boot mounts -> 5110bc9f88.
+3. HSA hardware exception 0x1016 on all ranks at the first warm-up step
+   after graph capture ("unspecified launch failure" on an innocent Triton
+   launch; serialized launches abort in C++ with no frame). Flag bisect:
+   producer off -> died; + sampler reverted -> died; + PLE glue off ->
+   BOOTED (9.40-9.42 ms/step). Two kernel-side fixes (ITERS cap for a
+   suspected register spill, state-slot bound) did not help. `--enforce-eager`
+   with the glue on was healthy, so the fault was graph-replay-specific.
+   Root cause (agent ple_glue_fault): the fused op replaced
+   `vllm::qwen4_exp_ple_short_conv`, a piecewise splitting op in
+   `CompilationConfig._attention_ops`, without being listed itself; the
+   piecewise graph captured the whole PLE body, capture sizes above
+   max_num_seqs are prefill batches, so the recorded branch was the eager
+   dilated-prefill path whose per-step temporaries were freed after capture.
+   Fix: list `vllm::gfx908_ple_glue_body` in `_attention_ops` (35ba8a9c1b).
+   The kernel itself has 0 scratch / 0 spills at every ITERS.
+
+Four-lever tree (PLE off) measured 9.28-9.30 ms/step, c=1 106.7-106.9,
+c=4 264 (vs rc7 9.57-9.61 / 103.5-104.0). Five-lever tree pending.
