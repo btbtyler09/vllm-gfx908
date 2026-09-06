@@ -956,3 +956,17 @@ with `atomicAdd & (HC-1)` (wrap-safe, no reset store). Bit-identical on the
 clean path (both split variants, T=1..16 x 4 steps). PLE glue back on.
 Lesson: a coherent config is not proof a cross-rank protocol is sound;
 flipping an unrelated graph boundary is a cheap perturbation test.
+
+Four-rank proof (agent hcar4, all 4 GPUs, no server): a standalone harness
+driving the real push-AR IPC slots, sentinel ring and the real deferred-push
+/ HC-AR consume custom ops and HIP kernels, 8 layers per step, T=1..16,
+24 steps per case, reference = rank-ordered fp32 sum of the four partials.
+Pre-fix code passes eager and single-graph capture (the recorded memset
+lives in the one graph that is replayed) and FAILS the "lottery" mode
+(dirty pool, one capture never replayed, then the target capture replayed):
+first bad step 2, max err 15-20, 0 timeouts, slot never re-armed, counter
+seed 0x6B6B6B6B = the pattern the harness wrote into the pool. Fixed code
+(04e838b9d6) is torch.equal on every step in all modes, counters created
+outside capture on every rank, split kernel kept. A single-graph
+micro-repro is NOT sufficient for this class of bug; capture two graphs and
+replay the second. Harness: agents/hcar4/run_all.sh (~4 min).
