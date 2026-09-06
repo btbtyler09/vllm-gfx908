@@ -168,7 +168,7 @@ __global__ __launch_bounds__(NT) void ple_glue_k(
   long slot = sidx64 ? sidx64[t] : (long)sidx32[t];
   const bool valid = (slot != null_id);
   const bool hinit = valid && (has_init ? has_init[t] : true);
-  if (!valid) slot = null_id;
+  if (!valid) slot = 0;  // never index the state with an unvalidated slot
 
   int mi[ITERS];
   float stv[ITERS][SL > 0 ? SL : 1], cwv[ITERS][SKSZ];
@@ -319,8 +319,15 @@ void ple_glue(at::Tensor hidden, at::Tensor key, at::Tensor value,
   int split = 1;
   const char* env = std::getenv("VLLM_GFX908_PLE_GLUE_ITERS");
   const int force = env ? atoi(env) : 0;
+  // ITERS > 2 keeps ~135 VGPRs live under __launch_bounds__(512) (128/wave on gfx908)
+  // and spills to scratch; a scratch-backed dispatch inside a captured graph faulted on
+  // the first replay (2026-09-06, HSA exception 0x1016).  Cap the per-lane iteration
+  // count (VLLM_GFX908_PLE_GLUE_MAX_ITERS, default 1) and take more channel splits instead.
+  const char* env_max = std::getenv("VLLM_GFX908_PLE_GLUE_MAX_ITERS");
+  const int max_it = env_max ? atoi(env_max) : 1;
   for (int cand : {1, 2, 4, 5}) {
     if (HG % (NT * cand)) continue;
+    if (!force && cand > max_it) continue;
     if (force ? (cand == force) : ((long)T * hc * (HG / (NT * cand)) <= 240)) {
       split = HG / (NT * cand);
       break;

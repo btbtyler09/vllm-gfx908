@@ -48,7 +48,9 @@ def _ext():
     build_dir = os.environ.get(
         "VLLM_GFX908_HIP_BUILD_DIR", os.path.expanduser("~/.cache/vllm/gfx908_w4gemv")
     )
-    os.makedirs(build_dir, exist_ok=True)
+    from vllm.platforms.gfx908_ext import hashed_build_dir
+
+    build_dir = hashed_build_dir(build_dir, "ple_glue", [_CSRC])
     logger.info_once("gfx908: building/loading the fused PLE glue extension in %s", build_dir)
     return load(
         name="gfx908_ple_glue_ext",
