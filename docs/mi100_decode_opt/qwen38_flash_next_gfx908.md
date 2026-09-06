@@ -970,3 +970,19 @@ seed 0x6B6B6B6B = the pattern the harness wrote into the pool. Fixed code
 outside capture on every rank, split kernel kept. A single-graph
 micro-repro is NOT sufficient for this class of bug; capture two graphs and
 replay the second. Harness: agents/hcar4/run_all.sh (~4 min).
+
+### rc8 five-lever 12-tier at 200 W: c>=32 regression, and its fix (2026-09-06 midday)
+
+Pure image (34268b1e9a): single-user TPOT 9.41 ms (rc7 10.32), decode
+stress 107.1 tok/s (100.3), short c=16 476.6 (465.9), 16K c=4 139.9
+(132.9), c=2/4/8/16 132.5/229.8/361/536.6 (130/222/358/532) -- but
+c=32/64/128 489.7/474.5/469.3 vs rc7 546.5/582.4/549.1 (-10/-18/-15%).
+GSM8K 1287/1319 (best so far), batched 481/500, PPL 3.1378, parity floor,
+long 48/48 x4. A/B on the image at c=48 (256-token outputs): glue on
+627/691, glue off 819/856; c=16 and c=32 unchanged. Cause: the glue op is a
+piecewise splitting op, so inductor no longer fuses the PLE body; every
+prefill or mixed step (all of them at the 48-request cap) ran the body as
+~10 unfused eager passes over [T, 10240]. Fix (2637d3ee6f, default on in
+e1343cd539): `VLLM_GFX908_PLE_GLUE_COMPILED_FALLBACK` compiles the fallback
+body standalone (dynamic shapes, no cudagraphs, nested short-conv op stays
+opaque): c=48 863/834, coherence 5/16. rc8 rebaked from e1343cd539.
