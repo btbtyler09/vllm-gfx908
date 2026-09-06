@@ -931,3 +931,28 @@ yet; Tyler asked for the PLE glue fix first):
 
 Overlay smoke boot of the same tree: 9.28-9.30 ms/step, c=1 106.7-106.9,
 c=4 264 (vs rc7 9.57-9.61 / 103.5-104.0).
+
+### Root cause of the five-lever garbage: split-consumer counters born inside a capture (2026-09-06)
+
+Bisect on the pure image: PLE glue x HC-AR fused consumer = garbage, and
+only with the consumer's SPLIT kernels (per-(site,row) self-resetting
+arrival counters); split off is coherent but costs +2 ms/step (11.4 ms, 96
+tok/s); compile without cudagraphs is coherent with everything on. Agent
+ple_x_hcar_split proved the mechanism on one GPU: `_cnt()` created the
+counters with `torch.zeros` on first real use, which is always inside a
+cudagraph capture (the warm-up pass takes the no-push branch), so the
+counters were a recycled private-pool block with only a recorded memset:
+6528/6528 nonzero after capture and after replay. With dirty counters the
+last-arriver check never fires, the slots are never re-armed, the counter
+never resets, the consumer stops waiting (0 timeouts) and returns this
+step's partials from some ranks mixed with last step's from the others,
+every deferred all-reduce, from token 0. Whether the recycled block was
+zero depended on the piecewise partition: the PLE glue splitting op moved
+the boundary and lost the lottery; the four-lever tree had won it (and
+"validated"). Fix 04e838b9d6: counters allocated at model build
+(`prepare_counters` from `defer_layer_all_reduces`), `_cnt` refuses to
+allocate under capture (single-WG fallback + warning), monotonic counter
+with `atomicAdd & (HC-1)` (wrap-safe, no reset store). Bit-identical on the
+clean path (both split variants, T=1..16 x 4 steps). PLE glue back on.
+Lesson: a coherent config is not proof a cross-rank protocol is sound;
+flipping an unrelated graph boundary is a cheap perturbation test.
