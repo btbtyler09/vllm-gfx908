@@ -115,7 +115,7 @@ def gfx908_boot_summary(model=None) -> None:
     rows.append(("Router", "fused GEMV+softmax+top-k" if os.environ.get("VLLM_GFX908_ROUTER_FUSED", "1") == "1" else "stock"))
     rows.append(("Sampler top-k/top-p", "radix fast path (<=64)" if os.environ.get("VLLM_GFX908_SAMPLER_FASTK", "1") == "1" else "stock"))
     rows.append(("PLE embeddings", "zero-copy pinned host gather" if os.environ.get("VLLM_PLE_ZEROCOPY", "1") == "1" else "device"))
-    rows.append(("PLE fused decode glue", _onoff(os.environ.get("VLLM_GFX908_PLE_GLUE", "0") == "1")))
+    rows.append(("PLE fused decode glue", _onoff(os.environ.get("VLLM_GFX908_PLE_GLUE", "1") == "1")))
     rows.append(("Stable QSA top-k", _onoff(os.environ.get("VLLM_GFX908_QSA_STABLE_TOPK", "1") == "1")))
     rows.append(("Extension loader", "strict" if os.environ.get("VLLM_GFX908_STRICT_EXT", "1") == "1" else "lenient"))
 

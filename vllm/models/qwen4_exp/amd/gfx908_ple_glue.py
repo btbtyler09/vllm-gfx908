@@ -38,7 +38,7 @@ _MAX_STATE = 16    # MAXS in the kernel
 
 
 def ple_glue_enabled() -> bool:
-    return os.environ.get("VLLM_GFX908_PLE_GLUE", "0") == "1"
+    return os.environ.get("VLLM_GFX908_PLE_GLUE", "1") == "1"
 
 
 def _envint(name: str, default: int) -> int:

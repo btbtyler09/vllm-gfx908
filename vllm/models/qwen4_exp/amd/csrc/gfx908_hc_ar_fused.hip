@@ -351,9 +351,13 @@ hc_ar_fused_k(const u32x4* __restrict__ res, long s_res16,
 // One workgroup per (row, stream), like the Triton kernel's decomposition, so at T = 1 the four
 // streams' combine/norm chains run on four CUs instead of serially on one.  Every WG of a row polls
 // the full row's four source rows (redundant 4 x 20 KB of local UC reads -- negligible), and the
-// slot is re-armed by the LAST workgroup of the row to finish reading it: a self-resetting
-// per-(site, row) counter (atomicAdd after the poll; the last arriver rewrites the sentinels and
-// zeroes the counter).  No workgroup ever waits on another.
+// slot is re-armed by the LAST workgroup of the row to finish reading it: a per-(site, row)
+// arrival counter (atomicAdd after the poll; the arriver that sees `old % HC == HC - 1` rewrites
+// the sentinels).  No workgroup ever waits on another.  The counter is monotonic and is never
+// reset -- each launch adds exactly HC, HC is a power of two, so the phase is stable across
+// wraparound and there is no reset store to race with a straggler's atomicAdd.  It has to *start*
+// at a multiple of HC; `gfx908_hc_ar_fused._cnt` guarantees that by creating it outside every
+// cudagraph capture (a torch.zeros issued under capture only records its memset).
 template <int HC, bool NORM>
 __global__ void __launch_bounds__(1024)
 hc_ar_fused_split_k(const u32x4* __restrict__ res, long s_res16,
@@ -395,9 +399,14 @@ hc_ar_fused_split_k(const u32x4* __restrict__ res, long s_res16,
   // (C) arrival counter.  The atomic is *issued* here (this WG's poll data is in registers, so
   // signalling is safe) but its result is only read after the barrier that the norm reduction
   // needs anyway, so the L2 round trip hides behind the combine.  The last-arriving stream WG of
-  // the row re-arms the slot, at the very end of the kernel.
+  // the row re-arms the slot, at the very end of the kernel.  Monotonic + `& (HC - 1)`: no reset
+  // store, wrap-safe, and a counter left at any multiple of HC still picks exactly one arriver.
+  static_assert((HC & (HC - 1)) == 0, "the arrival phase mask needs a power-of-two HC");
   __syncthreads();
-  if (c == 0) last_s = atomicAdd(cnt + (long)site * cnt_stride + t, 1);
+  if (c == 0) {
+    unsigned* cp = (unsigned*)(cnt + (long)site * cnt_stride + t);
+    last_s = (int)(atomicAdd(cp, 1u) & (unsigned)(HC - 1));
+  }
   if (stats && spin_stats) {
     unsigned m = wave_max(spins);
     if (lane == 0) {
@@ -431,7 +440,6 @@ hc_ar_fused_split_k(const u32x4* __restrict__ res, long s_res16,
       const u32x4 s4 = {SENT32, SENT32, SENT32, SENT32};
 #pragma unroll
       for (int r = 0; r < 4; r++) __builtin_nontemporal_store(s4, rowp[r] + c);
-      if (c == 0) cnt[(long)site * cnt_stride + t] = 0;
     }
     return;
   }
@@ -455,11 +463,10 @@ hc_ar_fused_split_k(const u32x4* __restrict__ res, long s_res16,
     yo[j] = f2bf_bits(ylo) | (f2bf_bits(yhi) << 16);
   }
   y[t * s_y16 + (long)s * n16 + c] = yo;
-  if (last_s == HC - 1) {     // last stream WG of this row re-arms the slot and resets the counter
+  if (last_s == HC - 1) {     // last stream WG of this row re-arms the slot
     const u32x4 s4 = {SENT32, SENT32, SENT32, SENT32};
 #pragma unroll
     for (int r = 0; r < 4; r++) __builtin_nontemporal_store(s4, rowp[r] + c);
-    if (c == 0) cnt[(long)site * cnt_stride + t] = 0;
   }
 }
 
@@ -555,7 +562,8 @@ void hc_ar_combine(at::Tensor res, at::Tensor inj, at::Tensor out, int64_t hc, i
   fused_impl(res, inj, nullptr, out, nullptr, 0.0, hc, site_ptr, src_stride_elems, stats, max_spin,
              site, spin_stats, modes, nullptr);
 }
-// Split variants (grid (T, HC)); cnt: int32 [sites, rows_max] zero-initialised, self-resetting.
+// Split variants (grid (T, HC)); cnt: int32 [sites, rows_max] arrival counters, monotonic, and
+// zero-initialised OUTSIDE any cudagraph capture (see gfx908_hc_ar_fused._cnt).
 void hc_ar_combine_norm_split(at::Tensor res, at::Tensor inj, at::Tensor w, at::Tensor out,
                               at::Tensor y, double eps, int64_t hc, int64_t site_ptr,
                               int64_t src_stride_elems, at::Tensor stats, int64_t max_spin,

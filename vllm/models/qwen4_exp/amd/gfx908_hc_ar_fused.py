@@ -92,18 +92,68 @@ def _split_enabled() -> bool:
     return _SPLIT
 
 
-def _cnt(par, n: int) -> torch.Tensor:
-    """int32 [sites, rows_max] arrival counters for the split kernel (zeroed; self-resetting)."""
+def _cnt(par, n: int) -> torch.Tensor | None:
+    """int32 [sites, rows_max] arrival counters for the split kernel.
+
+    **The counters must never be created while a stream is capturing.**  A ``torch.zeros``
+    issued inside a cudagraph capture takes its storage from the graph's private pool (a
+    recycled, non-zero block once earlier pieces have been captured) and only *records* its
+    memset: the fill runs when -- and only when -- that one graph replays.  Lazily creating
+    the counters from inside the consumer therefore left them holding pool garbage for every
+    other capture size, including the decode sizes a c=1 run actually replays.
+
+    A counter that does not start at a multiple of HC is fatal and permanent: no workgroup
+    ever observes ``HC - 1``, so nobody re-arms the slot sentinels and nobody resets the
+    counter.  With the sentinels gone the consumer no longer waits for its peers -- it
+    reduces whatever is in the slot, i.e. this step's partials from the ranks that have
+    already pushed mixed with *last step's* partials from the ranks that have not.  Proven
+    on GPU3: agents/ple_x_hcar_split/probe_zeros_in_capture.py (the memset is only recorded)
+    and probe_stale_read.py (dirty counter -> 0 spins, returns new0+new1+old2+old3).
+
+    Returns None when the counters do not exist yet and cannot be created here; the caller
+    then takes the single-workgroup fused kernel, which owns no cross-workgroup state.
+    """
     cache = getattr(par, "_gfx908_hc_ar_cnt", None)
     if cache is None:
         cache = {}
         par._gfx908_hc_ar_cnt = cache
     t = cache.get(n)
     if t is None:
+        if torch.cuda.is_current_stream_capturing():
+            logger.warning_once(
+                "gfx908 HC-AR: the split consumer's arrival counters were first needed "
+                "inside a cudagraph capture (width %d); falling back to the single-workgroup "
+                "kernel. Call prepare_counters(hidden_size) before capture to keep the split "
+                "kernel.", n,
+            )
+            return None
         rows = max(1, par.slot_elems // n)
         t = torch.zeros(par.sites, rows, dtype=torch.int32, device=par.device)
         cache[n] = t
+        logger.info_once(
+            "gfx908 HC-AR: split-consumer arrival counters created outside capture "
+            "(%d sites x %d rows, width %d)", par.sites, rows, n,
+        )
     return t
+
+
+def prepare_counters(hidden_size: int) -> None:
+    """Create the split consumer's arrival counters now, before any cudagraph capture.
+
+    Called from ``defer_layer_all_reduces`` (model construction).  Without this the first
+    fused split consume happens inside the capture pass -- the cudagraph warm-up pass takes
+    the stock path, so the lazy allocation always landed inside a capture.  See ``_cnt``.
+    """
+    if not _split_enabled():
+        return
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return
+        _, par = _push_ar()
+        if par is not None:
+            _cnt(par, int(hidden_size))
+    except Exception as exc:  # pragma: no cover - diagnostics only
+        logger.warning_once("gfx908 HC-AR: could not pre-create the arrival counters (%s)", exc)
 
 
 @functools.cache
@@ -283,10 +333,11 @@ def _hc_combine_norm_ar_impl(
                        site, par.spin_stats)
         STATS["consume_stock"] += 1
         return _hc_combine_norm(residual, block, inj, w, eps, hc)
-    if _split_enabled() and T <= _cnt(par, N).shape[1]:
+    cnt = _cnt(par, N) if _split_enabled() else None
+    if cnt is not None and T <= cnt.shape[1]:
         _ext().hc_ar_combine_norm_split(
             residual, inj, w, out, y, float(eps), hc, base, par.slot_elems,
-            par.stats, par.max_spin, site, par.spin_stats, _MODES, _cnt(par, N),
+            par.stats, par.max_spin, site, par.spin_stats, _MODES, cnt,
         )
         STATS["fused_split"] += 1
     else:
@@ -324,10 +375,11 @@ def _hc_combine_ar_impl(
                        site, par.spin_stats)
         STATS["consume_stock"] += 1
         return _hc_combine(residual, block, inj, hc)
-    if _split_enabled() and T <= _cnt(par, N).shape[1]:
+    cnt = _cnt(par, N) if _split_enabled() else None
+    if cnt is not None and T <= cnt.shape[1]:
         _ext().hc_ar_combine_split(
             residual, inj, out, hc, base, par.slot_elems,
-            par.stats, par.max_spin, site, par.spin_stats, _MODES, _cnt(par, N),
+            par.stats, par.max_spin, site, par.spin_stats, _MODES, cnt,
         )
         STATS["fused_split"] += 1
     else:
@@ -399,4 +451,8 @@ def defer_layer_all_reduces(layer) -> bool:
             return False
         down.reduce_results = False
     proj.reduce_results = False
+    # Create the split consumer's arrival counters here, i.e. outside every cudagraph
+    # capture.  `proj` is the block's RowParallelLinear, so its full output size is the
+    # width of every all-reduce this layer defers.  See `_cnt`.
+    prepare_counters(getattr(proj, "output_size", 0) or 0)
     return True
