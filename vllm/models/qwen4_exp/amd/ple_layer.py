@@ -1288,7 +1288,29 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         # NOTE: the layer returns hidden_states + PLE(...); the decoder layer no
         # longer re-adds the residual (it is folded into the fused kernel).
         if gfx908_ple_glue.ple_glue_enabled():
+            cmp = os.environ.get("VLLM_GFX908_PLE_GLUE_CMP", "0")
             output = torch.empty_like(hidden_states)
+            if cmp != "0" and not torch.cuda.is_current_stream_capturing():
+                # diagnostics: direct eager body vs the custom-op path on identical inputs
+                ref = self.ple_body_eager(hidden_states, key, value)
+                torch.ops.vllm.gfx908_ple_glue_body(
+                    hidden_states, key, value, output, self.prefix
+                )
+                self._gfx908_cmp_n = getattr(self, "_gfx908_cmp_n", 0) + 1
+                if self._gfx908_cmp_n <= 12:
+                    d = (ref.float() - output.float()).abs()
+                    logger.info(
+                        "gfx908 PLE CMP #%d T=%d max|ref-op|=%.3e mism=%d/%d same_layer=%s "
+                        "kv_same=%s out_contig=%s hid_contig=%s hid_ptr_eq_out=%s",
+                        self._gfx908_cmp_n, hidden_states.shape[0], d.max().item(),
+                        int((d > 0).sum().item()), d.numel(),
+                        gfx908_ple_glue._LAST_LAYER is self,
+                        (gfx908_ple_glue._LAST_LAYER is not None
+                         and gfx908_ple_glue._LAST_LAYER.kv_cache[0].data_ptr() == self.kv_cache[0].data_ptr()),
+                        output.is_contiguous(), hidden_states.is_contiguous(),
+                        output.data_ptr() == hidden_states.data_ptr(),
+                    )
+                return ref if cmp == "1" else output
             torch.ops.vllm.gfx908_ple_glue_body(
                 hidden_states, key, value, output, self.prefix
             )
