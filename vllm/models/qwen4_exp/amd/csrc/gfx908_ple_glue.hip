@@ -320,19 +320,27 @@ void ple_glue(at::Tensor hidden, at::Tensor key, at::Tensor value,
   int split = 1;
   const char* env = std::getenv("VLLM_GFX908_PLE_GLUE_ITERS");
   const int force = env ? atoi(env) : 0;
-  // ITERS > 2 keeps ~135 VGPRs live under __launch_bounds__(512) (128/wave on gfx908)
-  // and spills to scratch; a scratch-backed dispatch inside a captured graph faulted on
-  // the first replay (2026-09-06, HSA exception 0x1016).  Cap the per-lane iteration
-  // count (VLLM_GFX908_PLE_GLUE_MAX_ITERS, default 1) and take more channel splits instead.
+  // Optional cap on the per-lane iteration count.  Default 0 = no cap:
+  // -Rpass-analysis=kernel-resource-usage reports ScratchSize 0 bytes/lane and no
+  // spills for ITERS 1/2/4/5, so there is nothing to work around here (the
+  // 2026-09-06 HSA 0x1016 fault was this op being captured into the piecewise
+  // cudagraph, not a scratch-backed dispatch).  The cap has to be applied *after*
+  // the selection loop: skipping candidates inside it made the loop fall through
+  // to split = 1, i.e. ITERS = HG/NT = 5, whenever T*hc*split > 240 (T >= 13) --
+  // exactly the configuration the cap was meant to exclude.
   const char* env_max = std::getenv("VLLM_GFX908_PLE_GLUE_MAX_ITERS");
-  const int max_it = env_max ? atoi(env_max) : 1;
+  const int max_it = env_max ? atoi(env_max) : 0;
   for (int cand : {1, 2, 4, 5}) {
     if (HG % (NT * cand)) continue;
-    if (!force && cand > max_it) continue;
     if (force ? (cand == force) : ((long)T * hc * (HG / (NT * cand)) <= 240)) {
       split = HG / (NT * cand);
       break;
     }
+  }
+  if (!force && max_it > 0 && HG / (NT * split) > max_it) {
+    TORCH_CHECK(HG % (NT * max_it) == 0, "VLLM_GFX908_PLE_GLUE_MAX_ITERS=", max_it,
+                " does not divide hidden_size / ", NT);
+    split = HG / (NT * max_it);
   }
   const int iters = HG / (NT * split);
   const int grid = T * (int)hc * split;

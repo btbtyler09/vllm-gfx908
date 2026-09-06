@@ -770,6 +770,13 @@ class CompilationConfig:
         "vllm::short_conv",
         "vllm::qwen4_exp_compute_ple_ngram_ids",
         "vllm::qwen4_exp_ple_short_conv",
+        # gfx908 (VLLM_GFX908_PLE_GLUE=1): the fused PLE decode glue wraps
+        # qwen4_exp_ple_short_conv inside an opaque custom op, so it has to
+        # inherit its split point.  Without it the whole PLE body -- including
+        # the eager fallback's index_select / index_copy_ over per-step
+        # metadata temporaries -- is captured into the piecewise cudagraph and
+        # faults on the first replay (HSA 0x1016).
+        "vllm::gfx908_ple_glue_body",
         "vllm::qwen4_exp_ple_mmap_forward",
         "vllm::qwen4_exp_qsa_with_output",
         "vllm::linear_attention",

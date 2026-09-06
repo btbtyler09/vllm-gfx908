@@ -84,8 +84,15 @@ def _try_fused(layer, hidden_states, key, value, output) -> bool:
     idx = m.state_indices_tensor
     if idx is None or idx.numel() < tokens or idx.dtype not in (torch.int32, torch.int64):
         return False
+    # The kernel reads state_idx[t] linearly.  Under MTP `state_indices_tensor`
+    # is `state_indices_tensor_d[:, 0]`, a column view with stride
+    # 1 + num_spec_tokens, which would silently select the wrong cache slots.
+    if idx.dim() != 1 or idx.stride(0) != 1:
+        return False
     has_init = m.has_initial_states_d
-    if has_init is not None and has_init.numel() < tokens:
+    if has_init is not None and (
+        has_init.numel() < tokens or has_init.dim() != 1 or has_init.stride(0) != 1
+    ):
         return False
 
     conv_state = layer.kv_cache[0]
