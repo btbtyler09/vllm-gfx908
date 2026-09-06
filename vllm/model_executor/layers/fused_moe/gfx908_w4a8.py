@@ -736,7 +736,7 @@ def moe_w4a8(
             part2 = gemv_rowlane(w2_i, w2_scale, i8, isc, isum, row_self, row_expert, wpb=1,
                                  extra=extra2)
     rb2 = 256  # 3 -> 10 workgroups; 3.13 -> 1.98 us at M=1 (agents/gemv_flight), same per-element order
-    if not _moe_reduce_push(ext, part2, wsum, output, rows, mul_routed_weight):
+    if not _moe_reduce_push(_ext(), part2, wsum, output, rows, mul_routed_weight):
         _moe_reduce_weighted_sum_kernel[(triton.cdiv(K, rb2), M)](
             part2, wsum, output, K,
             0, part2.stride(0), output.stride(0),
@@ -871,7 +871,7 @@ def moe_w4a8_mr(
     if part2 is None:
         return None
     rb2 = 256
-    if not _moe_reduce_push(ext, part2, wsum, output, rows, mul_routed_weight):
+    if not _moe_reduce_push(_ext(), part2, wsum, output, rows, mul_routed_weight):
         _moe_reduce_weighted_sum_kernel[(triton.cdiv(K, rb2), M)](
             part2, wsum, output, K,
             0, part2.stride(0), output.stride(0),
