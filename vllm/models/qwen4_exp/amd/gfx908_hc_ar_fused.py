@@ -219,6 +219,25 @@ def ar_push_deferred(x: torch.Tensor) -> torch.Tensor:
 
 
 # --------------------------------------------------------------------------- consume
+
+_LOG_N = 0
+
+
+def _ar_log(where: str, block: torch.Tensor, p) -> None:
+    """VLLM_GFX908_HC_AR_LOG=1: first 60 consumer decisions (capture + replay)."""
+    global _LOG_N
+    if os.environ.get("VLLM_GFX908_HC_AR_LOG", "0") != "1" or _LOG_N >= 60:
+        return
+    _LOG_N += 1
+    pend = _PENDING
+    logger.info(
+        "gfx908 HC-AR %s #%d T=%d block=%#x cap=%s pending=%s taken=%s",
+        where, _LOG_N, block.shape[0] if block.dim() == 2 else -1, block.data_ptr(),
+        torch.cuda.is_current_stream_capturing(),
+        None if pend is None else (pend[0], pend[1], pend[2], hex(pend[3])),
+        p is not None,
+    )
+
 def _take_pending(block: torch.Tensor):
     global _PENDING
     p = _PENDING
@@ -240,6 +259,7 @@ def _hc_combine_norm_ar_impl(
     from .ops.hc import _hc_combine_norm
 
     p = _take_pending(block)
+    _ar_log("_hc_combine_norm_ar_impl", block, p)
     ca, par = (None, None) if p is None else _push_ar()
     if p is None or par is None or hc != 4 or residual.stride(1) != 1 or inj.stride(1) != 1:
         if p is not None and par is not None:
@@ -281,6 +301,7 @@ def _hc_combine_ar_impl(
     from .ops.hc import _hc_combine
 
     p = _take_pending(block)
+    _ar_log("_hc_combine_ar_impl", block, p)
     ca, par = (None, None) if p is None else _push_ar()
     if p is None or par is None or hc != 4 or residual.stride(1) != 1 or inj.stride(1) != 1:
         if p is not None and par is not None:
