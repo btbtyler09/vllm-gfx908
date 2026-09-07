@@ -1,7 +1,7 @@
 # Qwen3.8-Flash-Next on 4x MI100: campaign close-out (2026-09-02 .. 2026-09-06)
 
 Final release: **rc9** (`btbtyler09/vllm-rocm-gfx908:v0.28.0rc9.dev-q38fn`;
-numbers filled in below when its gates and 12-tier land). Model: qwen4_exp
+vllm-gfx908 708816c020, pushed 2026-09-07). Model: qwen4_exp
 180B MoE, GPTQ 4-bit experts + QSA, bf16 elsewhere in the artifact (int8 at
 load for HC mixes, GDN projections, lm_head). TP=4 over xGMI, torch.compile +
 HIP graphs (FULL_AND_PIECEWISE), V2 model runner. The artifact's quantization
@@ -12,13 +12,13 @@ re-quantization of HC/GDN (est. +6-7% at c=1) was declined.
 
 | | bring-up (09-02) | rc7 (09-05) | rc8 (09-06) | rc9 final |
 |---|---|---|---|---|
-| c=1 decode (tok/s) | 17.5 | 100.3 | 105.7 | TBD |
-| single-user TPOT | ~57 ms | 10.32 ms | 9.56 ms | TBD |
-| step timer (ms/step) | ~57 | 9.57-9.61 | 9.17-9.20 | TBD |
-| 16K c=4 (tok/s) | - | 132.9 | 141.2 | TBD |
-| c=16 / c=64 | - | 532 / 582 | 544 / 582 | TBD |
-| 290 W halo c=1 / c=64 | - | - | 107.3 / 619 | TBD |
-| GSM8K (1319) / PPL | 1278 / 3.145 (rc5) | 1282 / 3.1451 | 1275 / 3.1407 | TBD |
+| c=1 decode (tok/s) | 17.5 | 100.3 | 105.7 | 107.5 |
+| single-user TPOT | ~57 ms | 10.32 ms | 9.56 ms | 9.38 ms |
+| step timer (ms/step) | ~57 | 9.57-9.61 | 9.17-9.20 | 9.14-9.17 |
+| 16K c=4 (tok/s) | - | 132.9 | 141.2 | 137.7 |
+| c=16 / c=64 | - | 532 / 582 | 544 / 582 | 542 / 567 |
+| 290 W halo c=1 / c=64 | - | - | 107.3 / 619 | not rerun (== rc8) |
+| GSM8K (1319) / PPL | 1278 / 3.145 (rc5) | 1282 / 3.1451 | 1275 / 3.1407 | 1281 / 3.1378 |
 
 Per-rank bytes per decode token: 1.91 GB (HC W8 636 MB, GDN int8 519,
 experts W4 365, lm_head 159, router bf16 126, QSA W4 78). The step is
@@ -44,7 +44,7 @@ drafter) and the artifact-level quantization that was declined.
 | HC-AR consumer fused into the HC combine (split kernels, counters at model build) | VLLM_GFX908_HC_AR_FUSED | -0.25 ms/step |
 | W4A8 bf16 epilogue on the dense QSA GEMVs | VLLM_GFX908_W4A8_BF16_EPILOGUE | -36 cast launches |
 | PLE decode glue (23 -> 1 launches; splitting op; compiled fallback body) | VLLM_GFX908_PLE_GLUE | -22 launches (within boot noise) |
-| fused push-AR producer (GDN out_proj, QSA o_proj push from the epilogue) | VLLM_GFX908_PUSH_AR_FUSED_PRODUCER | -0.05 ms/step (rc9) |
+| fused push-AR producer (GDN out_proj, QSA o_proj push from the epilogue; the MoE reduce is not its all-reduce's tensor and is not armed) | VLLM_GFX908_PUSH_AR_FUSED_PRODUCER | -0.05 ms/step (rc9; arm moved inside the HC mix op because dynamo traced the Python arm away) |
 | strict extension loaders, hashed build dirs, off-GPU prebuild gate, boot banner | VLLM_GFX908_STRICT_EXT | no silent fallbacks |
 
 ## Levers tried and rejected (with the number that killed them)
