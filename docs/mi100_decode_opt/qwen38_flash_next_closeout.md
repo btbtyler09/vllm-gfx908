@@ -80,3 +80,19 @@ map in `btbtyler09/mi100-llm-testing`; this campaign's per-round log in
 `qwen38_flash_next_gfx908.md`. Next, non-GPU: reusable kernels into the aiter
 fork as a gfx908 op library; a thin MI100 serving project on upstream vLLM via
 platform/model plugins.
+
+## Post-close exploration: HIP-graph parallel branches (2026-09-07) -- NO
+
+Idea: capture independent kernels on a second stream (fork/join events) so
+they become sibling graph nodes the executor can overlap. Audit found one true
+sibling pair per layer type (GDN in_proj_ba || in_proj_qkvz, ceiling 140
+us/step; QSA qkv || index_qk, 78 us/step); the push-AR site sequence pins
+everything else. Microbench (one GPU): siblings do overlap (+74% on a 4-wide
+fan-out vs an ideal 75%), fork/join event nodes are free. In the server
+(`VLLM_GFX908_GRAPH_BRANCHES=1`, one boot, parity 5/16): 12.0-12.5 ms/step vs
+9.14-9.17, i.e. +2.9 ms spread over all ~900 nodes (~3.2 us each), not at the
+48 fork sites: a strictly linear HIP graph takes a fast dispatch path and any
+fork drops the whole graph onto a slower dependency-walking dispatcher. Branch
+`graph-branches` (bda94c5231 patch, e84efc4502 report); reusable one-GPU step
+replica `agents/graph_branches/mb_step_replica.py` predicted the sign in a
+minute. Lever stays "fewer nodes"; the step is at its floor for this GPU.
