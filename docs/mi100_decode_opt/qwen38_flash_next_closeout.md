@@ -96,3 +96,18 @@ fork drops the whole graph onto a slower dependency-walking dispatcher. Branch
 `graph-branches` (bda94c5231 patch, e84efc4502 report); reusable one-GPU step
 replica `agents/graph_branches/mb_step_replica.py` predicted the sign in a
 minute. Lever stays "fewer nodes"; the step is at its floor for this GPU.
+
+## Power curve (rc9, 2026-09-07, one server, cap changed live and verified on all four cards)
+
+| cap | c=1 decode | step | single-user TPOT | c=16 | c=64 | 16K c=4 | c=1 tok/s per kW |
+|---|---|---|---|---|---|---|---|
+| 100 W | 77.5 | 12.8 ms | 12.9 ms | 281 | 304 | 81 | 194 |
+| 150 W | 100.9 | 9.8 ms | 10.0 ms | 485 | 512 | 127 | 168 |
+| 200 W | 107.5 | 9.15 ms | 9.4 ms | 542 | 567 | 138 | 134 |
+| 290 W (rc8) | 107.3 | 9.2 ms | 9.4 ms | 571 | 619 | 148 | 93 |
+
+Below 200 W the cap clips clocks although the sampled average draw during
+decode is only ~45-60 W per card (the SMU picks a DPM state that guarantees
+the cap), so c=1 is not power-insensitive downward: -6% at 150 W, -28% at
+100 W; c>=16 loses 11% / 48%. 150 W is the throughput-per-watt sweet spot,
+200 W the recommended balance, 290 W only helps c>=16 (+5-8%).
