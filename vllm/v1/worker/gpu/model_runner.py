@@ -1590,7 +1590,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)
-            _gfx908_step_begin(self)
+            _gfx908_step_begin(self, scheduler_output)
             self.update_requests(scheduler_output)
             self.block_tables.apply_staged_writes()
             if scheduler_output.total_num_scheduled_tokens == 0:
@@ -2223,11 +2223,25 @@ import os as _os
 import time as _time
 
 _GFX908_STEP_TIMING = _os.environ.get("VLLM_GFX908_STEP_TIMING", "0") == "1"
+# VLLM_GFX908_STEP_TRACE=1: additionally log every step that carries more than 8 scheduled
+# tokens (prefill / mixed) with its request mix and GPU/wall time -- for TTFT attribution.
+_GFX908_STEP_TRACE = _os.environ.get("VLLM_GFX908_STEP_TRACE", "0") == "1"
 
 
-def _gfx908_step_begin(runner) -> None:
+def _gfx908_step_begin(runner, scheduler_output=None) -> None:
     if not _GFX908_STEP_TIMING:
         return
+    desc = None
+    if _GFX908_STEP_TRACE and scheduler_output is not None:
+        try:
+            nst = scheduler_output.num_scheduled_tokens
+            tot = int(scheduler_output.total_num_scheduled_tokens)
+            if tot > 8:
+                big = [n for n in nst.values() if n > 1]
+                desc = (tot, len(nst), len(big), max(big) if big else 0,
+                        len(scheduler_output.scheduled_new_reqs))
+        except Exception:  # noqa: BLE001
+            desc = None
     st = getattr(runner, "_gfx908_st", None)
     if st is None:
         st = runner._gfx908_st = {
@@ -2239,7 +2253,7 @@ def _gfx908_step_begin(runner) -> None:
     st["last_wall"] = now
     ev = torch.cuda.Event(enable_timing=True)
     ev.record()
-    st["cur"] = (ev, wall)
+    st["cur"] = (ev, wall, desc)
 
 
 def _gfx908_step_end(runner) -> None:
@@ -2248,14 +2262,21 @@ def _gfx908_step_end(runner) -> None:
     st = getattr(runner, "_gfx908_st", None)
     if st is None or st["cur"] is None:
         return
-    ev_s, wall = st["cur"]
+    ev_s, wall, desc = st["cur"]
     st["cur"] = None
     ev_e = torch.cuda.Event(enable_timing=True)
     ev_e.record()
-    st["pending"].append((ev_s, ev_e, wall))
+    st["pending"].append((ev_s, ev_e, wall, desc))
     # Drain finished steps without blocking.
     while st["pending"] and st["pending"][0][1].query():
-        s, e, w = st["pending"].popleft()
+        s, e, w, d = st["pending"].popleft()
+        if d is not None:
+            logger.info(
+                "gfx908 step trace: tokens=%d reqs=%d prefill_reqs=%d max_req_tokens=%d "
+                "new_reqs=%d GPU %.1f ms wall %s ms",
+                d[0], d[1], d[2], d[3], d[4], s.elapsed_time(e),
+                "-" if w is None else f"{w:.1f}",
+            )
         if w is None or w > 1000.0:  # first step / idle gap
             continue
         g = s.elapsed_time(e)
