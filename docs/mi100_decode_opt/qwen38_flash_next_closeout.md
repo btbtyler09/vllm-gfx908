@@ -111,3 +111,28 @@ decode is only ~45-60 W per card (the SMU picks a DPM state that guarantees
 the cap), so c=1 is not power-insensitive downward: -6% at 150 W, -28% at
 100 W; c>=16 loses 11% / 48%. 150 W is the throughput-per-watt sweet spot,
 200 W the recommended balance, 290 W only helps c>=16 (+5-8%).
+
+## Post-close: the c=2 TTFT shape (2026-09-07, rc9 + per-step trace, VLLM_GFX908_STEP_TRACE=1)
+
+Trace of every prefill/mixed step (random 1024-token prompts, 256 out):
+- A 1024-token prefill step costs 250-290 ms GPU whether alone (1024 tokens)
+  or mixed with one decoding request (1025 tokens): the mixed step is not
+  slower per token.
+- Before a mixed prefill step the host gap is 50-130 ms (vs ~10 ms before an
+  alone prefill): new-request admission work (PLE n-gram context / mmap prep,
+  block allocation) runs on the critical path while a decode is in flight.
+- The first two 1024/1025-token steps after boot took 1.9 s and 2.4 s
+  (first-time compile/capture of those shapes): that is the p99 tail; the
+  boot warm-up should cover the prefill shapes the benchmark uses.
+- At c=4 the same prompts are chunked into 256-token pieces (tokens=768 with
+  new_reqs=3, then 256-token continuation steps): `_mamba_block_aligned_split`
+  (mamba_cache_mode "align" for hybrid prefix caching) stops chunks at block
+  boundaries, so each new request's first step covers one block and its
+  prefill spans four interleaved steps; c=4 median TTFT 984 ms in this run.
+- Chunked prefill cannot be disabled for this model (align mode requires it).
+So c=2 TTFT = own prefill (~270 ms) + wait for the other request's step(s) +
+~80 ms admission gap; c=4 adds the block-aligned chunking. Knobs to try next:
+`--long-prefill-token-threshold`, `--max-num-partial-prefills`,
+`--mamba-cache-mode none` (loses SSM prefix caching), a prefill-shape warm-up
+at boot, and moving the admission work off the step loop. Not pursued; the
+campaign is closed.
