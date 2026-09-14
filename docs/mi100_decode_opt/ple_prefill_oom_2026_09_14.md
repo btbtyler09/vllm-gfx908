@@ -146,9 +146,11 @@ replies that hit the 2048-token cap mid-thinking carry all text in
 without the parser and scraped the truncated thinking. Re-running those 29 on
 the same serve and scoring with the thinking text included: 21 length-capped,
 14 correct, giving an rc9-equivalent **~1285/1319**, inside the rc5-rc9
-spread (1275-1287). Verdict: quality-neutral. For a single clean number, run
-rc9 on the identical vision config or teach the evaluator to read
-`reasoning_content` (one ~25-min run).
+spread (1275-1287). Verdict: quality-neutral. The evaluator is now parser-agnostic (`tools/gsm8k_eval_openai.py`: scores
+`content`, falls back to `reasoning_content`, records `source` and
+`finish_reason` per question and prints both counts). Queued for the next
+GPU window: one clean full-1319 run of rc10 with it, so the record holds a
+single like-for-like number next to rc9's 1281.
 
 Greedy reviewer smoke (temperature 0, c=2, twice): 33/41 and 34/41 agreement
 vs Opus, 39/41 chunks identical between runs, no greedy loops.
