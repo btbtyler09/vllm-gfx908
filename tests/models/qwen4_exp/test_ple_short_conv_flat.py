@@ -22,10 +22,11 @@ def padded_reference(x_p, lengths, initial_state, w, dilation):
     P = lengths.numel()
     C, K = w.shape
     L = (K - 1) * dilation
-    q_starts = torch.cat([torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)])
+    dev = x_p.device
+    q_starts = torch.cat([torch.zeros(1, dtype=torch.int64, device=dev), lengths.cumsum(0)])
     T = int(q_starts[-1])
     max_len = int(lengths.max())
-    positions = torch.arange(T, dtype=torch.int64)
+    positions = torch.arange(T, dtype=torch.int64, device=dev)
     req = torch.searchsorted(q_starts[1:], positions, right=True)
     col = positions - q_starts[req]
     packed = x_p.new_zeros((P, max_len, C))
@@ -35,7 +36,7 @@ def padded_reference(x_p, lengths, initial_state, w, dilation):
     y = F.conv1d(history, w.unsqueeze(1).contiguous(), groups=C, dilation=dilation)
     y = F.silu(y).transpose(1, 2).contiguous()  # [P, max_len, C]
     out = y[req, col]
-    idx = (lengths.view(P, 1, 1) + torch.arange(L).view(1, 1, L)).expand(-1, C, -1)
+    idx = (lengths.view(P, 1, 1) + torch.arange(L, device=dev).view(1, 1, L)).expand(-1, C, -1)
     next_state = history.gather(2, idx)
     return out, next_state
 

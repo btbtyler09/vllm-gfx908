@@ -87,6 +87,23 @@ rectangle (`[num_reqs + 1, max_len, C]`) but `max_len = num_spec + 1`, so it
 is bounded and left as is (MTP is off for this model anyway). The decode
 path is per-token and unaffected.
 
+## Measured (one MI100, 2026-09-14 11:44 UTC, `tools/ple_conv_membench_gfx908.py`)
+
+Peak transient of one PLE prefill short-conv call, bf16, C = 10240:
+
+| batch shape | padded (rc9) | flat (rc10) |
+|---|---|---|
+| crash shape: 5 prefills, longest 7200 | 3,520 MiB, 41.5 ms | 470 MiB, 13.8 ms |
+| one 8192-token chunk | 800 MiB, 10.8 ms | 480 MiB, 14.2 ms |
+| 12 x 600 (even agents) | 705 MiB, 9.2 ms | 463 MiB, 13.2 ms |
+| worst: 8000 + 47 x 4 (48 seqs) | RuntimeError (rectangle > 2^31 elements, `canUse32BitIndexMath`) | 489 MiB, 15.1 ms |
+
+Output max abs diff 0.0 and conv state bit-identical on every shape the
+padded path can run. The flat transient is ~470-490 MiB independent of the
+batch shape (fp32 accumulator chunk + output); the padded one scaled with
+`num_prefills x longest request` and at the config worst case could not run
+at all.
+
 ## Verification plan (GPU window)
 
 1. `~/work/flashnext_vision_smoke/ple_conv_membench.py` on one MI100: peak
