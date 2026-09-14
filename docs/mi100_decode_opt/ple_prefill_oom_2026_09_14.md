@@ -135,6 +135,28 @@ at all.
 
 Verdict: PASS. rc10 replaced rc9 as the loop's serve at 0.90 utilization.
 
+### GSM8K (after the loop, 15:23-15:46 UTC, same serve)
+
+Full 1319, campaign protocol (thinking, temperature 0.6, seed 1234, 2048 max
+tokens, c=8): raw **1271/1319 = 0.9636** vs rc9 reference 1281 (0.9712).
+Of the 48 misses, 19 are wrong answers and 29 are evaluator errors (reply
+`content` was `None`): the vision serve runs `--reasoning-parser qwen3`, so
+replies that hit the 2048-token cap mid-thinking carry all text in
+`reasoning_content`, which `gsm8k_eval.py` never reads; the rc9 reference ran
+without the parser and scraped the truncated thinking. Re-running those 29 on
+the same serve and scoring with the thinking text included: 21 length-capped,
+14 correct, giving an rc9-equivalent **~1285/1319**, inside the rc5-rc9
+spread (1275-1287). Verdict: quality-neutral. For a single clean number, run
+rc9 on the identical vision config or teach the evaluator to read
+`reasoning_content` (one ~25-min run).
+
+Greedy reviewer smoke (temperature 0, c=2, twice): 33/41 and 34/41 agreement
+vs Opus, 39/41 chunks identical between runs, no greedy loops.
+
+Whole rc10 window (11:44-15:49 UTC): 7,490 chat completions served, zero OOM
+or engine errors, including the 16-wide 11.5k-token worst case and the
+cleanup loop at 12-14 concurrent agents.
+
 ## Proposed serve config for 12-16 agents (after the fix)
 
 Same as `serve_vision.sh` (TP4, bf16, 8192 batched tokens, 48 seqs,
