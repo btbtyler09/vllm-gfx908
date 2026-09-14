@@ -36,9 +36,14 @@ from ..common.ple import PLEVocabParallelEmbedding
 # pool + plain H2D copies); the module lives in the nvidia tree upstream.
 from ..nvidia import ple_mmap
 from vllm.models.qwen4_exp.amd import gfx908_ple_glue, gfx908_ple_zc
+from vllm.models.qwen4_exp.amd.ple_short_conv_flat import dilated_causal_conv_flat
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+# Rows per accumulation chunk of the padding-free prefill short-conv; bounds
+# the transient to ~chunk x C x (2 B input + 4 B fp32 accumulator).
+_PLE_PREFILL_CONV_CHUNK = int(os.environ.get("VLLM_GFX908_PLE_CONV_CHUNK", "2048"))
 
 
 class Qwen4ExpPLEGroupedNorm(nn.Module):
@@ -899,10 +904,6 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         req_indices = torch.searchsorted(q_starts[1:], positions, right=True)
         col_indices = positions - q_starts[req_indices]
 
-        packed_tokens = x_p.new_zeros((num_prefills, max_len, hidden_size))
-        packed_tokens[req_indices, col_indices] = x_p
-        packed_tokens = packed_tokens.transpose(1, 2).contiguous()
-
         state_indices = state_indices_tensor_p[:num_prefills].to(
             device=conv_state.device, dtype=torch.int64
         )
@@ -929,37 +930,34 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 state,
                 torch.zeros_like(state),
             )
-            history = torch.cat((initial_state, packed_tokens), dim=-1)
         else:
-            history = packed_tokens
+            initial_state = x_p.new_zeros((num_prefills, hidden_size, 0))
 
-        conv_output = F.conv1d(
-            history,
-            conv_weights.unsqueeze(1).contiguous(),
-            groups=history.size(1),
-            dilation=self.short_conv_dilation,
+        # Padding-free formulation: taps are masked gathers on the flat token
+        # stream, accumulated in fp32 in fixed-size chunks. The former
+        # [num_prefills, C, max_len + L] rectangle (F.conv1d over padded
+        # requests) cost ~0.7 GiB per materialized copy at the 2026-09-14
+        # crash shape (5 prefills, longest 7200 tokens, C = 10240) and is
+        # invisible to the memory profiler's even token split; see
+        # docs/mi100_decode_opt/ple_prefill_oom_2026_09_14.md.
+        conv_output, next_state = dilated_causal_conv_flat(
+            x_p,
+            q_starts,
+            req_indices,
+            col_indices,
+            lengths,
+            initial_state,
+            conv_weights,
+            self.short_conv_dilation,
+            chunk_tokens=_PLE_PREFILL_CONV_CHUNK,
         )
-        conv_output = F.silu(conv_output).transpose(1, 2).contiguous()
-
-        token_positions = torch.arange(max_len, device=x_p.device, dtype=torch.int64)
-        valid_tokens = token_positions.view(1, max_len) < lengths.view(num_prefills, 1)
-        valid_output_mask = valid_tokens & valid_state.to(device=x_p.device).view(
-            num_prefills, 1
-        )
-        conv_output.masked_fill_(~valid_output_mask.unsqueeze(-1), 0)
-        output.copy_(conv_output[req_indices, col_indices])
+        # Rows whose state slot is the null block produce zeros (same as the
+        # padded path's valid_output_mask).
+        row_valid = valid_state.to(device=x_p.device)[req_indices]
+        conv_output.mul_(row_valid.unsqueeze(1).to(conv_output.dtype))
+        output.copy_(conv_output)
 
         if self.conv_state_len > 0 and conv_state.shape[0] > 0:
-            state_starts = lengths.to(device=history.device, dtype=torch.int64).view(
-                num_prefills, 1, 1
-            )
-            state_offsets = torch.arange(
-                self.conv_state_len, device=history.device, dtype=torch.int64
-            ).view(1, 1, self.conv_state_len)
-            next_state = history.gather(
-                dim=2,
-                index=(state_starts + state_offsets).expand(-1, history.size(1), -1),
-            )
             # Write back without a host synchronization. Valid, non-empty rows
             # receive their new state; padding and zero-length rows keep the
             # current cache value.
