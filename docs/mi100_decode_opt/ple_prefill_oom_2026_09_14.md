@@ -148,9 +148,10 @@ the same serve and scoring with the thinking text included: 21 length-capped,
 14 correct, giving an rc9-equivalent **~1285/1319**, inside the rc5-rc9
 spread (1275-1287). Verdict: quality-neutral. The evaluator is now parser-agnostic (`tools/gsm8k_eval_openai.py`: scores
 `content`, falls back to `reasoning_content`, records `source` and
-`finish_reason` per question and prints both counts). Queued for the next
-GPU window: one clean full-1319 run of rc10 with it, so the record holds a
-single like-for-like number next to rc9's 1281.
+`finish_reason` per question and prints both counts). Clean run with it (16:04-16:26 UTC, vision serve config, c=8):
+**1280/1319 = 0.9704** vs rc9 1281 (0.9712); 0 evaluator errors, 39 wrong
+answers, 36 length-capped replies, 36 answers taken from reasoning_content
+(14 correct). One question apart: quality-neutral, like-for-like.
 
 Greedy reviewer smoke (temperature 0, c=2, twice): 33/41 and 34/41 agreement
 vs Opus, 39/41 chunks identical between runs, no greedy loops.
