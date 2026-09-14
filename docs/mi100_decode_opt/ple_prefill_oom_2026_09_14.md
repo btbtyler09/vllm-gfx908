@@ -115,6 +115,26 @@ at all.
    each) with crops in flight at `--gpu-memory-utilization 0.90`, and the
    20-page smoke for agreement.
 
+## Verification results (rc10 = rc9 image + this patch, 4 x MI100, 2026-09-14 11:44-12:05 UTC)
+
+- Boot at `--gpu-memory-utilization 0.90` with the vision serve config: KV
+  pool 219,738 tokens (rc9: 220,380).
+- Greedy parity, 20 cases (16 text + 4 page images, 96 tokens, top-5
+  logprobs): rc10 vs rc9 15/20 identical, mean |dlogprob| on the shared
+  prefix 0.0024; rc10 vs itself 19/20, 0.0012 (the serve's own run-to-run
+  floor). Divergences are near-tie tokens (both candidates within 0.1-0.3
+  nats). Within the band the campaign accepted for kernel changes (rc5 vs
+  rc4: 6/16, 0.0046) with PPL/GSM8K held; GSM8K was not rerun in this window.
+- Synthetic worst case, 12 concurrent requests of 11,562 prompt tokens each
+  (B3 page + two crops, distinct images so no cache hits): 12/12 OK, no OOM,
+  KV peak 82 %, 50 s per request. At 16 concurrent: 16/16 OK, KV 98.5 % with
+  3 requests queued (no preemption, no crash), 72-77 s per request.
+- 20-page reviewer smoke at c=8: 20/20 parsed, verdict agreement vs Opus
+  30/41 (rc9 runs: 34/41 at c=4, 32/41 at c=8; sampled at temperature 0.7),
+  TTFT mean 3.1 s, max 7.3 s.
+
+Verdict: PASS. rc10 replaced rc9 as the loop's serve at 0.90 utilization.
+
 ## Proposed serve config for 12-16 agents (after the fix)
 
 Same as `serve_vision.sh` (TP4, bf16, 8192 batched tokens, 48 seqs,
