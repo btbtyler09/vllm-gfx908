@@ -561,6 +561,16 @@ def _get_backend_priorities(
             ]
 
     backends = []
+    # gfx908 (MI100): put TRITON_ATTN first. Measured 2026-09-15 on a dense
+    # Qwen3.8-27B GPTQ-8bit at c=1: with the auto-selected ROCM_ATTN, decode
+    # fell 33 tok/s at 2k depth to 8.1 at 16k, 4.5 at 32k and 2.4 at 64k --
+    # inverse-linear in depth, roughly a tenth of the KV byte floor -- while
+    # the same checkpoint on the published config, which passes
+    # --attention-backend TRITON_ATTN explicitly, holds 56.0 tok/s at 16k.
+    # Auto-select must not land on ROCM_ATTN on this arch; an explicit
+    # --attention-backend still overrides this ordering.
+    if on_gfx908():
+        backends.append(AttentionBackendEnum.TRITON_ATTN)
     # Keep ROCM_ATTN disabled for KV connectors until connector transfer
     # semantics are validated for its asymmetric native K/V cache views.
     if not use_kv_connector:
@@ -574,7 +584,9 @@ def _get_backend_priorities(
     backends.append(AttentionBackendEnum.TRITON_ATTN)
     backends.append(AttentionBackendEnum.TURBOQUANT)
 
-    return backends
+    # Preserve order, drop the duplicate TRITON_ATTN the gfx908 branch adds.
+    seen: set = set()
+    return [b for b in backends if not (b in seen or seen.add(b))]
 
 
 class RocmPlatform(Platform):

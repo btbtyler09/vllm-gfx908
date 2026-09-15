@@ -496,8 +496,17 @@ def triton_w8a16_gemm(
         f"scales shape mismatch: {scales.shape} vs ({K // group_size}, {N})"
     )
     if qzeros is not None:
+        # Print BOTH shapes and the terms they are built from: when this fires on
+        # a checkpoint the kernel has not seen before, the useful question is
+        # which of K//group_size or N//4 disagrees, and that decides whether the
+        # checkpoint packs zero-points along a different axis (in which case the
+        # kernel must decline the layer in can_implement so the selector falls
+        # through to Exllama) or whether group_size is being misread.
         assert qzeros.shape == (K // group_size, N // 4), (
-            f"qzeros shape mismatch: {qzeros.shape}"
+            f"qzeros shape mismatch: got {tuple(qzeros.shape)}, "
+            f"expected {(K // group_size, N // 4)} "
+            f"(K={K}, N={N}, group_size={group_size}; "
+            f"K//group_size={K // group_size}, N//4={N // 4})"
         )
 
     c = torch.empty((M, N), dtype=a.dtype, device=a.device)
