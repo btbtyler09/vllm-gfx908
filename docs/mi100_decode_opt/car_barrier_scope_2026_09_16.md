@@ -193,6 +193,21 @@ nothing to carry, so the patch lands on both sides:
 - `btbtyler09/vllm-gfx908` branch `gfx908-car-barrier-scope` (this commit):
   the vLLM-side fix, for `VLLM_ROCM_USE_AITER_CUSTOM_AR=0` configs.
 
-Open check not yet done: whether the **graph-capture** pool (the
-pre-registered pool captured ARs route through) is also uncached, or only the
-eager `input` pool is.
+**Graph-capture pool — answered, it is the same uncached pool.**
+`aiter/dist/device_communicators/custom_all_reduce.py:1250` computes
+`reg = self.enable_register_for_capturing and not _on_gfx908()`, so on gfx908
+a captured all-reduce always takes `registered_input=False` — the copy-in path
+that stages into the pre-registered `input` pool, with the copy captured inside
+the graph (the "registered" path would bake a cached-memory IPC view of the
+input tensor's own pointer into the graph, which is the 2026-08 replay
+corruption: first decode token correct, every replayed token after it wrong).
+That `input` pool is created once at line 1084 with `uncached=uncached_pool`,
+where line 1080 sets `uncached_default = "1" if _on_gfx908() else "0"`. So the
+graph path and the eager path share one uncached allocation; graphs do **not**
+reintroduce the stale-L2 mechanism, and the blast radius above stands as
+written. (Overridable with `AITER_CAR_UNCACHED_POOL=0`, A/B only.)
+
+**Fabric, measured not inferred.** `rocm-smi --showtopotype --showtopohops
+--showtopoweight` on this node: every off-diagonal pair reads `XGMI`, 1 hop,
+weight 15 — a genuine all-to-all 4-card hive, no bridged pairs and no PCIe
+cross-pair link.
