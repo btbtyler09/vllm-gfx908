@@ -260,6 +260,24 @@ DINLINE void barrier_at_end(const RankSignals& sg, Signal* self_sg, int rank) {
 
 #else
 
+// gfx908 / ROCm: the data these flags guard is written by REMOTE agents (peer
+// GPUs staging into IPC-shared buffers over XGMI). A __MEMORY_SCOPE_DEVICE
+// acquire does not order visibility of a remote agent's writes, so a reduce
+// kernel can clear its barrier and read a peer's buffer while that peer's
+// writes are still in flight -> torn values (NaN / huge-finite seeds).
+// The stores were already SYSTEM-scope; only the acquires were not.
+// Set VLLM_CAR_PEER_ACQUIRE_SCOPE_DEVICE=1 at build time to restore the
+// upstream (unsafe) scope for an A/B cost measurement.
+#ifndef VLLM_CAR_PEER_ACQUIRE_SCOPE_DEVICE
+  #define VLLM_CAR_PEER_ACQUIRE_SCOPE_DEVICE 0
+#endif
+
+#if VLLM_CAR_PEER_ACQUIRE_SCOPE_DEVICE
+  #define VLLM_CAR_PEER_ACQUIRE_SCOPE __MEMORY_SCOPE_DEVICE
+#else
+  #define VLLM_CAR_PEER_ACQUIRE_SCOPE __MEMORY_SCOPE_SYSTEM
+#endif
+
 template <int ngpus>
 DINLINE void barrier_at_start(const RankSignals& sg, Signal* self_sg,
                               int rank) {
@@ -272,7 +290,7 @@ DINLINE void barrier_at_start(const RankSignals& sg, Signal* self_sg,
     // wait until we got true from all ranks
     while (__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
                                   __ATOMIC_RELAXED,
-                                  __MEMORY_SCOPE_DEVICE) < flag);
+                                  VLLM_CAR_PEER_ACQUIRE_SCOPE) < flag);
   }
   __syncthreads();
   // use one thread to update flag
@@ -289,7 +307,7 @@ DINLINE void barrier_at_start_release(const RankSignals& sg, Signal* self_sg,
                             flag, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
     while (__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
                                   __ATOMIC_ACQUIRE,
-                                  __MEMORY_SCOPE_DEVICE) < flag);
+                                  VLLM_CAR_PEER_ACQUIRE_SCOPE) < flag);
   }
   __syncthreads();
   if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
@@ -310,7 +328,7 @@ DINLINE void barrier_at_end(const RankSignals& sg, Signal* self_sg, int rank) {
     while (
         __scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
                                final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
-                               __MEMORY_SCOPE_DEVICE) < flag);
+                               VLLM_CAR_PEER_ACQUIRE_SCOPE) < flag);
   }
   if constexpr (!final_sync) __syncthreads();
   // use one thread to update flag
@@ -318,6 +336,32 @@ DINLINE void barrier_at_end(const RankSignals& sg, Signal* self_sg, int rank) {
 }
 
 #endif
+
+// Start-of-kernel barrier used by the reduce kernels.
+//
+// Upstream calls the fully relaxed `barrier_at_start` here on the grounds that
+// the first barrier "doesn't need to make any visibility guarantees for prior
+// memory accesses". That reasoning holds for the calling rank's OWN prior
+// accesses; it does not hold for the peer input buffers the reduce kernel is
+// about to read, which were written by REMOTE agents. Use the
+// release/acquire variant so the peer's staging writes are ordered before our
+// reads. ROCm only -- the CUDA path keeps upstream behaviour.
+//
+// Build with -DVLLM_CAR_UPSTREAM_START_BARRIER=1 to restore the upstream
+// relaxed barrier for an A/B cost measurement.
+#ifndef VLLM_CAR_UPSTREAM_START_BARRIER
+  #define VLLM_CAR_UPSTREAM_START_BARRIER 0
+#endif
+
+template <int ngpus>
+DINLINE void barrier_at_start_for_reduce(const RankSignals& sg,
+                                         Signal* self_sg, int rank) {
+#if defined(USE_ROCM) && !VLLM_CAR_UPSTREAM_START_BARRIER
+  barrier_at_start_release<ngpus>(sg, self_sg, rank);
+#else
+  barrier_at_start<ngpus>(sg, self_sg, rank);
+#endif
+}
 
 template <typename P, int ngpus, typename A>
 DINLINE P packed_reduce(const P* ptrs[], int idx) {
