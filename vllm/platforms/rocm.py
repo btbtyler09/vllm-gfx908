@@ -246,10 +246,26 @@ if _ON_GFX908:
         "VLLM_ROCM_USE_AITER_MHA": "0",
         "VLLM_ROCM_USE_AITER_MLA": "0",
         "VLLM_ROCM_USE_AITER_RMSNORM": "0",
-        # AITER custom allreduce (2026-08 rewrite: fp8 quant + fused AR+RMSNorm)
-        # compiles on gfx908 with the opus.hpp guards but computes garbage —
-        # A/B on Qwen3.8-27B TP4: CAR on = degenerate '!!!' output, CAR off =
-        # coherent. Default off until the CDNA1 numerics are debugged.
+        # AITER custom all-reduce: ON for gfx908.
+        #
+        # History: the 2026-08 AITER rewrite (fp8 quant + fused AR+RMSNorm)
+        # compiled on gfx908 but computed garbage — A/B on Qwen3.8-27B TP4 gave
+        # degenerate '!!!' output with it on. Root-caused and fixed in the aiter
+        # fork during the 2026-08-27 sync: the eager IPC input pool now lives in
+        # UNCACHED device memory (AITER_CAR_UNCACHED_POOL, so peer reads bypass
+        # a stale L2) and the start/end signal exchange uses a release/acquire
+        # pair. Captured all-reduces additionally route through that same
+        # pre-registered pool instead of binding the input tensor's own pointer.
+        # After the fix: coherent, and +15.8% at c=64. This default was flipped
+        # to "1" then.
+        #
+        # IMPORTANT for anyone debugging the collective: when this is "1",
+        # CudaCommunicator constructs AiterCustomAllreduce and then SKIPS
+        # vLLM's own CustomAllreduce entirely (see cuda_communicator.py:
+        # `if use_custom_allreduce and self.aiter_ar_comm is None`). The live
+        # reduce kernels are aiter's csrc/include/custom_all_reduce.cuh — vLLM's
+        # csrc/custom_all_reduce.cuh and csrc/custom_collective_common.cuh are
+        # dead code on this path. Set this to "0" to get vLLM's implementation.
         "VLLM_ROCM_USE_AITER_CUSTOM_AR": "1",
         # Disable FP8/FP4 (no hardware support)
         "VLLM_ROCM_USE_AITER_FP8BMM": "0",
