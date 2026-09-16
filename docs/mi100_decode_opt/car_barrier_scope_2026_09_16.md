@@ -137,3 +137,62 @@ decode step, so this must be measured):
 
 Ship only if correctness passes and the step-time delta is inside the
 0.15 ms/step flip threshold.
+
+---
+
+## Which all-reduce actually runs on our serves — and the AITER copy
+
+Added 2026-09-16 after the audit above, because it changes where the fix has
+to land.
+
+`vllm/platforms/rocm.py` `_GFX908_DEFAULTS` sets
+`VLLM_ROCM_USE_AITER_CUSTOM_AR: "1"`. In
+`vllm/distributed/device_communicators/cuda_communicator.py`, when
+`use_aiter_allreduce` is true the communicator builds `AiterCustomAllreduce`
+and the vLLM `CustomAllreduce` (`ca_comm`) is **not constructed at all**
+(`if use_custom_allreduce and self.aiter_ar_comm is None`). So on our stock
+gfx908 serves the live reduce kernels are **AITER's**, in the aiter fork at
+`csrc/include/custom_all_reduce.cuh` — not the vLLM `csrc/` file patched
+above. The vLLM patch only matters for `VLLM_ROCM_USE_AITER_CUSTOM_AR=0`
+configs.
+
+*(Note: the comment block above that default in `rocm.py` still says "Default
+off until the CDNA1 numerics are debugged" while the value is `"1"`. The value
+was flipped after the 2026-08-27 sync verified CAR coherent; the comment is
+stale and should be corrected.)*
+
+AITER's `start_sync` / `end_sync` have the same shape:
+
+| | flag store | flag load |
+|---|---|---|
+| `start_sync` (ROCm) | `__ATOMIC_RELEASE`, `__MEMORY_SCOPE_SYSTEM` | `__ATOMIC_ACQUIRE`, **`__MEMORY_SCOPE_DEVICE`** (both the seq and legacy waits) |
+| `end_sync` (ROCm) | `__ATOMIC_RELEASE` (`RELAXED` if `final_sync`), `__MEMORY_SCOPE_SYSTEM` | `__ATOMIC_ACQUIRE` (`RELAXED` if `final_sync`), **`__MEMORY_SCOPE_DEVICE`** |
+
+So the **ordering** half of the fix is already present here — `start_sync` is
+release/acquire, not relaxed, from the 2026-08 signal-hardening work — and
+only the acquire **scope** is still DEVICE. Four load sites.
+
+Two mitigations already in this path make the practical window much narrower
+than upstream vLLM's CAR:
+
+1. `start_sync` publishes with a SYSTEM-scope RELEASE, so the producing side
+   already orders its pool writes before the flag.
+2. The IPC input pool is allocated **uncached** on gfx908
+   (`AITER_CAR_UNCACHED_POOL` defaults to `1`, `hipExtMallocWithFlags` with
+   `hipDeviceMallocUncached`), so peer reads go to memory and the stale-L2
+   mechanism that caused the 2026-08 serving corruption is gone. With no cache
+   line to invalidate, the reader's acquire scope has little left to do.
+
+That is a reasoning argument, not a measurement. The scope promotion costs
+nothing to carry, so the patch lands on both sides:
+
+- `btbtyler09/aiter-gfx908` branch `gfx908-car-barrier-scope` (commit
+  `e2b5092a7`): four acquires promoted to `__MEMORY_SCOPE_SYSTEM`, reversible
+  with `-DAITER_CAR_PEER_ACQUIRE_SCOPE_DEVICE=1`. **This is the one on our hot
+  path.**
+- `btbtyler09/vllm-gfx908` branch `gfx908-car-barrier-scope` (this commit):
+  the vLLM-side fix, for `VLLM_ROCM_USE_AITER_CUSTOM_AR=0` configs.
+
+Open check not yet done: whether the **graph-capture** pool (the
+pre-registered pool captured ARs route through) is also uncached, or only the
+eager `input` pool is.
