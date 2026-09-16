@@ -140,74 +140,161 @@ Ship only if correctness passes and the step-time delta is inside the
 
 ---
 
-## Which all-reduce actually runs on our serves — and the AITER copy
+## CORRECTED 2026-09-16 (second pass): vLLM's CAR is the live path, not AITER's
 
-Added 2026-09-16 after the audit above, because it changes where the fix has
-to land.
+An earlier revision of this section claimed the opposite. It was wrong. It was
+derived from a branch default (`_GFX908_DEFAULTS` sets
+`VLLM_ROCM_USE_AITER_CUSTOM_AR: "1"`) without checking a single boot log.
+Tyler pushed back; the logs settle it.
 
-`vllm/platforms/rocm.py` `_GFX908_DEFAULTS` sets
-`VLLM_ROCM_USE_AITER_CUSTOM_AR: "1"`. In
-`vllm/distributed/device_communicators/cuda_communicator.py`, when
-`use_aiter_allreduce` is true the communicator builds `AiterCustomAllreduce`
-and the vLLM `CustomAllreduce` (`ca_comm`) is **not constructed at all**
-(`if use_custom_allreduce and self.aiter_ar_comm is None`). So on our stock
-gfx908 serves the live reduce kernels are **AITER's**, in the aiter fork at
-`csrc/include/custom_all_reduce.cuh` — not the vLLM `csrc/` file patched
-above. The vLLM patch only matters for `VLLM_ROCM_USE_AITER_CUSTOM_AR=0`
-configs.
+### Evidence: every boot selected CUSTOM
 
-*(Note: the comment block above that default in `rocm.py` still says "Default
-off until the CDNA1 numerics are debugged" while the value is `"1"`. The value
-was flipped after the 2026-08-27 sync verified CAR coherent; the comment is
-stale and should be corrected.)*
+Scanned every log under `~/work`, `~/bench_results_v027`, `~/mi100-llm-testing`
+and the session scratch that contains the backend-dispatch line — 60+ boots
+spanning `v0.21.0` through `v0.27.2rc1.dev682+g45eacfa4c`, 2026-08 to 2026-09.
+**Every one selected `CUSTOM`. None selected `AITER_CUSTOM`**, although
+`AITER_CUSTOM` is listed as a potential backend in all of them:
 
-AITER's `start_sync` / `end_sync` have the same shape:
+```
+cuda_communicator.py:269  Using ['CUSTOM', 'PYNCCL'] all-reduce backends (in dispatch order)
+for group 'tp:0' out of potential backends: ['FLASHINFER', 'NCCL_SYMM_MEM', 'QUICK_REDUCE',
+'AITER_CUSTOM', 'CUSTOM', 'SYMM_MEM', 'PYNCCL'].
+```
 
-| | flag store | flag load |
+Three independent confirmations in the same boots:
+
+- `allreduce_rms_fusion.py:1584` — "AITER allreduce fusions are disabled
+  because AITER Custom All Reduce is not enabled."
+- `rocm.py:1104` fires the *opposite* branch ("enabling AITER
+  allreduce+rmsnorm fusion"), which is gated on
+  `os.environ.get("VLLM_ROCM_USE_AITER_CUSTOM_AR", "0") != "1"`.
+- `gfx908_push_ar.py:393` prints on all four ranks. The push AR is constructed
+  inside vLLM's `CustomAllreduce` (`maybe_create_push_ar`) and is referenced
+  nowhere in `aiter_custom_all_reduce.py`. If AITER CAR were on, `ca_comm`
+  would never be constructed (`cuda_communicator.py:120` guards on
+  `self.aiter_ar_comm is None`) and the push AR could not exist.
+
+### Mechanism
+
+`docker/Dockerfile.q38fn` bakes `ENV VLLM_ROCM_USE_AITER=1
+VLLM_ROCM_USE_AITER_CUSTOM_AR=0`. `_GFX908_DEFAULTS` only fills vars that are
+**not already in `os.environ`**, so the image ENV wins and the branch default
+never applies. It is the only Dockerfile in the tree that sets either var.
+
+Source read alone would have been misleading twice over: the branch default is
+`"1"` while the comment directly above it said "Default off", and the image
+overrides both. **Per-image runtime logs, not branch source, decide which
+all-reduce ships.** That is the lesson from this correction.
+
+## Corrected blast radius — vLLM `csrc/custom_collective_common.cuh`
+
+This is the file curvedinf patched and reported as
+`vllm-project/vllm#57059`, and it is the one we ship.
+
+### Does anything equivalent to the uncached pool protect this path?
+
+**Yes** — and it is upstream code, not something I should have attributed to
+AITER. `csrc/libtorch_stable/custom_all_reduce.cu:157`
+`allocate_shared_buffer_and_handle` allocates the IPC staging buffers with
+`hipExtMallocWithFlags(..., hipDeviceMallocUncached)` under `#if
+defined(USE_ROCM)`, with the comment "data buffers need to be 'uncached' for
+signal on MI200". Those buffers back the `registered=False` path.
+
+Our fork forces `registered=False` on gfx908 in **both** directions —
+eagerly (`custom_all_reduce.py`, the `else` arm) and under capture (the
+`on_gfx908()` branch, which exists precisely because HIP IPC views of cached
+`cudaMalloc`'d memory drift under graph replay). So every gfx908 CAR message
+stages through uncached memory, and the stale-peer-L2 mechanism is absent here
+too.
+
+**What does NOT carry over:** AITER's `start_sync` already uses a
+RELEASE/ACQUIRE pair. vLLM's `barrier_at_start` is fully `__ATOMIC_RELAXED`
+with no acquire at all, and both reduce kernels enter through it. The path we
+ship is therefore the **weaker** of the two — mitigated on the caching axis,
+unmitigated on the ordering axis.
+
+### The exposed slice, per model
+
+Two filters sit in front of the suspect barriers. The push AR
+(`gfx908_push_ar.py:424` `eligible`) takes a message only if it is
+**bfloat16**, contiguous, `dim >= 2`, `n % 8 == 0`, `n <= 8192`, and
+`numel <= slot_elems = 122,880`. Whatever it declines falls to
+`CustomAllreduce`, which itself only handles messages up to `max_size` —
+capped by the image ENV `VLLM_GFX908_CUSTOM_AR_MAX_SIZE_MB=2` to **2 MiB**
+(`custom_all_reduce.py:234`). Anything larger goes to PYNCCL/RCCL and never
+touches these barriers.
+
+**Qwen3.8-Flash-Next (bf16, AR width 2560, 2 B/elem):**
+
+| tokens T in the AR | bytes | path |
 |---|---|---|
-| `start_sync` (ROCm) | `__ATOMIC_RELEASE`, `__MEMORY_SCOPE_SYSTEM` | `__ATOMIC_ACQUIRE`, **`__MEMORY_SCOPE_DEVICE`** (both the seq and legacy waits) |
-| `end_sync` (ROCm) | `__ATOMIC_RELEASE` (`RELAXED` if `final_sync`), `__MEMORY_SCOPE_SYSTEM` | `__ATOMIC_ACQUIRE` (`RELAXED` if `final_sync`), **`__MEMORY_SCOPE_DEVICE`** |
+| 1 – 48 | ≤ 245 KiB | push AR (the boot log's own "T <= 48 at width 2560") |
+| 49 – 102 | 245 KiB – 512 KiB | **vLLM CAR, 1stage** |
+| 103 – 409 | 512 KiB – 2 MiB | **vLLM CAR, 2stage** |
+| ≥ 410 | > 2 MiB | PYNCCL |
 
-So the **ordering** half of the fix is already present here — `start_sync` is
-release/acquire, not relaxed, from the 2026-08 signal-hardening work — and
-only the acquire **scope** is still DEVICE. Four load sites.
+Decode at our serving cap (`--max-num-seqs 48`) is entirely push AR. Prefill
+chunks (`--max-num-batched-tokens 8192` → 41.9 MB) are entirely PYNCCL. The
+exposed band is the middle: mixed batches, chunked-prefill tails and
+spec-verify rows with 49 ≤ T ≤ 409. Narrow, and it excludes the two shapes
+that dominate the step count.
 
-Two mitigations already in this path make the practical window much narrower
-than upstream vLLM's CAR:
+**Dense Qwen3.8-27B-GPTQ-8bit (fp16, hidden 5120, 2 B/elem):** served with
+`--dtype half` (`serve_dense27b.sh:20`) on the same image. The push AR is
+**bf16-only**, so it declines every message and the filter in front of the
+barriers disappears:
 
-1. `start_sync` publishes with a SYSTEM-scope RELEASE, so the producing side
-   already orders its pool writes before the flag.
-2. The IPC input pool is allocated **uncached** on gfx908
-   (`AITER_CAR_UNCACHED_POOL` defaults to `1`, `hipExtMallocWithFlags` with
-   `hipDeviceMallocUncached`), so peer reads go to memory and the stale-L2
-   mechanism that caused the 2026-08 serving corruption is gone. With no cache
-   line to invalidate, the reader's acquire scope has little left to do.
+| tokens T | bytes | path |
+|---|---|---|
+| 1 – 51 | ≤ 512 KiB | **vLLM CAR, 1stage** |
+| 52 – 204 | 512 KiB – 2 MiB | **vLLM CAR, 2stage** |
+| ≥ 205 | > 2 MiB | PYNCCL |
 
-That is a reasoning argument, not a measurement. The scope promotion costs
-nothing to carry, so the patch lands on both sides:
+**Every decode step of every fp16 dense serve we run goes through the relaxed
+`barrier_at_start` and the 1stage kernel.** That is the real exposed surface,
+and it is the one behind the published dense-27B numbers and the long-context
+sweep. I have no boot log for the `v0.27.4rc2.dev` campaign image, so I state
+that rather than infer it; the logs I do have span v0.21 to v0.27.2 and are
+unanimous.
 
-- `btbtyler09/aiter-gfx908` branch `gfx908-car-barrier-scope` (commit
-  `e2b5092a7`): four acquires promoted to `__MEMORY_SCOPE_SYSTEM`, reversible
-  with `-DAITER_CAR_PEER_ACQUIRE_SCOPE_DEVICE=1`. **This is the one on our hot
-  path.**
-- `btbtyler09/vllm-gfx908` branch `gfx908-car-barrier-scope` (this commit):
-  the vLLM-side fix, for `VLLM_ROCM_USE_AITER_CUSTOM_AR=0` configs.
+### Does the 512 KiB crossover still bite?
 
-**Graph-capture pool — answered, it is the same uncached pool.**
-`aiter/dist/device_communicators/custom_all_reduce.py:1250` computes
-`reg = self.enable_register_for_capturing and not _on_gfx908()`, so on gfx908
-a captured all-reduce always takes `registered_input=False` — the copy-in path
-that stages into the pre-registered `input` pool, with the copy captured inside
-the graph (the "registered" path would bake a cached-memory IPC view of the
-input tensor's own pointer into the graph, which is the 2026-08 replay
-corruption: first decode token correct, every replayed token after it wrong).
-That `input` pool is created once at line 1084 with `uncached=uncached_pool`,
-where line 1080 sets `uncached_default = "1" if _on_gfx908() else "0"`. So the
-graph path and the eager path share one uncached allocation; graphs do **not**
-reintroduce the stale-L2 mechanism, and the blast radius above stands as
-written. (Overridable with `AITER_CAR_UNCACHED_POOL=0`, A/B only.)
+Yes, inside the exposed band. It is not absorbed by the push AR in either
+model: for Flash-Next the push AR cuts off at T=48, below the T=102 crossover,
+so the band straddles it; for fp16 dense the push AR is absent entirely and
+the crossover sits at T=51, inside the CAR range. So the same layer's
+all-reduce still sums in a different order either side of that boundary. It
+remains a reproducibility defect, not a wrong answer.
 
-**Fabric, measured not inferred.** `rocm-smi --showtopotype --showtopohops
---showtopoweight` on this node: every off-diagonal pair reads `XGMI`, 1 hop,
-weight 15 — a genuine all-to-all 4-card hive, no bridged pairs and no PCIe
-cross-pair link.
+### Patch ranking — inverted from the first pass
+
+1. **`btbtyler09/vllm-gfx908` branch `gfx908-car-barrier-scope` — the one that
+   matters.** It is the live path on every image we ship, it carries the fully
+   relaxed start barrier, and for fp16 dense serves it handles all decode
+   traffic. The patch does both halves: scope promotion on the three acquires
+   and `barrier_at_start` → `barrier_at_start_release` in both reduce kernels.
+2. **`btbtyler09/aiter-gfx908` branch `gfx908-car-barrier-scope` — near
+   irrelevant today.** AITER's CAR is not selected on any image we ship, and
+   it already has the release/acquire pair. Keep it (it costs nothing and
+   protects anyone who sets `VLLM_ROCM_USE_AITER_CUSTOM_AR=1`), but it is not
+   the fix to validate first.
+
+### Effect on the validation plan
+
+The correctness harness must exercise **vLLM's** kernels, at the sizes that
+actually reach them: 49–409 tokens at width 2560 bf16, and 1–204 tokens at
+width 5120 fp16, straddling the 512 KiB crossover in both. Add an fp16 dense
+arm — it is the configuration with no push AR in front of it. The cost
+measurement is correspondingly less interesting for c=1 Flash-Next decode
+(push AR handles it) and more interesting for fp16 dense decode and for
+mid-size mixed batches.
+
+## Superseded first-pass claims
+
+For the record, so nobody re-derives from the wrong version: the first pass of
+this note asserted that AITER's CAR was live on our serves, that the
+uncached-pool mitigation was an AITER-only property, and that the AITER-side
+patch was the one on the hot path. All three are wrong. The graph-capture
+finding from that pass (captured ARs route through a pre-registered uncached
+buffer rather than binding the input pointer) is correct and holds on the vLLM
+path as well, by the same `registered=False` mechanism.
