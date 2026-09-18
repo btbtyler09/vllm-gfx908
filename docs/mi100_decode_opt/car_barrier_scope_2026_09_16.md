@@ -298,3 +298,42 @@ patch was the one on the hot path. All three are wrong. The graph-capture
 finding from that pass (captured ARs route through a pre-registered uncached
 buffer rather than binding the input pointer) is correct and holds on the vLLM
 path as well, by the same `registered=False` mechanism.
+
+
+---
+
+## VALIDATION RESULT 2026-09-18 (correctness half only; cost arms deferred)
+
+Cards were free 09:23-14:00; the hub re-scoped to correctness only.
+
+**Arm 1 — 4-rank standalone harness: PASS.** 1.2M all-reduce calls per build
+across three builds (stock image `_C`, standalone control with
+`-DVLLM_CAR_PEER_ACQUIRE_SCOPE_DEVICE=1 -DVLLM_CAR_UPSTREAM_START_BARRIER=1`,
+standalone patched) = 3.6M total. **Zero mismatches, zero NaN.** Per rank per
+arm: 150,000 1stage and 150,000 2stage calls, alternating across the 512 KiB
+crossover every iteration, 96 queued with no host sync, 8 MB producer write
+before each. Bit-exact (integer payloads < 61, 4-rank sum < 244 exact in bf16).
+Harness: `/home/tyler/work/car4/car4.py`.
+
+The control passed too, so **the defect is not reproduced**. The patch closes a
+formal ordering gap; there is no empirical demonstration it was ever firing.
+
+**Arm 2 — greedy parity: INCONCLUSIVE by construction.** Patched vs the stock
+rc10 reference scored 17/20 identical, but the same live server scores only
+19/20 against itself back-to-back, and 5-7 of 8 prompts are non-deterministic
+across greedy repeats on *stock*. The gate's noise floor swamps the signal.
+Full write-up: `parity_noise_floor_2026_09_18.md` (and next to the gate itself
+at `~/work/flashnext_vision_smoke/PARITY_NOISE_FLOOR.md`).
+
+**Cost arms (step timer, AR microbench) NOT RUN.** Ship condition is
+correctness AND cost inside the 0.15 ms/step flip threshold, so the patch
+**remains unshippable**: correctness partially established, cost unmeasured.
+
+**Method notes.** Avoided a 45 MB `_C_stable_libtorch` rebuild by compiling
+`libtorch_stable/custom_all_reduce.cu` standalone (shallow include graph) and
+re-registering the ops under `_car_test`, then redirecting `vllm._custom_ops`
+via a lazy `sitecustomize` injector — two-minute builds, exact single-TU A/B.
+Two near-misses: the `.so` was silently truncated to 0 bytes twice on a
+writable bind mount, and one boot came up **healthy with `ops_loaded=0`**,
+which would have produced a clean "parity passed" while running entirely stock
+kernels. Gate on the artifact actually loading, never on `/health`.
