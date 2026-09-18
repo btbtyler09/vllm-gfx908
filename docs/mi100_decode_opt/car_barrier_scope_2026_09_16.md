@@ -337,3 +337,61 @@ Two near-misses: the `.so` was silently truncated to 0 bytes twice on a
 writable bind mount, and one boot came up **healthy with `ops_loaded=0`**,
 which would have produced a clean "parity passed" while running entirely stock
 kernels. Gate on the artifact actually loading, never on `/health`.
+
+## COST ARMS 2026-09-18 (both run; patch is CHEAP, and the in-server test cannot resolve it)
+
+Probe choice: **fp16 dense Qwen3.8-27B-GPTQ-8bit**, because nothing sits in
+front of vLLM's CAR there. Flash-Next decode is owned by the gfx908 push AR
+(bf16, numel <= 122880), so it barely exercises this patch at all.
+
+### AR microbench — the instrument that can actually resolve it
+
+Same translation unit both arms, only the barrier macros differ, ops redirected
+to a standalone `.so` so injection overhead is common-mode.
+
+| message | control us/call | patched us/call | delta | pct |
+|---|---|---|---|---|
+| 1 tok / 10 KiB | 13.07 | 13.31 | +0.24 | +1.8% |
+| 8 tok / 80 KiB | 14.31 | 14.60 | +0.29 | +2.0% |
+| 16 tok / 160 KiB | 19.57 | 20.22 | +0.65 | +3.3% |
+| 48 tok / 480 KiB | 37.51 | 38.04 | +0.53 | +1.4% |
+| 96 tok / 960 KiB | 43.72 | 44.21 | +0.49 | +1.1% |
+| 192 tok / 1.9 MiB | 73.55 | 74.18 | +0.64 | +0.9% |
+| 384 tok / 3.8 MiB | 134.22 | 134.64 | +0.42 | +0.3% |
+
+Decode sizes median-of-3, positive on 7/7; larger sizes 2 replicates, positive
+on 10/10. **Mean +0.37 us per all-reduce call.** At 96-128 ARs per decode step
+that is **+0.036 to +0.048 ms/step** — roughly a quarter to a third of the
+0.15 ms/step flip threshold. Small, consistently signed, **not zero**.
+
+### In-server step timer — 3 alternating pairs (P,C,P,C,P,C), c=1 TPOT
+
+| pair | patched | control | delta |
+|---|---|---|---|
+| 1 | 18.514 | 18.365 | +0.149 |
+| 2 | 18.515 | 18.401 | +0.114 |
+| 3 | 18.502 | 18.521 | **-0.019** |
+
+patched spread 0.013 ms; **control spread 0.156 ms**. The delta is NOT
+consistently signed and the control arm's own boot-to-boot drift exceeds the
+effect. **The in-server test cannot resolve this patch** — 0.04 ms is 0.2% of
+an 18.5 ms step. c=16 and c=64 are worse: the c=64 mean delta is +1.29 ms,
+**17x larger than the physical ceiling** the microbench allows (+0.59 us/call
+x 128 ARs = +0.075 ms), so that tier is pure batching/scheduling variance.
+
+An earlier two-pair reading of this data suggested a real +0.13 ms/step cost
+and reached for an L2-working-set explanation for why it beat the microbench.
+The third pair falsified it: there was no effect, only two low control boots.
+Recorded because the failure mode is instructive — an alternating design plus
+the discipline of finishing all three pairs is what caught it.
+
+### Verdict
+
+**Cost is not a barrier to shipping.** By the only instrument with the
+resolution to measure it, the patch costs ~0.04-0.05 ms/step, well inside the
+0.15 ms flip threshold. The ship condition remains unmet only on the
+**correctness** side, where the defect was never reproduced (harness passes on
+control too) and greedy parity is uninformative on this stack.
+
+All six boots gated on `ops_loaded >= 4` (the four TP ranks) before any
+measurement was taken. Raw: `/home/tyler/work/car4/cost_*.json`, `arb*.json`.
