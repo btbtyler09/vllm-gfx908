@@ -76,11 +76,18 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
                 # through F.embedding (tied embeddings), which would see the
                 # zero-storage stub. lm_head is excluded from the default free
                 # policy anyway (it runs at M = #sequences every decode step).
+                # Only a ParallelLMHead runs the W8 GEMM: a plain embedding
+                # table is read through F.embedding and its int8 copy would
+                # never be used (0.15 GiB/rank for embed_tokens).  A plain
+                # VocabParallelEmbedding used *as* the head (lm_head =
+                # embed_tokens) is prepped by prepare_w8a16_lm_heads from the
+                # loader's model-level pass instead.
                 from vllm.model_executor.layers.gfx908_w8a16 import (
                     prepare_w8a16_layer,
                 )
 
-                prepare_w8a16_layer(layer, allow_free=False)
+                if isinstance(layer, ParallelLMHead):
+                    prepare_w8a16_layer(layer, allow_free=False)
                 # TEST lever: pre-bind only when opted in; default off keeps the
                 # baseline runtime-dispatch path (VLLM_GFX908_PREBIND_GEMM=1).
                 if os.environ.get("VLLM_GFX908_PREBIND_GEMM", "0") == "1":

@@ -416,6 +416,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             gfx908_boot_summary(self.model)
         except Exception as exc:  # noqa: BLE001 - the banner must never break a boot
             logger.debug("gfx908 boot banner skipped: %s", exc)
+        from vllm.platforms import current_platform
+
+        if current_platform.is_rocm():
+            try:
+                from vllm.platforms.rocm import on_gfx908
+
+                if on_gfx908():
+                    from vllm.model_executor.layers.gfx908_w8a16 import (
+                        log_w8a16_prep_summary,
+                    )
+
+                    live = [self.model]
+                    draft = getattr(self.speculator, "model", None)
+                    if draft is not None:
+                        live.append(draft)
+                    log_w8a16_prep_summary(live)
+            except Exception as exc:  # noqa: BLE001 - never break a boot over a log
+                logger.warning("gfx908 W8 prep summary skipped: %s", exc)
 
         # Initialize the components that require the model.
         self.model_state = init_model_state(

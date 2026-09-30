@@ -25,6 +25,19 @@ def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
     return torch.equal(w, target.weight)
 
 
+def _release_discarded_w8(discarded, keep: list) -> None:
+    """Drop the gfx908 W8 cache entries of a draft module about to be replaced
+    by the target's.  The cache pins both the int8 copy and the bf16 Parameter
+    (by data_ptr), so without this a discarded draft embed/lm_head stays
+    resident for the life of the process.  Modules in ``keep`` (and any weight
+    storage they share) are left alone.  No-op when nothing was cached."""
+    if discarded is None or any(discarded is k for k in keep):
+        return
+    from vllm.model_executor.layers.gfx908_w8a16 import release_w8a16_module
+
+    release_w8a16_module(discarded, keep=[k for k in keep if k is not None])
+
+
 def get_target_lm_head(target_model: nn.Module, target_language_model: nn.Module):
     """The target's lm_head — from get_language_model() for
     *ForConditionalGeneration targets, else the top-level module."""
@@ -77,6 +90,10 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
             eagle_model, "has_own_embed_tokens", draft_embed, target_embed
         ):
             if draft_embed is not None:
+                _release_discarded_w8(
+                    draft_embed,
+                    [target_embed, getattr(eagle_model, "lm_head", None)],
+                )
                 del draft_inner.embed_tokens
             draft_inner.embed_tokens = target_embed
 
@@ -86,6 +103,10 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
         eagle_model, "has_own_lm_head", draft_lm_head, target_lm_head
     ):
         if draft_lm_head is not None:
+            _release_discarded_w8(
+                draft_lm_head,
+                [target_lm_head, getattr(draft_inner, "embed_tokens", None)],
+            )
             del eagle_model.lm_head
         eagle_model.lm_head = target_lm_head
 
@@ -97,6 +118,7 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
             for layer in items:
                 sh = getattr(layer, "shared_head", None)
                 if sh is not None and hasattr(sh, "head"):
+                    _release_discarded_w8(sh.head, [target_lm_head])
                     del sh.head
                     sh.head = target_lm_head
 

@@ -122,6 +122,21 @@ def process_weights_after_loading(
             # the caching allocator, which starves the OS on UMA devices.
             release_device_memory_under_pressure(target_device)
 
+    from vllm.platforms import current_platform
+
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx908
+
+        if on_gfx908():
+            # W8A16: prep the modules this model actually uses as its LM head
+            # (also a plain VocabParallelEmbedding tied as lm_head); embedding
+            # tables that are only looked up are skipped.
+            from vllm.model_executor.layers.gfx908_w8a16 import (
+                prepare_w8a16_lm_heads,
+            )
+
+            prepare_w8a16_lm_heads(model)
+
     # Initialize post-load attention weights for any attention layer and MM
     # encoder. NOTE: Happens after other modules so we can easily decompress
     # weights.

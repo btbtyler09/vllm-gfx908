@@ -162,6 +162,10 @@ W8A16_SHAPES = frozenset({(4096, 2560), (4160, 2560), (2560, 1536), (62080, 2560
 # copy duplicates.  ``all`` adds it anyway (N-chunked dequant).
 W8A16_FREE_SHAPES_GDN = frozenset({(4096, 2560), (4160, 2560), (2560, 1536)})
 
+# Vocab-sized shapes: the only ones that are also embedding tables.  Used by the
+# boot summary to count LM heads separately.
+W8A16_VOCAB_SHAPES = frozenset({(62080, 2560)})
+
 # (YTILE, UNRL, LPR, KS) per shape and M, from the microbench sweeps
 # (agents/w8a16/REPORT.md "Recommended dispatch").
 _CFG: dict[tuple[int, int], dict[int, tuple[int, int, int, int]]] = {
@@ -896,6 +900,144 @@ def prepare_w8a16_layer(layer, allow_free: bool = True) -> bool:
     except Exception as exc:  # never break model loading over this
         logger.warning_once("gfx908 W8A16: prepare failed for %s (%s)", type(layer), exc)
         return False
+
+
+def prepare_w8a16_lm_heads(model) -> int:
+    """Prep every module that some module of ``model`` exposes as ``lm_head``.
+
+    Covers heads the embedding-method hook cannot recognise by type, i.e. a
+    plain ``VocabParallelEmbedding`` used as the head (``lm_head =
+    embed_tokens``).  Embedding tables that are only looked up (F.embedding)
+    are never prepped: their int8 copy would never be read.
+    """
+    n = 0
+    seen: set[int] = set()
+    for m in model.modules():
+        head = getattr(m, "lm_head", None)
+        if not isinstance(head, torch.nn.Module) or id(head) in seen:
+            continue
+        seen.add(id(head))
+        if prepare_w8a16_layer(head, allow_free=False):
+            n += 1
+    return n
+
+
+def _entry_bytes(ent: _QEntry) -> tuple[int, int]:
+    """(int8 + scale bytes, pinned bf16 master bytes) of one cache entry."""
+    side = sum(
+        t.numel() * t.element_size()
+        for t in (ent.q, ent.s, ent.qsw, ent.ssw, ent.q4, ent.s4)
+        if t is not None
+    )
+    pinned = 0
+    if ent.owner is not None:
+        pinned = ent.owner.numel() * ent.owner.element_size()
+    return side, pinned
+
+
+def release_w8a16_weight(weight) -> int:
+    """Drop the cache entry keyed by ``weight`` (int8 copy + bf16 pin).
+
+    For a module that is being discarded (e.g. a draft head replaced by the
+    target's): without this the entry keeps both the int8 copy and, through
+    ``owner``, the bf16 Parameter alive for the life of the process.  Returns
+    the bytes the entry held (int8 + scales + pinned bf16).
+    """
+    if not isinstance(weight, torch.Tensor) or weight.dim() != 2 or weight.is_meta:
+        return 0
+    ent = _Q_CACHE.pop(_cache_key(weight), None)
+    if ent is None:
+        return 0
+    side, pinned = _entry_bytes(ent)
+    return side + pinned
+
+
+def release_w8a16_module(module, keep=()) -> int:
+    """``release_w8a16_weight`` for every parameter of ``module`` except those
+    whose storage is also a parameter of a module in ``keep`` (shared/tied
+    weights stay cached)."""
+    kept = {
+        p.untyped_storage().data_ptr()
+        for k in keep
+        if isinstance(k, torch.nn.Module)
+        for p in k.parameters()
+    }
+    total = 0
+    for p in module.parameters():
+        if p.untyped_storage().data_ptr() in kept:
+            continue
+        total += release_w8a16_weight(p)
+    return total
+
+
+def w8a16_prep_summary(live_modules=()) -> dict:
+    """Counts/bytes of the W8 cache, split into vocab heads and the rest, plus
+    entries that belong to no parameter of ``live_modules`` (orphans = leaks).
+    """
+    ranges = []
+    for mod in live_modules:
+        if not isinstance(mod, torch.nn.Module):
+            continue
+        for p in (*mod.parameters(), *mod.buffers()):
+            st = p.untyped_storage()
+            ranges.append((st.data_ptr(), st.data_ptr() + max(st.nbytes(), 1)))
+    heads, others, orphans = [], [], []
+    side_h = side_o = pinned = orphan_bytes = 0
+    for key, ent in _Q_CACHE.items():
+        ptr, n, k = key[0], key[1], key[2]
+        side, pin = _entry_bytes(ent)
+        pinned += pin
+        if (n, k) in W8A16_VOCAB_SHAPES:
+            heads.append((n, k))
+            side_h += side
+        else:
+            others.append((n, k))
+            side_o += side
+        if live_modules and not any(lo <= ptr < hi for lo, hi in ranges):
+            orphans.append((n, k))
+            orphan_bytes += side + pin
+    return {
+        "heads": heads,
+        "head_bytes": side_h,
+        "others": others,
+        "other_bytes": side_o,
+        "pinned_bf16_bytes": pinned,
+        "orphans": orphans,
+        "orphan_bytes": orphan_bytes,
+    }
+
+
+def log_w8a16_prep_summary(live_modules=()) -> dict | None:
+    """One boot line that proves which tensors hold a W8 copy, e.g.
+    ``gfx908 W8 prep: 1 vocab head (62080x2560), 0.15 GiB int8+scales; ...``.
+    Warns loudly when an entry belongs to no live module."""
+    if not _Q_CACHE and not w8a16_enabled():
+        return None
+    s = w8a16_prep_summary(live_modules)
+    gib = float(1 << 30)
+    shapes = sorted({f"{n}x{k}" for n, k in s["heads"]})
+    logger.info(
+        "gfx908 W8 prep: %d vocab head%s (%s), %.2f GiB int8+scales; "
+        "%d other W8 tensors, %.2f GiB; bf16 masters pinned by the cache "
+        "%.2f GiB; orphans %d",
+        len(s["heads"]),
+        "" if len(s["heads"]) == 1 else "s",
+        ", ".join(shapes) or "-",
+        s["head_bytes"] / gib,
+        len(s["others"]),
+        s["other_bytes"] / gib,
+        s["pinned_bf16_bytes"] / gib,
+        len(s["orphans"]),
+    )
+    if s["orphans"]:
+        logger.warning(
+            "gfx908 W8 prep: %d cache entries (%.2f GiB incl. pinned bf16) "
+            "belong to no live module (leak): %s",
+            len(s["orphans"]),
+            s["orphan_bytes"] / gib,
+            ", ".join(f"{n}x{k}" for n, k in s["orphans"]),
+        )
+    return s
 
 
 def w8a16_weight_applies(weight: torch.Tensor) -> bool:
