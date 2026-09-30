@@ -128,8 +128,13 @@ _CSRC_W8 = [os.path.join(_CSRC_DIR, "gfx908_wv_fused_w8.hip")] + [
 _CSRC_W8_BIG = [os.path.join(_CSRC_DIR, "gfx908_wv_fused_w8.hip")] + [
     os.path.join(_CSRC_DIR, f"gfx908_wv_fused_w8_nb{i}.hip") for i in range(4, 9)
 ]
+# Small-M (MTP verify, M = 2..4) W8 kernels: their own extension, never linked into the hot
+# M = 1 module above (code-object size is a per-dispatch cost on gfx908).  See
+# docs/mi100_decode_opt/mtp_smallm_gemv_gfx908.md.
+_CSRC_W8_SMALLM = os.path.join(_CSRC_DIR, "gfx908_hc_w8_smallm.hip")
 _FLAG: bool | None = None
 _W8_FLAG: bool | None = None
+_SMALLM_FLAG: bool | None = None
 
 
 def _build_dir() -> str:
@@ -187,6 +192,23 @@ def _ext_w8_big():
     )
 
 
+@functools.cache
+def _ext_w8_smallm():
+    """The M = 2..4 one-round-trip W8 HC kernels (``hcsm_down`` / ``hcsm_up``), own code object."""
+    from torch.utils.cpp_extension import load
+
+    build_dir = os.path.join(_build_dir(), "w8smallm")
+    os.makedirs(build_dir, exist_ok=True)
+    logger.info_once("gfx908: building/loading HC W8 small-M extension in %s", build_dir)
+    return load(
+        name="gfx908_hc_w8_smallm_ext",
+        sources=[_CSRC_W8_SMALLM],
+        build_directory=build_dir,
+        extra_cuda_cflags=["-O3", "--offload-arch=gfx908"],
+        verbose=False,
+    )
+
+
 def hc_fused_enabled() -> bool:
     global _FLAG
     if _FLAG is None:
@@ -237,6 +259,105 @@ def hc_w8_enabled() -> bool:
     return _W8_FLAG
 
 
+# ---------------------------------------------------------------------------
+# Small-M W8 kernels (``VLLM_GFX908_SMALLM_HC_W8=1``, default OFF)
+# ---------------------------------------------------------------------------
+# The MTP verify step runs the HC chain at M = K + 1 (2..4 at c = 1).  The shipping W8 GEMV
+# stages the whole activation into LDS in all 120 workgroups behind a barrier before its first
+# weight load, keeps 4 waves per CU busy on mix_down, and pays a separate `.contiguous()` launch
+# for the injection columns at M >= 2 -- so every extra row costs ~5 us per HC module plus a
+# launch (x 97 modules).  `hcsm_down` / `hcsm_up` issue every load up front (one global round
+# trip), use all lanes, and write the injection compactly (chain = 2 launches at every M).
+# Numerically: same per-lane math and epilogues, different summation order (fp32-rounding-level
+# differences; tests/gfx908/test_hc_w8_smallm_ref.py).
+_SMALLM_DOWN_YT_DEFAULT = 3     # 336 rows / 3 = 112 workgroups <= 120 CUs, one round
+
+
+@functools.cache
+def hc_w8_smallm_range() -> tuple[int, int]:
+    """[lo, hi] M range of the small-M kernels (``VLLM_GFX908_SMALLM_HC_W8_MIN_M`` default 2,
+    ``..._MAX_M`` default 4; the kernels are instantiated for M = 1..4).  M = 1 stays on the
+    shipping kernel unless MIN_M=1 is set for an A/B."""
+    def _get(name, default):
+        try:
+            v = int(os.environ.get(name, str(default)))
+        except ValueError:
+            v = default
+        return min(max(v, 1), 4)
+
+    lo = _get("VLLM_GFX908_SMALLM_HC_W8_MIN_M", 2)
+    hi = _get("VLLM_GFX908_SMALLM_HC_W8_MAX_M", 4)
+    return lo, max(lo, hi)
+
+
+@functools.cache
+def hc_w8_smallm_down_ytile() -> int:
+    """Rows per workgroup of hcsm_down (``VLLM_GFX908_SMALLM_HC_W8_DOWN_YT`` = 2 | 3 | 4)."""
+    v = os.environ.get("VLLM_GFX908_SMALLM_HC_W8_DOWN_YT", str(_SMALLM_DOWN_YT_DEFAULT))
+    return int(v) if v in ("2", "3", "4") else _SMALLM_DOWN_YT_DEFAULT
+
+
+def hc_w8_smallm_enabled() -> bool:
+    """``VLLM_GFX908_SMALLM_HC_W8=1`` (default off): serve the W8 HC chain at M in
+    hc_w8_smallm_range() with the one-round-trip kernels.  Needs the W8 HC path.  Fails loudly
+    under its flag (``VLLM_GFX908_STRICT_EXT=1``, the default) instead of silently falling back."""
+    global _SMALLM_FLAG
+    if _SMALLM_FLAG is None:
+        if os.environ.get("VLLM_GFX908_SMALLM_HC_W8", "0") != "1":
+            _SMALLM_FLAG = False
+            return _SMALLM_FLAG
+        if not hc_w8_enabled():
+            msg = "gfx908: VLLM_GFX908_SMALLM_HC_W8=1 needs VLLM_GFX908_HC_W8=1 (the W8 HC path is off)"
+            if os.environ.get("VLLM_GFX908_STRICT_EXT", "1") == "1":
+                raise RuntimeError(msg + "; set VLLM_GFX908_STRICT_EXT=0 to ignore")
+            logger.warning_once(msg)
+            _SMALLM_FLAG = False
+            return _SMALLM_FLAG
+        try:
+            ext = _ext_w8_smallm()
+        except Exception as exc:
+            if os.environ.get("VLLM_GFX908_STRICT_EXT", "1") == "1":
+                raise RuntimeError(
+                    "gfx908: HC W8 small-M extension unavailable under its flag; set "
+                    "VLLM_GFX908_STRICT_EXT=0 to fall back"
+                ) from exc
+            logger.warning_once("gfx908: HC W8 small-M extension unavailable (%s)", exc)
+            _SMALLM_FLAG = False
+            return _SMALLM_FLAG
+        _SMALLM_FLAG = True
+        lo, hi = hc_w8_smallm_range()
+        logger.info_once(
+            "gfx908: HC W8 small-M kernels ACTIVE for %d <= M <= %d (hcsm_down ytile %d, "
+            "hcsm_up, compact injection; %s)",
+            lo, hi, hc_w8_smallm_down_ytile(), getattr(ext, "__file__", ext),
+        )
+    return _SMALLM_FLAG
+
+
+def _hc_w8_smallm_chain(xn, ed, eu, hc_count, lora_rank, hidden):
+    """Two launches: mix_down (+silu, + compact injection) and mix_up (+gate-mix).
+    Returns None only if a kernel declines (then the caller's shipping path runs)."""
+    M = xn.shape[0]
+    ext = _ext_w8_smallm()
+    down = torch.empty((M, ed.q.shape[0]), dtype=xn.dtype, device=xn.device)
+    injection = torch.empty((M, hc_count), dtype=xn.dtype, device=xn.device)
+    y = torch.empty((M, hidden), dtype=xn.dtype, device=xn.device)
+    if ext.hcsm_down(ed.q, ed.s, xn, down, injection, ed.gs, hc_w8_smallm_down_ytile(), 1,
+                     hc_count, lora_rank) and ext.hcsm_up(
+        eu.q, eu.s, down[:, :lora_rank], xn, y, eu.gs, hc_count
+    ):
+        logger.info_once("gfx908: HC W8 small-M chain served M=%d", M)
+        return y, injection
+    msg = (
+        f"gfx908: HC W8 small-M kernels declined M={M} down={tuple(ed.q.shape)} gs={ed.gs} "
+        f"up={tuple(eu.q.shape)} gs={eu.gs} hc={hc_count}"
+    )
+    if os.environ.get("VLLM_GFX908_STRICT_EXT", "1") == "1":
+        raise RuntimeError(msg + "; set VLLM_GFX908_STRICT_EXT=0 to fall back to the shipping W8 GEMV")
+    logger.warning_once(msg + "; falling back to the shipping W8 GEMV")
+    return None
+
+
 _W4_FLAG: bool | None = None
 
 
@@ -266,8 +387,10 @@ def hc_w4_enabled() -> bool:
 
 def _reset_env_cache():
     """Re-read the HC env flags and drop the weight caches (tests only)."""
-    global _W8_FLAG, _W4_FLAG, _SHARD_FLAG, _MAX_M
-    _W8_FLAG = _W4_FLAG = _SHARD_FLAG = _MAX_M = None
+    global _W8_FLAG, _W4_FLAG, _SHARD_FLAG, _MAX_M, _SMALLM_FLAG
+    _W8_FLAG = _W4_FLAG = _SHARD_FLAG = _MAX_M = _SMALLM_FLAG = None
+    hc_w8_smallm_range.cache_clear()
+    hc_w8_smallm_down_ytile.cache_clear()
     _W8_CACHE.clear()
     _PERM_CACHE.clear()
     hc_w8_gs.cache_clear()
@@ -662,6 +785,9 @@ def prepare_hc_w8_weight(
         ent = _W8Entry(weight, q, s, gs, kind, False, shape=tuple(q.shape))
     _W8_CACHE[_w8_key(weight)] = ent
     _ensure_scratch(q.device, q.shape[0] * q.shape[1])
+    # resolve the small-M flag at load time: builds/loads its extension (or fails loudly) and logs
+    # the active path at boot, not on the first verify step
+    hc_w8_smallm_enabled()
     logger.info_once(
         "gfx908 HC W8: quantized %s weight %dx%d (gs=%d, freed=%s); %d cached",
         kind,
@@ -803,6 +929,20 @@ def _hc_mix_local(
         except Exception as exc:  # unsupported shape -> the paths below
             logger.warning_once("gfx908 HC W4: chain declined (%s)", exc)
             del lora, injection, y
+
+    if (
+        ed is not None
+        and ed.q is not None
+        and ed.gs > 0
+        and eu.gs > 0
+        and xn.is_contiguous()
+        and hc_w8_smallm_enabled()
+    ):
+        lo, hi = hc_w8_smallm_range()
+        if lo <= M <= hi:
+            out = _hc_w8_smallm_chain(xn, ed, eu, hc_count, lora_rank, hidden)
+            if out is not None:
+                return out
 
     if ed is not None and ed.q is not None and M <= hc_fused_max_m() and xn.is_contiguous():
         ext = _ext_w8() if M <= _W8_SMALL_MAX_M else _ext_w8_big()
