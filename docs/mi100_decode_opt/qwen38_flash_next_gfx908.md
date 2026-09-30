@@ -702,6 +702,13 @@ under Zipf-skewed routing the multi-row kernel beats per-pair by 1.4x already
 at M=24, so VLLM_GFX908_MOE_MR_MIN_M=24 (set with uniform routing) may be too
 high for real traffic -- check with a real topk_ids histogram.
 
+mtp_smallm (2026-09-30, code only, GPU-unvalidated): the per-extra-row verify cost is mostly the
+HC W8 chain's structure (serialised X-staging + weight round trips, 4 waves/CU on mix_down, 62.5%
+lanes on mix_up, a 98/step injection copy), not bytes; the W8 MFMA swap at M=2 is already cheaper
+than the M=1 GEMV and the MoE is at its unique-expert byte floor. `VLLM_GFX908_SMALLM_HC_W8=1`
+(default off) adds one-round-trip M=2..4 HC kernels in their own extension. Analysis, CPU gates and
+the GPU recipe: mtp_smallm_gemv_gfx908.md.
+
 ar_ship (2026-09-05): push AR in-server on the rc6 image, same window:
 push 10.43-10.48 ms/step (two boots), base 10.79-10.80; c=1 92.2 -> 95.2
 tok/s; greedy c=1 16/16 bit-identical to rc6 (both arms); 1300-request
