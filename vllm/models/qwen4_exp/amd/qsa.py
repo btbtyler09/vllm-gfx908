@@ -90,6 +90,37 @@ def _prefill_tiled_enabled() -> bool:
     )
 
 
+def _eager_fast_path_min_qlen() -> int:
+    """Smallest ``max_query_len`` the eager-only QSA fast paths (dense-short,
+    prefill-tiled) may take.  ``VLLM_GFX908_QSA_EAGER_FAST_MIN_QLEN``, default 9.
+
+    Speculative verify batches are decode-shaped with ``q_len = K + 1 <= 8``;
+    they belong on the sparse decode path, which already handles per-token
+    top-k at any query length.  Before this gate, ``max_query_len > 1`` let a
+    K=1 verify (q_len 2) match the prefill-shaped test.
+    """
+
+    try:
+        return max(2, int(os.environ.get("VLLM_GFX908_QSA_EAGER_FAST_MIN_QLEN", "9")))
+    except ValueError:
+        return 9
+
+
+def _stream_capturing() -> bool:
+    """True while a CUDA/HIP graph is being captured on the current stream.
+
+    The fast paths are eager-only by design, but the forward context's runtime
+    mode is not a reliable capture signal (the MTP verify/draft graphs were
+    captured with the tiled prefill kernel baked in, at the dummy run's
+    ``max_seq_len``), so ask the stream directly.
+    """
+
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
     """Flash metadata supporting uniform decode and target-verify graphs."""
 
@@ -475,7 +506,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             return False
         if self.indexer.skip_topk:
             return False
-        if int(getattr(main_metadata, "max_query_len", 1) or 1) <= 1:
+        if int(getattr(main_metadata, "max_query_len", 1) or 1) < _eager_fast_path_min_qlen():
+            return False
+        if _stream_capturing():
             return False
         max_seq_len = int(getattr(main_metadata, "max_seq_len", 0) or 0)
         if max_seq_len <= 0 or max_seq_len > self.indexer.token_topk:
@@ -497,7 +530,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             return False
         if self.indexer.skip_topk:
             return False
-        if int(getattr(main_metadata, "max_query_len", 1) or 1) <= 1:
+        if int(getattr(main_metadata, "max_query_len", 1) or 1) < _eager_fast_path_min_qlen():
+            return False
+        if _stream_capturing():
             return False
         if int(getattr(main_metadata, "max_seq_len", 0) or 0) <= self.indexer.token_topk:
             return False
