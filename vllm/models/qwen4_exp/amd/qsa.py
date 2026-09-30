@@ -473,7 +473,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self._gfx908_qsa_glue = gfx908_qsa_glue.qsa_glue_layer_supported(self, vllm_config)
         spec_config = getattr(vllm_config, "speculative_config", None)
         # decode-shaped query length of this config (1 + K with spec decode on)
-        self._spec_query_len = 1 + int(getattr(spec_config, "num_speculative_tokens", 0) or 0)
+        num_spec = int(getattr(spec_config, "num_speculative_tokens", 0) or 0)
+        self._spec_query_len = 1 + num_spec
 
         static_context = vllm_config.compilation_config.static_forward_context
         if self.layer_name in static_context:
@@ -515,7 +516,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             return False
         if self.indexer.skip_topk:
             return False
-        if int(getattr(main_metadata, "max_query_len", 1) or 1) < _eager_fast_path_min_qlen(getattr(self, "_spec_query_len", 1)):
+        min_qlen = _eager_fast_path_min_qlen(getattr(self, "_spec_query_len", 1))
+        if int(getattr(main_metadata, "max_query_len", 1) or 1) < min_qlen:
             return False
         if _stream_capturing():
             return False
@@ -539,7 +541,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             return False
         if self.indexer.skip_topk:
             return False
-        if int(getattr(main_metadata, "max_query_len", 1) or 1) < _eager_fast_path_min_qlen(getattr(self, "_spec_query_len", 1)):
+        min_qlen = _eager_fast_path_min_qlen(getattr(self, "_spec_query_len", 1))
+        if int(getattr(main_metadata, "max_query_len", 1) or 1) < min_qlen:
             return False
         if _stream_capturing():
             return False
