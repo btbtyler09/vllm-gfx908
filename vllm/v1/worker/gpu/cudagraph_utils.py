@@ -226,6 +226,9 @@ class CudaGraphManager:
                 {
                     num_spec + num_new_sampled_tokens_per_step
                     for num_spec in dense_schedule[1:]
+                    # A K=0 bucket gives the draft manager (decode_query_len 1)
+                    # a non-positive length: nothing to capture there.
+                    if num_spec + num_new_sampled_tokens_per_step >= 1
                 }
             )
         else:
