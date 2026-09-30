@@ -781,10 +781,27 @@ def is_w8a16_freed(weight: torch.Tensor) -> bool:
     return ent is not None and ent.freed
 
 
-def _quantize_and_cache(weight: torch.Tensor, allow_free: bool) -> _QEntry:
+def _forced_group_size(k: int) -> int:
+    """Group size for an opted-in (non-whitelisted) weight: the configured one when
+    it divides K, else the largest power of two >= 16 that does (the kernel needs
+    ``gs | K``); e.g. the draft shared-expert down_proj has K = 160 -> 32."""
     gs = w8a16_group_size()
+    if gs == 0 or k % gs == 0:
+        return gs
+    g = 1 << (k.bit_length() - 1)
+    while g >= 16:
+        if k % g == 0:
+            return g
+        g >>= 1
+    raise ValueError(f"W8A16: no power-of-two group size >= 16 divides K={k}")
+
+
+def _quantize_and_cache(
+    weight: torch.Tensor, allow_free: bool, force: bool = False
+) -> _QEntry:
     n, k = int(weight.shape[0]), int(weight.shape[1])
-    if w4lt_gdn_enabled() and (n, k) in W4LT_GDN_SHAPES:
+    gs = _forced_group_size(k) if force else w8a16_group_size()
+    if not force and w4lt_gdn_enabled() and (n, k) in W4LT_GDN_SHAPES:
         # W4 replaces the int8 copy entirely: 0.28x the bf16 bytes instead of 0.52x.
         gs4 = w4lt_gs()
         q4, s4 = quantize_w4(weight, gs4)
@@ -814,7 +831,7 @@ def _quantize_and_cache(weight: torch.Tensor, allow_free: bool) -> _QEntry:
         del q, s
         q = s = None
     pin = qsw if q is None else q
-    if allow_free and _should_free((n, k)):
+    if allow_free and (force or _should_free((n, k))):
         stub = _make_stub(pin, (n, k))
         # Releases the bf16 storage: the parameter's TensorImpl now points at
         # the stub, and nothing else holds a reference to the old data.
@@ -889,13 +906,31 @@ def prepare_w8a16_layer(layer, allow_free: bool = True) -> bool:
     w = getattr(layer, "weight", None)
     if w is None or not isinstance(w, torch.Tensor):
         return False
-    if not w8a16_enabled() or not w8a16_weight_applies(w):
+    if not w8a16_enabled():
+        return False
+    # Per-layer opt-in outside the shape whitelist (``layer._gfx908_w8a16_force``,
+    # set e.g. by the Qwen4Exp MTP draft): any bf16 [N, K] weight with K % 16 == 0.
+    # ``layer._gfx908_w8a16_free`` (default False) releases the bf16 master; the
+    # GEMV config is the generic fallback unless ``_CFG`` has the shape.
+    force = bool(getattr(layer, "_gfx908_w8a16_force", False))
+    if force:
+        if (
+            w.dim() != 2
+            or w.dtype != torch.bfloat16
+            or w.is_meta
+            or not w.is_contiguous()
+            or w.shape[1] % 16
+        ):
+            return False
+    elif not w8a16_weight_applies(w):
         return False
     if _cache_key(w) in _Q_CACHE:
         return True
     keep = getattr(layer, "_w8a16_keep_bf16", False)
+    if force:
+        keep = keep or not getattr(layer, "_gfx908_w8a16_free", False)
     try:
-        _quantize_and_cache(w, allow_free=allow_free and not keep)
+        _quantize_and_cache(w, allow_free=allow_free and not keep, force=force)
         return True
     except Exception as exc:  # never break model loading over this
         logger.warning_once("gfx908 W8A16: prepare failed for %s (%s)", type(layer), exc)
@@ -1164,10 +1199,11 @@ def w8a16_gemm(
     if weight.dim() != 2:
         return None
     n, k = int(weight.shape[0]), int(weight.shape[1])
-    if (n, k) not in W8A16_SHAPES:
+    ent = _Q_CACHE.get(_cache_key(weight))
+    if (n, k) not in W8A16_SHAPES and ent is None:
+        # Not whitelisted and not opted in at load time (prepare_w8a16_layer).
         return None
     m = x.numel() // x.size(-1)
-    ent = _Q_CACHE.get(_cache_key(weight))
     if ent is None:
         # Lazy (no load-time hook): only worth it for the decode GEMV.
         max_lazy = (
