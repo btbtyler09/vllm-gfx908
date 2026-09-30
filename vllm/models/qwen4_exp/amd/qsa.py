@@ -90,20 +90,26 @@ def _prefill_tiled_enabled() -> bool:
     )
 
 
-def _eager_fast_path_min_qlen() -> int:
+def _eager_fast_path_min_qlen(spec_query_len: int = 1) -> int:
     """Smallest ``max_query_len`` the eager-only QSA fast paths (dense-short,
-    prefill-tiled) may take.  ``VLLM_GFX908_QSA_EAGER_FAST_MIN_QLEN``, default 9.
+    prefill-tiled) may take: strictly above the decode-shaped query length of
+    the running config, i.e. ``num_speculative_tokens + 1`` with speculative
+    decoding on (verify batches are decode-shaped at that length and belong on
+    the sparse decode path, which handles per-token top-k at any query length)
+    and 1 without.  Before this gate, ``max_query_len > 1`` let a K=1 verify
+    (q_len 2) match the prefill-shaped test.
 
-    Speculative verify batches are decode-shaped with ``q_len = K + 1 <= 8``;
-    they belong on the sparse decode path, which already handles per-token
-    top-k at any query length.  Before this gate, ``max_query_len > 1`` let a
-    K=1 verify (q_len 2) match the prefill-shaped test.
+    ``VLLM_GFX908_QSA_EAGER_FAST_MIN_QLEN`` overrides the derived value for
+    A/B work (``=2`` restores the old ``> 1`` behaviour).
     """
 
-    try:
-        return max(2, int(os.environ.get("VLLM_GFX908_QSA_EAGER_FAST_MIN_QLEN", "9")))
-    except ValueError:
-        return 9
+    override = os.environ.get("VLLM_GFX908_QSA_EAGER_FAST_MIN_QLEN", "").strip()
+    if override:
+        try:
+            return max(2, int(override))
+        except ValueError:
+            pass
+    return max(1, int(spec_query_len)) + 1
 
 
 def _stream_capturing() -> bool:
@@ -465,6 +471,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         # gfx908 fused decode glue (VLLM_GFX908_QSA_GLUE=1): static, so the
         # compiled forward never branches on it at runtime.
         self._gfx908_qsa_glue = gfx908_qsa_glue.qsa_glue_layer_supported(self, vllm_config)
+        spec_config = getattr(vllm_config, "speculative_config", None)
+        # decode-shaped query length of this config (1 + K with spec decode on)
+        self._spec_query_len = 1 + int(getattr(spec_config, "num_speculative_tokens", 0) or 0)
 
         static_context = vllm_config.compilation_config.static_forward_context
         if self.layer_name in static_context:
@@ -506,7 +515,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             return False
         if self.indexer.skip_topk:
             return False
-        if int(getattr(main_metadata, "max_query_len", 1) or 1) < _eager_fast_path_min_qlen():
+        if int(getattr(main_metadata, "max_query_len", 1) or 1) < _eager_fast_path_min_qlen(getattr(self, "_spec_query_len", 1)):
             return False
         if _stream_capturing():
             return False
@@ -530,7 +539,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             return False
         if self.indexer.skip_topk:
             return False
-        if int(getattr(main_metadata, "max_query_len", 1) or 1) < _eager_fast_path_min_qlen():
+        if int(getattr(main_metadata, "max_query_len", 1) or 1) < _eager_fast_path_min_qlen(getattr(self, "_spec_query_len", 1)):
             return False
         if _stream_capturing():
             return False
