@@ -95,7 +95,13 @@ def gfx908_boot_summary(model=None) -> None:
         if not h.hc_fused_enabled():
             return "off"
         w8 = h.hc_w8_enabled()
-        return f"on (rows <= {h.hc_fused_max_m()}; {'W8 mixes' if w8 else 'bf16 mixes'})"
+        extra = ""
+        if h._STRIDED_INJ:
+            extra += "; strided injection"
+        if h.hc_final_w8_enabled():
+            extra += "; final mixer W8"
+        mixes = "W8 mixes" if w8 else "bf16 mixes"
+        return f"on (rows <= {h.hc_fused_max_m()}; {mixes}{extra})"
 
     rows.append(("HC fused mix chain", _try(hc_line)))
 

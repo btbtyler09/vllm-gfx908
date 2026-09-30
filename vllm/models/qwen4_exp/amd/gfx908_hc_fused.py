@@ -135,6 +135,21 @@ _CSRC_W8_SMALLM = os.path.join(_CSRC_DIR, "gfx908_hc_w8_smallm.hip")
 _FLAG: bool | None = None
 _W8_FLAG: bool | None = None
 _SMALLM_FLAG: bool | None = None
+_FINAL_W8_FLAG: bool | None = None
+
+# VLLM_GFX908_HC_STRIDED_INJECT=1 (default off): the fused mix op returns the injection
+# as the [:, lora_rank : lora_rank + hc] column view of the [M, down_rows] mix_down
+# output instead of a compacted [M, hc] copy.  Every consumer takes a row stride
+# (ops/hc.py _hc_combine / _hc_combine_norm pass stride(0) to Triton;
+# gfx908_hc_ar_fused.hip reads inj + t * s_inj), so the copy only existed because the
+# fake impl promised a contiguous tensor.  Read once at import: the fake impl and the
+# real impl must agree on the layout for the life of the process.
+_STRIDED_INJ = os.environ.get("VLLM_GFX908_HC_STRIDED_INJECT", "0") == "1"
+if _STRIDED_INJ:
+    logger.info(
+        "gfx908: HC injection returned as a strided view of the mix_down output "
+        "(VLLM_GFX908_HC_STRIDED_INJECT=1)"
+    )
 
 
 def _build_dir() -> str:
@@ -347,6 +362,10 @@ def _hc_w8_smallm_chain(xn, ed, eu, hc_count, lora_rank, hidden):
         eu.q, eu.s, down[:, :lora_rank], xn, y, eu.gs, hc_count
     ):
         logger.info_once("gfx908: HC W8 small-M chain served M=%d", M)
+        if _STRIDED_INJ:
+            # hcsm_down also writes rows [R, R+HC) into `down`: return the column view the
+            # fake promises under VLLM_GFX908_HC_STRIDED_INJECT (no layout copy).
+            return y, _injection_from_down(down, ed.q.shape[0], lora_rank, hc_count)
         return y, injection
     msg = (
         f"gfx908: HC W8 small-M kernels declined M={M} down={tuple(ed.q.shape)} gs={ed.gs} "
@@ -385,10 +404,40 @@ def hc_w4_enabled() -> bool:
     return _W4_FLAG
 
 
+def hc_final_w8_enabled() -> bool:
+    """``VLLM_GFX908_HC_FINAL_W8=1`` (default off).
+
+    The final mixers (``use_combine=False``: target + MTP ``hyper_connection_mixer``)
+    also get int8 weights and run the 2-launch W8 fused chain (mix_down + silu,
+    mix_up + gate-mix) instead of the 4-launch bf16 chain.  Needs the combining HC W8
+    path (same kernels, same prepare); not with the W4 HC variant (its mix_down
+    kernel requires inject rows)."""
+    global _FINAL_W8_FLAG
+    if _FINAL_W8_FLAG is None:
+        _FINAL_W8_FLAG = False
+        if os.environ.get("VLLM_GFX908_HC_FINAL_W8", "0") == "1":
+            if hc_w4_enabled():
+                logger.warning_once(
+                    "gfx908: VLLM_GFX908_HC_FINAL_W8=1 ignored (W4 HC mixes are on)"
+                )
+            elif not hc_w8_enabled():
+                logger.warning_once(
+                    "gfx908: VLLM_GFX908_HC_FINAL_W8=1 ignored "
+                    "(needs VLLM_GFX908_HC_W8=1)"
+                )
+            else:
+                _FINAL_W8_FLAG = True
+                logger.info_once(
+                    "gfx908: HC final mixer on the W8 fused chain "
+                    "(VLLM_GFX908_HC_FINAL_W8=1)"
+                )
+    return _FINAL_W8_FLAG
+
+
 def _reset_env_cache():
     """Re-read the HC env flags and drop the weight caches (tests only)."""
-    global _W8_FLAG, _W4_FLAG, _SHARD_FLAG, _MAX_M, _SMALLM_FLAG
-    _W8_FLAG = _W4_FLAG = _SHARD_FLAG = _MAX_M = _SMALLM_FLAG = None
+    global _W8_FLAG, _W4_FLAG, _SHARD_FLAG, _MAX_M, _SMALLM_FLAG, _FINAL_W8_FLAG
+    _W8_FLAG = _W4_FLAG = _SHARD_FLAG = _MAX_M = _SMALLM_FLAG = _FINAL_W8_FLAG = None
     hc_w8_smallm_range.cache_clear()
     hc_w8_smallm_down_ytile.cache_clear()
     _W8_CACHE.clear()
@@ -810,8 +859,11 @@ def install_hc_w8_prepare(gated_residual) -> None:
     cudagraph capture.
     """
     hc, hidden = gated_residual.hc_count, gated_residual.hidden_size
+    down = getattr(gated_residual, "input_mix_weight_down_block_inject", None)
+    if down is None:  # final mixer (use_combine=False): no inject rows
+        down = gated_residual.input_mix_weight_down
     pairs = (
-        (gated_residual.input_mix_weight_down_block_inject, "down"),
+        (down, "down"),
         (gated_residual.input_mix_weight_up, "up"),
     )
     for layer, kind in pairs:
@@ -897,6 +949,57 @@ def _gate_mix_perm(xn: torch.Tensor, gate_perm: torch.Tensor, hc: int, hidden: i
     return (torch.sigmoid(g) * x).mean(-1).to(xn.dtype)
 
 
+_SEEN: set[str] = set()
+
+
+def _note_once(key: str, msg: str, *args) -> None:
+    """One log line the first time a runtime path is taken (a set lookup afterwards;
+    nothing runs on HIP-graph replay)."""
+    if key not in _SEEN:
+        _SEEN.add(key)
+        logger.info(msg, *args)
+
+
+def _inject_layout(src: torch.Tensor, down_rows: int, lora_rank: int, hc_count: int):
+    """Copy a compact ``[M, hc]`` injection into the layout the strided fake impl
+    advertises: columns ``lora_rank : lora_rank + hc`` of a fresh ``[M, down_rows]``
+    buffer."""
+    buf = src.new_empty((src.shape[0], down_rows))
+    out = buf[:, lora_rank : lora_rank + hc_count]
+    out.copy_(src)
+    return out
+
+
+def _injection_from_down(
+    down: torch.Tensor, down_rows: int, lora_rank: int, hc_count: int
+) -> torch.Tensor:
+    """The injection columns of a mix_down output ``down`` ``[M, down_rows]``.
+
+    Default: a compacted copy (the historical contract).  Under
+    VLLM_GFX908_HC_STRIDED_INJECT: the column view itself, provided ``down`` is
+    exactly the fresh ``[M, down_rows]`` row-major buffer the fake impl describes
+    (offset 0, row stride ``down_rows``); anything else is copied into such a buffer
+    so the layout always matches."""
+    inj = down[:, lora_rank : lora_rank + hc_count]
+    if not _STRIDED_INJ:
+        return inj.contiguous()
+    if (
+        down.dim() == 2
+        and down.shape[1] == down_rows
+        and down.storage_offset() == 0
+        and down.stride(1) == 1
+        and down.stride(0) == down_rows
+    ):
+        _note_once(
+            "inj_view",
+            "gfx908 HC: injection returned as a [M, %d] column view, no copy (M=%d)",
+            down_rows,
+            down.shape[0],
+        )
+        return inj
+    return _inject_layout(inj, down_rows, lora_rank, hc_count)
+
+
 def _hc_mix_local(
     xn: torch.Tensor, w_down: torch.Tensor, w_up: torch.Tensor,
     hc_count: int, lora_rank: int, hidden: int,
@@ -904,6 +1007,7 @@ def _hc_mix_local(
     """The HC mix on whatever rows it is given: fused wvSplitK epilogues for
     M <= 3, stock math otherwise."""
     M = xn.shape[0]
+    down_rows = int(w_down.shape[0])  # a freed weight's stub keeps its shape
     ed = eu = None
     if _W8_CACHE:
         ed = _W8_CACHE.get(_w8_key(w_down))
@@ -925,6 +1029,11 @@ def _hc_mix_local(
             ext.w4lt_hc_down(ed.q4, ed.s4, xn, lora, injection, ed.gs4, hc_count, lora_rank,
                              *_CFG_W4_DOWN, 2)
             ext.w4lt_hc_up(eu.q4, eu.s4, lora, xn, y, eu.gs4, hc_count, *_CFG_W4_UP)
+            if _STRIDED_INJ:
+                # w4lt_hc_down indexes inj[m * HC + j] and TORCH_CHECKs is_contiguous()
+                # (gfx908_w4_loadtime.hip), so it cannot write the strided view: this
+                # path keeps one copy into the advertised layout.
+                injection = _inject_layout(injection, down_rows, lora_rank, hc_count)
             return y, injection
         except Exception as exc:  # unsupported shape -> the paths below
             logger.warning_once("gfx908 HC W4: chain declined (%s)", exc)
@@ -955,7 +1064,7 @@ def _hc_mix_local(
             # the kernel takes X's row stride, so the lora block is passed as a view
             # (no extra copy launch: the chain stays at the bf16 path's launch count)
             lora = down[:, :lora_rank]
-            injection = down[:, lora_rank : lora_rank + hc_count].contiguous()
+            injection = _injection_from_down(down, down_rows, lora_rank, hc_count)
             yt, un, lpr, ks = _CFG_UP.get(M, _CFG_UP_DEFAULT)
             y = torch.empty((M, hidden), dtype=xn.dtype, device=xn.device)
             if ext.hc_w8_gemv(eu.q, eu.s, lora, y, xn, 2, eu.gs, yt, un, lpr, ks,
@@ -971,7 +1080,7 @@ def _hc_mix_local(
         _w8_dequant_into(ed, wd)
         down = torch.ops.vllm.rocm_unquantized_gemm_gfx908(xn, wd, None)
         lora = hc_silu(down[:, :lora_rank].contiguous(), hc_count)
-        injection = down[:, lora_rank : lora_rank + hc_count].contiguous()
+        injection = _injection_from_down(down, down_rows, lora_rank, hc_count)
         wu = _w8_scratch_view(eu)
         _w8_dequant_into(eu, wu)
         gate_perm = torch.ops.vllm.rocm_unquantized_gemm_gfx908(lora, wu, None)
@@ -984,7 +1093,7 @@ def _hc_mix_local(
         down = torch.empty((M, w_down.shape[0]), dtype=xn.dtype, device=xn.device)
         ext.wv_fused(w_down, xn, down, xn, 1, hc_count, lora_rank, cu)
         lora = down[:, :lora_rank]
-        injection = down[:, lora_rank : lora_rank + hc_count].contiguous()
+        injection = _injection_from_down(down, down_rows, lora_rank, hc_count)
         y = torch.empty((M, hidden), dtype=xn.dtype, device=xn.device)
         ext.wv_fused(w_up_perm, lora, y, xn, 2, hc_count, lora_rank, cu)
         return y, injection
@@ -993,7 +1102,7 @@ def _hc_mix_local(
 
     down = torch.ops.vllm.rocm_unquantized_gemm_gfx908(xn, w_down, None)
     lora = hc_silu(down[:, :lora_rank].contiguous(), hc_count)
-    injection = down[:, lora_rank : lora_rank + hc_count].contiguous()
+    injection = _injection_from_down(down, down_rows, lora_rank, hc_count)
     gate = torch.ops.vllm.rocm_unquantized_gemm_gfx908(lora, w_up, None)
     return hc_gate_mix(xn, gate, hc_count), injection
 
@@ -1057,9 +1166,15 @@ def _hc_mix_impl(
             hidden,
             hc_count,
         )
-        # The fake_impl promises contiguous outputs and inductor bakes those
-        # strides into the graph; never hand back a view of a wider buffer.
+        # The fake_impl promises these exact layouts and inductor bakes those
+        # strides into the graph.  hc_shard_mix compacts the injection, so under
+        # VLLM_GFX908_HC_STRIDED_INJECT it is copied into the advertised layout
+        # (prefill-sized M only).
         assert block_input.is_contiguous() and injection.is_contiguous()
+        if _STRIDED_INJ:
+            injection = _inject_layout(
+                injection, int(w_down.shape[0]), lora_rank, hc_count
+            )
     else:
         block_input, injection = _hc_mix_local(
             xn, w_down, w_up, hc_count, lora_rank, hidden
@@ -1070,10 +1185,16 @@ def _hc_mix_impl(
 
 
 def _hc_mix_fake(xn, w_down, w_up, hc_count, lora_rank, hidden, arm_kind=0):
-    return (
-        xn.new_empty((xn.shape[0], hidden)),
-        xn.new_empty((xn.shape[0], hc_count)),
-    )
+    if _STRIDED_INJ:
+        # [M, hc] column view (offset lora_rank, row stride down_rows) of a fresh [M,
+        # down_rows] buffer: exactly what every real path returns (_injection_from_down,
+        # _inject_layout), so inductor keeps the view and inserts no copy.
+        injection = xn.new_empty((xn.shape[0], w_down.shape[0]))[
+            :, lora_rank : lora_rank + hc_count
+        ]
+    else:
+        injection = xn.new_empty((xn.shape[0], hc_count))
+    return xn.new_empty((xn.shape[0], hidden)), injection
 
 
 direct_register_custom_op(
@@ -1093,8 +1214,59 @@ def hc_fused_mix(xn, w_down, w_up, hc_count, lora_rank, hidden, arm_kind=0):
 # Final mixer (``use_combine=False``): same chain without the injection block.
 # One module out of 97, but it runs on the full prefill chunk too.
 # ---------------------------------------------------------------------------
+def _hc_final_mix_w8(xn, ed: _W8Entry, eu: _W8Entry, hc_count, lora_rank, hidden):
+    """The final mixer on the W8 fused kernels: 2 launches.
+
+    mix_down is ``hc_w8_gemv`` epi 1 over the [lora_rank, HC*HD] weight with
+    R = lora_rank, so every output row gets the silu epilogue (the combining mixer's
+    inject/pad rows simply do not exist here); mix_up is epi 2 over the row-permuted
+    [HC*HD, lora_rank] weight.  Same kernels, configs and accumulation order as the
+    combining chain.  Returns None when the kernel declines the shape/config
+    (nothing was launched)."""
+    M = xn.shape[0]
+    ext = _ext_w8() if M <= _W8_SMALL_MAX_M else _ext_w8_big()
+    cu = _cu_count()
+    yt, un, lpr, ks = _CFG_DOWN.get(M, _CFG_DOWN_DEFAULT)
+    lora = torch.empty((M, ed.q.shape[0]), dtype=xn.dtype, device=xn.device)
+    if not ext.hc_w8_gemv(ed.q, ed.s, xn, lora, xn, 1, ed.gs, yt, un, lpr, ks,
+                          hc_count, lora_rank, cu):
+        return None
+    yt, un, lpr, ks = _CFG_UP.get(M, _CFG_UP_DEFAULT)
+    y = torch.empty((M, hidden), dtype=xn.dtype, device=xn.device)
+    if not ext.hc_w8_gemv(eu.q, eu.s, lora, y, xn, 2, eu.gs, yt, un, lpr, ks,
+                          hc_count, lora_rank, cu):
+        return None
+    _note_once(
+        f"final_w8_{M}", "gfx908 HC: final mixer ran the W8 fused chain (M=%d)", M
+    )
+    return y
+
+
 def _hc_final_mix_local(xn, w_down, w_up, hc_count, lora_rank, hidden):
     from vllm.models.qwen4_exp.amd.ops.hc import hc_gate_mix, hc_silu
+
+    ed = eu = None
+    if _W8_CACHE:
+        ed = _W8_CACHE.get(_w8_key(w_down))
+        eu = _W8_CACHE.get(_w8_key(w_up))
+    if ed is not None and eu is not None and ed.q is not None and eu.q is not None:
+        # Only reachable under VLLM_GFX908_HC_FINAL_W8=1 (nothing else quantizes the
+        # final mixer's weights).
+        if xn.shape[0] <= hc_fused_max_m() and xn.is_contiguous():
+            y = _hc_final_mix_w8(xn, ed, eu, hc_count, lora_rank, hidden)
+            if y is not None:
+                return y
+        if ed.freed or eu.freed:
+            # No bf16 master copy: rematerialise into the scratch, stock math (as the
+            # combining mixer's freed path does).
+            wd = _w8_scratch_view(ed)
+            _w8_dequant_into(ed, wd)
+            lora = torch.ops.vllm.rocm_unquantized_gemm_gfx908(xn, wd, None)
+            lora = hc_silu(lora, hc_count)
+            wu = _w8_scratch_view(eu)
+            _w8_dequant_into(eu, wu)
+            gate_perm = torch.ops.vllm.rocm_unquantized_gemm_gfx908(lora, wu, None)
+            return _gate_mix_perm(xn, gate_perm, hc_count, hidden)
 
     lora = torch.ops.vllm.rocm_unquantized_gemm_gfx908(xn, w_down, None)
     lora = hc_silu(lora, hc_count)
