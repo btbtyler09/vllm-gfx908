@@ -48,13 +48,16 @@ sys.path.insert(0, os.path.join(SRC, "tests", "gfx908"))
 def load_exts(build_dir: str):
     """Shipping W8 extensions from the installed tree (prebuilt in the image) + the new one
     built from the mounted worktree source."""
-    import vllm.models.qwen4_exp.amd.gfx908_hc_fused as hcm
     from torch.utils.cpp_extension import load
+
+    import vllm.models.qwen4_exp.amd.gfx908_hc_fused as hcm
 
     os.makedirs(build_dir, exist_ok=True)
     new = load(
         name="gfx908_hc_w8_smallm_ext",
-        sources=[os.path.join(SRC, "vllm/models/qwen4_exp/amd/csrc/gfx908_hc_w8_smallm.hip")],
+        sources=[
+            os.path.join(SRC, "vllm/models/qwen4_exp/amd/csrc/gfx908_hc_w8_smallm.hip")
+        ],
         build_directory=build_dir,
         extra_cuda_cflags=["-O3", "--offload-arch=gfx908"],
         verbose=False,
@@ -107,7 +110,10 @@ def main():
     dev = "cuda"
     hcm, ext_w8, ext_w8b, ext_new = load_exts(args.build)
     cu = hcm._cu_count()
-    print(f"device {torch.cuda.get_device_name()} cu={cu}  new ext {ext_new.__file__}", flush=True)
+    print(
+        f"device {torch.cuda.get_device_name()} cu={cu}  new ext {ext_new.__file__}",
+        flush=True,
+    )
 
     # weights: the same generator as the CPU test (outliers included), NROT copies for L2-cold
     q8 = []
@@ -127,7 +133,7 @@ def main():
             qd, sd, qu, su = q8[i]
             d = torch.empty((M, N_DOWN), dtype=torch.bfloat16, device=dev)
             assert ship.hc_w8_gemv(qd, sd, xn, d, xn, 1, GS_D, *cfg_d, HC, R, cu)
-            inj = d[:, R:R + HC].contiguous()
+            inj = d[:, R : R + HC].contiguous()
             y = torch.empty((M, HD), dtype=torch.bfloat16, device=dev)
             assert ship.hc_w8_gemv(qu, su, d[:, :R], y, xn, 2, GS_U, *cfg_u, HC, R, cu)
             return y, inj, d
@@ -157,14 +163,18 @@ def main():
         row["inj_vs_emulator"] = ulp(injn, torch.from_numpy(e_inj))
         row["down_vs_emulator"] = ulp(dn, torch.from_numpy(e_down))
         row["y_vs_emulator"] = ulp(yn, torch.from_numpy(e_y))
-        row["inj_equals_down_cols"] = bool(torch.equal(injn, dn[:, R:R + HC]))
+        row["inj_equals_down_cols"] = bool(torch.equal(injn, dn[:, R : R + HC]))
         gate = (
             row["inj_vs_emulator"][0] == 0
             and row["down_vs_emulator"][0] <= 1
             and row["y_vs_emulator"][0] <= 1
             and row["inj_equals_down_cols"]
-            and all(row[f"yt{yt}_y_vs_ship"][0] <= 1 and row[f"yt{yt}_inj_vs_ship"][0] <= 1
-                    and row[f"yt{yt}_y_vs_ship"][1] <= 0.01 for yt in (2, 3, 4))
+            and all(
+                row[f"yt{yt}_y_vs_ship"][0] <= 1
+                and row[f"yt{yt}_inj_vs_ship"][0] <= 1
+                and row[f"yt{yt}_y_vs_ship"][1] <= 0.01
+                for yt in (2, 3, 4)
+            )
         )
         row["gate"] = gate
         ok &= gate
@@ -188,16 +198,19 @@ def main():
             def s_up():
                 _, _, qu_, su_ = q8[nxt()]
                 y = torch.empty((M, HD), dtype=torch.bfloat16, device=dev)
-                ship.hc_w8_gemv(qu_, su_, lora_buf[:, :R], y, xn, 2, GS_U, *cfg_u, HC, R, cu)
+                ship.hc_w8_gemv(
+                    qu_, su_, lora_buf[:, :R], y, xn, 2, GS_U, *cfg_u, HC, R, cu
+                )
 
             def s_copy():
-                inj_buf.copy_(lora_buf[:, R:R + HC])
+                inj_buf.copy_(lora_buf[:, R : R + HC])
 
             def n_down(yt):
                 def f():
                     qd_, sd_, _, _ = q8[nxt()]
                     d = torch.empty((M, N_DOWN), dtype=torch.bfloat16, device=dev)
                     ext_new.hcsm_down(qd_, sd_, xn, d, inj_buf, GS_D, yt, 1, HC, R)
+
                 return f
 
             def n_up():
@@ -221,18 +234,22 @@ def main():
         print(json.dumps(row), flush=True)
 
     # ---------------- summary
-    print("\n| M | ship down | ship up | inj copy | ship chain | new down yt2/3/4 | new up | new chain | "
-          "chain saving | y vs ship (ulp, frac) | inj/down/y vs emulator (max ulp) | gate |")
+    print(
+        "\n| M | ship down | ship up | inj copy | ship chain | new down yt2/3/4 | new up | new chain | "
+        "chain saving | y vs ship (ulp, frac) | inj/down/y vs emulator (max ulp) | gate |"
+    )
     print("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for r in res["rows"]:
         t = r.get("us", {})
         g = lambda k: f"{t[k]:.2f}" if k in t else "-"  # noqa: E731
         sav = f"{t['ship_chain'] - t['new_chain_yt3']:+.2f}" if t else "-"
-        print(f"| {r['M']} | {g('ship_down')} | {g('ship_up')} | {g('ship_inj_copy')} | {g('ship_chain')} | "
-              f"{g('new_down_yt2')}/{g('new_down_yt3')}/{g('new_down_yt4')} | {g('new_up')} | "
-              f"{g('new_chain_yt3')} | {sav} | {r['yt3_y_vs_ship'][0]}, {r['yt3_y_vs_ship'][1]:.4f} | "
-              f"{r['inj_vs_emulator'][0]}/{r['down_vs_emulator'][0]}/{r['y_vs_emulator'][0]} | "
-              f"{'PASS' if r['gate'] else 'FAIL'} |")
+        print(
+            f"| {r['M']} | {g('ship_down')} | {g('ship_up')} | {g('ship_inj_copy')} | {g('ship_chain')} | "
+            f"{g('new_down_yt2')}/{g('new_down_yt3')}/{g('new_down_yt4')} | {g('new_up')} | "
+            f"{g('new_chain_yt3')} | {sav} | {r['yt3_y_vs_ship'][0]}, {r['yt3_y_vs_ship'][1]:.4f} | "
+            f"{r['inj_vs_emulator'][0]}/{r['down_vs_emulator'][0]}/{r['y_vs_emulator'][0]} | "
+            f"{'PASS' if r['gate'] else 'FAIL'} |"
+        )
     res["pass"] = bool(ok)
     with open(args.out, "w") as f:
         json.dump(res, f, indent=1)

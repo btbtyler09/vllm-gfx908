@@ -35,8 +35,8 @@ import pytest
 HC = 4
 HIDDEN = 2560
 LORA = 320
-N_DOWN = 336              # lora 320 + inject 4 + pad 12
-K_DOWN = HC * HIDDEN      # 10240
+N_DOWN = 336  # lora 320 + inject 4 + pad 12
+K_DOWN = HC * HIDDEN  # 10240
 GS_DOWN = 128
 GS_UP = 64
 
@@ -78,7 +78,10 @@ def chunk_dots(q: np.ndarray, x: np.ndarray) -> np.ndarray:
 
 def fma32(a, b, c):
     """fp32 fma via float64 (exact when c == 0; otherwise double-rounded, see module doc)."""
-    return (np.asarray(a, np.float64) * np.asarray(b, np.float64) + np.asarray(c, np.float64)).astype(f32)
+    return (
+        np.asarray(a, np.float64) * np.asarray(b, np.float64)
+        + np.asarray(c, np.float64)
+    ).astype(f32)
 
 
 def dpp_reduce(v: np.ndarray, lpr: int) -> np.ndarray:
@@ -86,16 +89,16 @@ def dpp_reduce(v: np.ndarray, lpr: int) -> np.ndarray:
     whole lane vector after the tree (lane 63 = total for LPR 64; lanes 31 / 63 for LPR 32)."""
     v = v.astype(f32).copy()
     lane = np.arange(64)
-    for n in (8, 4, 2, 1):                                  # row_shr:n, bound_ctrl -> 0
+    for n in (8, 4, 2, 1):  # row_shr:n, bound_ctrl -> 0
         src = np.zeros_like(v)
         ok = (lane % 16) >= n
         src[..., ok] = v[..., lane[ok] - n]
         v = (v + src).astype(f32)
-    src = np.zeros_like(v)                                  # row_bcast:15
+    src = np.zeros_like(v)  # row_bcast:15
     for r in range(1, 4):
-        src[..., 16 * r:16 * r + 16] = v[..., 16 * r - 1:16 * r]
+        src[..., 16 * r : 16 * r + 16] = v[..., 16 * r - 1 : 16 * r]
     v = (v + src).astype(f32)
-    if lpr == 64:                                           # row_bcast:31
+    if lpr == 64:  # row_bcast:31
         src = np.zeros_like(v)
         src[..., 32:64] = v[..., 31:32]
         v = (v + src).astype(f32)
@@ -113,7 +116,7 @@ def gate_mix_epi(g: np.ndarray, xn: np.ndarray, hidden: int) -> np.ndarray:
     """EPI 2 on g[m, i, s] (fp32 row sums): out = bf16( fma-chain_s sigmoid(bf16(g)) * xn ) / HC."""
     m = g.shape[0]
     sg = (f32(1) / (f32(1) + np.exp(-bf16_round(g)).astype(f32))).astype(f32)
-    xs = xn.reshape(m, HC, hidden).transpose(0, 2, 1).astype(f32)   # [m, i, s]
+    xs = xn.reshape(m, HC, hidden).transpose(0, 2, 1).astype(f32)  # [m, i, s]
     acc = np.zeros((m, hidden), dtype=f32)
     for s in range(HC):
         acc = fma32(sg[..., s], xs[..., s], acc)
@@ -127,8 +130,8 @@ def down_new(q, s, x, gs, r, hc):
     n, k = q.shape
     m = x.shape[0]
     nch = k // 16
-    t = chunk_dots(q, x)                                           # [m, n, nch]
-    sc = np.repeat(s, gs // 16, axis=1)[None]                       # scale per chunk
+    t = chunk_dots(q, x)  # [m, n, nch]
+    sc = np.repeat(s, gs // 16, axis=1)[None]  # scale per chunk
     p = fma32(t, sc, 0.0)
     ks_n = (nch + 63) // 64
     pp = np.zeros((m, n, ks_n * 64), dtype=f32)
@@ -139,7 +142,7 @@ def down_new(q, s, x, gs, r, hc):
         v = (v + lane63[..., q_]).astype(f32)
     rows = np.arange(n)[None]
     out = bf16_round(silu_epi(v, rows, r, hc))
-    return out, out[:, r:r + hc].copy()
+    return out, out[:, r : r + hc].copy()
 
 
 def down_ship(q, s, x, gs, r, hc, ks, unrl):
@@ -163,16 +166,18 @@ def down_ship(q, s, x, gs, r, hc, ks, unrl):
             lo, hi = 64 * j, min(64 * j + 64, per)
             seg_t = np.zeros((m, n, 64), dtype=f32)
             seg_s = np.zeros((m, n, 64), dtype=f32)
-            seg_t[..., :hi - lo] = tt[..., lo:hi]
-            seg_s[..., :hi - lo] = ss[..., lo:hi]
-            lane_sum = np.where(np.arange(64) < hi - lo, fma32(seg_t, seg_s, lane_sum), lane_sum)
+            seg_t[..., : hi - lo] = tt[..., lo:hi]
+            seg_s[..., : hi - lo] = ss[..., lo:hi]
+            lane_sum = np.where(
+                np.arange(64) < hi - lo, fma32(seg_t, seg_s, lane_sum), lane_sum
+            )
         parts.append(dpp_reduce(lane_sum, 64)[..., 63])
     v = np.zeros((m, n), dtype=f32)
     for pv in parts:
         v = (v + pv).astype(f32)
     rows = np.arange(n)[None]
     out = bf16_round(silu_epi(v, rows, r, hc))
-    return out, out[:, r:r + hc].copy()
+    return out, out[:, r : r + hc].copy()
 
 
 # ----------------------------------------------------------------------------- mix_up
@@ -180,7 +185,7 @@ def up_new(qp, sp, lora, xn, gs, hidden):
     """hcsm_up_kernel: unit (i, c) -> partial[i, s, c] = fma(t, scale, 0) for the 4 permuted
     rows 4i+s; thread (i, n, s) sums c = 0..CPR-1 in order from 0; gate-mix in s order."""
     m = lora.shape[0]
-    t = chunk_dots(qp, lora)                                      # [m, 4*HD, CPR]
+    t = chunk_dots(qp, lora)  # [m, 4*HD, CPR]
     sc = np.repeat(sp, gs // 16, axis=1)[None]
     p = fma32(t, sc, 0.0)
     g = np.zeros(p.shape[:2], dtype=f32)
@@ -197,9 +202,9 @@ def up_ship(qp, sp, lora, xn, gs, hidden):
     t = chunk_dots(qp, lora)
     cpr = t.shape[2]
     sc = np.repeat(sp, gs // 16, axis=1)[None]
-    p = fma32(t, sc, 0.0)                                         # [m, rows, CPR]
+    p = fma32(t, sc, 0.0)  # [m, rows, CPR]
     lanes = np.zeros(p.shape[:2] + (64,), dtype=f32)
-    lanes[..., :cpr] = p                                          # sub 0 layout (sub 1 is identical math)
+    lanes[..., :cpr] = p  # sub 0 layout (sub 1 is identical math)
     g = dpp_reduce(lanes, 32)[..., 31]
     return gate_mix_epi(g.reshape(m, hidden, HC), xn, hidden)
 
@@ -208,7 +213,9 @@ def up_ship(qp, sp, lora, xn, gs, hidden):
 def down_ref64(q, s, x, gs, r, hc):
     """fp64 (q, s) reference; returns (output, pre-epilogue v, sum |w x| per output)."""
     n, k = q.shape
-    w = (q.astype(np.float64).reshape(n, k // gs, gs) * s[..., None].astype(np.float64)).reshape(n, k)
+    w = (
+        q.astype(np.float64).reshape(n, k // gs, gs) * s[..., None].astype(np.float64)
+    ).reshape(n, k)
     v = x.astype(np.float64) @ w.T
     a = np.abs(x.astype(np.float64)) @ np.abs(w).T
     rows = np.arange(n)[None]
@@ -220,7 +227,9 @@ def up_ref64(qp, sp, lora, xn, gs, hidden):
     """fp64 reference; returns (output, g [m, HD, HC], sum |w x| of g)."""
     n, k = qp.shape
     m = lora.shape[0]
-    w = (qp.astype(np.float64).reshape(n, k // gs, gs) * sp[..., None].astype(np.float64)).reshape(n, k)
+    w = (
+        qp.astype(np.float64).reshape(n, k // gs, gs) * sp[..., None].astype(np.float64)
+    ).reshape(n, k)
     g = (lora.astype(np.float64) @ w.T).reshape(m, hidden, HC)
     a = (np.abs(lora.astype(np.float64)) @ np.abs(w).T).reshape(m, hidden, HC)
     sg = 1 / (1 + np.exp(-bf16_round(g.astype(f32)).astype(np.float64)))
@@ -230,9 +239,11 @@ def up_ref64(qp, sp, lora, xn, gs, hidden):
 
 def ulp_dist(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """bf16 ulp distance between two bf16-valued fp32 arrays (monotone integer mapping)."""
+
     def key(x):
         u = (np.ascontiguousarray(x, f32).view(np.uint32) >> 16).astype(np.int64)
         return np.where(u & 0x8000, 0x8000 - (u & 0x7FFF), 0x8000 + u)
+
     return np.abs(key(a) - key(b))
 
 
@@ -241,7 +252,7 @@ def make_case(m: int, seed: int = 0, outliers: bool = True):
     rng = np.random.default_rng(seed)
     wd = rng.normal(0, 0.02, (N_DOWN, K_DOWN)).astype(f32)
     wu = rng.normal(0, 0.02, (HC * HIDDEN, LORA)).astype(f32)
-    if outliers:     # input-channel outliers as in agents/hc_w8 (1% of channels x20, 0.1% entries x50)
+    if outliers:  # input-channel outliers as in agents/hc_w8 (1% of channels x20, 0.1% entries x50)
         for w in (wd, wu):
             ch = rng.choice(w.shape[1], max(1, w.shape[1] // 100), replace=False)
             w[:, ch] *= 20
@@ -253,12 +264,17 @@ def make_case(m: int, seed: int = 0, outliers: bool = True):
     perm = np.arange(HC * HIDDEN).reshape(HC, HIDDEN).T.reshape(-1)
     qu, su = quantize_w8(wu[perm], GS_UP)
     xn = bf16_round(rng.normal(0, 1, (m, K_DOWN)).astype(f32))
-    xn[:, rng.choice(K_DOWN, 8, replace=False)] *= 8            # a few large activations
+    xn[:, rng.choice(K_DOWN, 8, replace=False)] *= 8  # a few large activations
     xn = bf16_round(xn)
     return qd, sd, qu, su, xn
 
 
-SHIP_DOWN_CFG = {1: (2, 2), 2: (2, 2), 3: (4, 3), 4: (1, 2)}   # (KS, UNRL) from _CFG_DOWN
+SHIP_DOWN_CFG = {
+    1: (2, 2),
+    2: (2, 2),
+    3: (4, 3),
+    4: (1, 2),
+}  # (KS, UNRL) from _CFG_DOWN
 
 
 def run_case(m: int, seed: int = 0):
@@ -276,14 +292,18 @@ def run_case(m: int, seed: int = 0):
     # Tolerance (as in agents/hc_w8): 2 bf16 ulp of the reference + the fp32 accumulation bound
     # + the propagated effect of the epilogue's own bf16 rounding of its input (silu input / gate)
     # flipping by one ulp.  fp32 accumulation bound: (#adds) * 2^-24 * sum |w x|.
-    ulp = 2.0 ** -7                                         # bf16 relative spacing (upper bound)
-    acc_d = da * (K_DOWN / 16 + 64) * 2.0 ** -24
+    ulp = 2.0**-7  # bf16 relative spacing (upper bound)
+    acc_d = da * (K_DOWN / 16 + 64) * 2.0**-24
     rows = np.arange(N_DOWN)[None]
-    dslope = np.where(rows < LORA, 1.1 / HC, 1.0)          # |d silu(v/HC) / dv| <= 1.1/HC
+    dslope = np.where(rows < LORA, 1.1 / HC, 1.0)  # |d silu(v/HC) / dv| <= 1.1/HC
     tol_d = 2 * ulp * np.abs(dref) + dslope * (acc_d + ulp * np.abs(dv)) + 1e-30
-    acc_u = ua * (LORA / 16 + 32) * 2.0 ** -24
+    acc_u = ua * (LORA / 16 + 32) * 2.0**-24
     xs = np.abs(xn.reshape(m, HC, HIDDEN).transpose(0, 2, 1).astype(np.float64))
-    tol_u = 2 * ulp * np.abs(uref) + (0.25 * (acc_u + ulp * np.abs(ug)) * xs).sum(-1) / HC + 1e-30
+    tol_u = (
+        2 * ulp * np.abs(uref)
+        + (0.25 * (acc_u + ulp * np.abs(ug)) * xs).sum(-1) / HC
+        + 1e-30
+    )
 
     res = {
         "M": m,
@@ -295,7 +315,7 @@ def run_case(m: int, seed: int = 0):
         "up_new_vs_ship_frac_diff": float(np.mean(un_ != us_)),
         "down_ship_vs_ref_maxratio": float(np.max(np.abs(ds - dref) / tol_d)),
         "up_ship_vs_ref_maxratio": float(np.max(np.abs(us_ - uref) / tol_u)),
-        "inj_equal": bool(np.array_equal(inj_n, dn[:, LORA:LORA + HC])),
+        "inj_equal": bool(np.array_equal(inj_n, dn[:, LORA : LORA + HC])),
         "inj_ship_equal": bool(np.array_equal(inj_n, inj_s)),
     }
     return res
@@ -306,14 +326,16 @@ def test_hc_w8_smallm_numerics(m):
     r = run_case(m, seed=m)
     assert r["down_new_vs_ref_maxratio"] <= 1.0, r
     assert r["up_new_vs_ref_maxratio"] <= 1.0, r
-    assert r["down_new_vs_ship_maxulp"] <= 1 and r["down_new_vs_ship_frac_diff"] <= 0.01, r
+    assert (
+        r["down_new_vs_ship_maxulp"] <= 1 and r["down_new_vs_ship_frac_diff"] <= 0.01
+    ), r
     assert r["up_new_vs_ship_maxulp"] <= 1 and r["up_new_vs_ship_frac_diff"] <= 0.01, r
     assert r["inj_equal"], r
 
 
 def test_dpp_tree_is_a_sum():
     rng = np.random.default_rng(1)
-    v = rng.integers(-1000, 1000, (7, 64)).astype(f32)      # exact in fp32 -> order-free
+    v = rng.integers(-1000, 1000, (7, 64)).astype(f32)  # exact in fp32 -> order-free
     assert np.array_equal(dpp_reduce(v, 64)[:, 63], v.sum(1).astype(f32))
     r32 = dpp_reduce(v, 32)
     assert np.array_equal(r32[:, 31], v[:, :32].sum(1).astype(f32))
@@ -321,13 +343,17 @@ def test_dpp_tree_is_a_sum():
 
 
 if __name__ == "__main__":
-    print("| M | down new/ref (<=1) | up new/ref (<=1) | down new vs ship: max ulp, % diff | "
-          "up new vs ship: max ulp, % diff | ship down/ref, up/ref | inj == down cols |")
+    print(
+        "| M | down new/ref (<=1) | up new/ref (<=1) | down new vs ship: max ulp, % diff | "
+        "up new vs ship: max ulp, % diff | ship down/ref, up/ref | inj == down cols |"
+    )
     print("|---|---|---|---|---|---|---|")
     for m in (1, 2, 3, 4):
         r = run_case(m, seed=m)
-        print(f"| {m} | {r['down_new_vs_ref_maxratio']:.3f} | {r['up_new_vs_ref_maxratio']:.3f} | "
-              f"{r['down_new_vs_ship_maxulp']}, {100 * r['down_new_vs_ship_frac_diff']:.3f}% | "
-              f"{r['up_new_vs_ship_maxulp']}, {100 * r['up_new_vs_ship_frac_diff']:.3f}% | "
-              f"{r['down_ship_vs_ref_maxratio']:.3f}, {r['up_ship_vs_ref_maxratio']:.3f} | "
-              f"{r['inj_equal'] and r['inj_ship_equal']} |")
+        print(
+            f"| {m} | {r['down_new_vs_ref_maxratio']:.3f} | {r['up_new_vs_ref_maxratio']:.3f} | "
+            f"{r['down_new_vs_ship_maxulp']}, {100 * r['down_new_vs_ship_frac_diff']:.3f}% | "
+            f"{r['up_new_vs_ship_maxulp']}, {100 * r['up_new_vs_ship_frac_diff']:.3f}% | "
+            f"{r['down_ship_vs_ref_maxratio']:.3f}, {r['up_ship_vs_ref_maxratio']:.3f} | "
+            f"{r['inj_equal'] and r['inj_ship_equal']} |"
+        )
