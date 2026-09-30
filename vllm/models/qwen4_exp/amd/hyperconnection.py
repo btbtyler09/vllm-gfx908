@@ -136,6 +136,17 @@ class GatedResidual(nn.Module):
         from .gfx908_hc_ar_fused import hc_ar_fused_enabled
 
         self._gfx908_hc_ar_fused = hc_ar_fused_enabled() and config.hc_count == 4
+        # Final mixer on the W8 fused chain: VLLM_GFX908_HC_FINAL_W8=1 (default off).
+        # Quantizes (and, like the combining mixers, may release the bf16 of) this
+        # module's two mix weights at load time, so every call must then go through
+        # the opaque hc_final_mix op, which is what _gfx908_hc_final_op_applies routes.
+        self._gfx908_hc_final_w8 = False
+        if not use_combine:
+            from .gfx908_hc_fused import hc_final_w8_enabled, install_hc_w8_prepare
+
+            self._gfx908_hc_final_w8 = hc_final_w8_enabled()
+            if self._gfx908_hc_final_w8:
+                install_hc_w8_prepare(self)
         if use_combine:
             from .gfx908_hc_fused import (
                 hc_w4_enabled,
@@ -175,7 +186,7 @@ class GatedResidual(nn.Module):
             block_input, injection = self._gfx908_hc_fused_mix(xn)
             return hidden_states, block_input, injection
 
-        if not self.use_combine and self._gfx908_hc_shard_applies(xn):
+        if not self.use_combine and self._gfx908_hc_final_op_applies(xn):
             return hidden_states, self._gfx908_hc_shard_final_mix(xn), None
 
         if self.use_combine:
@@ -230,7 +241,7 @@ class GatedResidual(nn.Module):
             block_input, injection = self._gfx908_hc_fused_mix(xn)
             return hidden_states, block_input, injection
 
-        if not self.use_combine and self._gfx908_hc_shard_applies(xn):
+        if not self.use_combine and self._gfx908_hc_final_op_applies(xn):
             return hidden_states, self._gfx908_hc_shard_final_mix(xn), None
 
         if self.use_combine:
@@ -259,6 +270,13 @@ class GatedResidual(nn.Module):
         # Plain attribute check only (same rule as the fused gate): the real M
         # dispatch happens inside the custom op.
         return xn.dtype == torch.bfloat16 and self._gfx908_hc_shard
+
+    def _gfx908_hc_final_op_applies(self, xn: torch.Tensor) -> bool:
+        # Final mixer through the opaque op (token sharding and/or the W8 chain); plain
+        # attribute checks only, the real M dispatch happens inside the op.
+        return xn.dtype == torch.bfloat16 and (
+            self._gfx908_hc_shard or self._gfx908_hc_final_w8
+        )
 
     def _gfx908_hc_shard_final_mix(self, xn: torch.Tensor) -> torch.Tensor:
         from .gfx908_hc_fused import hc_final_mix
